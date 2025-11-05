@@ -1,0 +1,12 @@
+requests
+Pillow
+numpy
+pandas
+matplotlib
+opencv-python-headless
+tqdm
+TTS
+soundfile
+librosa
+scipy
+numba
