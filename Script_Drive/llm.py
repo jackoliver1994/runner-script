@@ -1818,13 +1818,13 @@ if __name__ == "__main__":
     for p in image_prompts[:5]:
         print(f"[{p}]")
 
-    # # --- Example 3: Only generate narration (suitable for Coqui) ---
-    # narration_text = pipeline.generate_narration(script, timing_minutes=10)
-    # print("\nNarration saved and ready for TTS")
+    # --- Example 3: Only generate narration (suitable for Coqui) ---
+    narration_text = pipeline.generate_narration(script, timing_minutes=10)
+    print("\nNarration saved and ready for TTS")
 
-    # # # --- Example 4: Generate youtube metadata ---
-    # yt_meta = pipeline.generate_youtube_metadata(script, timing_minutes=10)
-    # print("\nYouTube metadata saved.")
+    # # --- Example 4: Generate youtube metadata ---
+    yt_meta = pipeline.generate_youtube_metadata(script, timing_minutes=10)
+    print("\nYouTube metadata saved.")
 
     print("\n✅ Done. Use the pipeline methods to call only what you need.")
     end = time.time()
