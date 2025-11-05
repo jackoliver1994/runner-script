@@ -24,4 +24,5 @@ jobs:
 
       - name: Run your Python script
         run: |
-          python Script_Drive/run_scripts.py
+          cd Script_Drive          # move into the subfolder
+          python run_scripts.py    # run your script
