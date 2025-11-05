@@ -1,0 +1,27 @@
+name: Run Python Script
+
+on:
+  workflow_dispatch:    # lets you manually trigger the run
+  # schedule:            # optional: uncomment to auto-run daily
+  #   - cron: "0 0 * * *"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360   # max runtime (6h on GitHub-hosted)
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+
+      - name: Install requirements (if you have any)
+        run: |
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Run your Python script
+        run: |
+          python Script_Drive/run_scripts.py
