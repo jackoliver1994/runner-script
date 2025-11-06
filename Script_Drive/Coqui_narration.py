@@ -86,26 +86,33 @@ CHUNK_WORKER_TIMEOUT = 240  # seconds (increase if models are slow)
 # ---------- HELP: ensure ffmpeg available (Colab-friendly) ----------
 def ensure_ffmpeg_available_and_install_if_missing():
     """
-    Check for ffmpeg on PATH. If missing and apt-get available (Colab),
-    attempt install with apt-get. Updates global ffmpeg_path if found.
-    Returns found path (or None).
+    Check for ffmpeg on PATH. If missing, try:
+      - provided ffmpeg binary (ffmpeg_path)
+      - apt-get install (if available)
+      - pip install imageio-ffmpeg (preferred pip that includes binary)
+      - pip install ffmpeg (per user request; may or may not provide binary)
+    Updates global ffmpeg_path if found and returns the path (or None).
     """
     global ffmpeg_path
+    # 1) PATH
     found = shutil.which("ffmpeg")
     if found:
         print(f"{_ts()} ✅ ffmpeg found on PATH: {found}")
         ffmpeg_path = found
         return found
 
-    print(f"{_ts()} ⚠️ ffmpeg not found on PATH.")
-    # Try provided ffmpeg binary (ffmpeg_path from local folder)
-    if os.path.exists(ffmpeg_path):
+    # 2) provided binary (configured path)
+    if ffmpeg_path and os.path.exists(ffmpeg_path):
         print(
             f"{_ts()} ℹ️ Found provided ffmpeg binary at configured ffmpeg_path: {ffmpeg_path}"
         )
         return ffmpeg_path
 
-    # If apt-get exists, try to install (Colab)
+    print(
+        f"{_ts()} ⚠️ ffmpeg not found on PATH or at configured ffmpeg_path ({ffmpeg_path})."
+    )
+
+    # 3) apt-get (Colab / Debian-like systems)
     apt_get = (
         shutil.which("apt-get")
         or os.path.exists("/usr/bin/apt-get")
@@ -116,7 +123,6 @@ def ensure_ffmpeg_available_and_install_if_missing():
             print(
                 f"{_ts()} ℹ️ Attempting to install ffmpeg using apt-get. This may take a moment..."
             )
-            # Run apt-get update then install ffmpeg
             subprocess.check_call(
                 ["apt-get", "update"], stdout=sys.stdout, stderr=sys.stderr
             )
@@ -127,23 +133,68 @@ def ensure_ffmpeg_available_and_install_if_missing():
             )
             found = shutil.which("ffmpeg")
             if found:
-                print(f"{_ts()} ✅ ffmpeg installed: {found}")
+                print(f"{_ts()} ✅ ffmpeg installed via apt-get: {found}")
                 ffmpeg_path = found
                 return found
             else:
                 print(
-                    f"{_ts()} ❌ apt-get run finished but ffmpeg binary still not found on PATH."
+                    f"{_ts()} ❌ apt-get finished but ffmpeg still not found on PATH."
                 )
-                return None
         except Exception:
             tb = traceback.format_exc()
             print(f"{_ts()} ❌ Failed to install ffmpeg via apt-get: {tb}")
-            return None
-    else:
+
+    # 4) Try pip installing imageio-ffmpeg (this package ships a binary usable via imageio_ffmpeg.get_ffmpeg_exe())
+    try:
         print(
-            f"{_ts()} ⚠️ apt-get not available on this system. Cannot automatically install ffmpeg."
+            f"{_ts()} ℹ️ Attempting to install 'imageio-ffmpeg' via pip and use its bundled ffmpeg..."
         )
-        return None
+        _pip_install("imageio-ffmpeg")
+        try:
+            import imageio_ffmpeg as _iioff  # type: ignore
+
+            exe = _iioff.get_ffmpeg_exe()
+            if exe and os.path.exists(exe):
+                print(f"{_ts()} ✅ Found ffmpeg via imageio-ffmpeg: {exe}")
+                ffmpeg_path = exe
+                return exe
+            # some distributions expose 'ffmpeg' name; check PATH again
+            found = shutil.which("ffmpeg")
+            if found:
+                print(
+                    f"{_ts()} ✅ ffmpeg now on PATH after imageio-ffmpeg install: {found}"
+                )
+                ffmpeg_path = found
+                return found
+        except Exception as _e:
+            print(f"{_ts()} ⚠️ Could not query imageio-ffmpeg binary: {_e}")
+    except Exception:
+        print(f"{_ts()} ⚠️ pip install imageio-ffmpeg failed or unavailable.")
+
+    # 5) Per user request: try pip install 'ffmpeg' (less reliable; may just be wrapper)
+    try:
+        print(
+            f"{_ts()} ℹ️ Attempting to 'pip install ffmpeg' as a last-resort attempt..."
+        )
+        _pip_install("ffmpeg")
+        found = shutil.which("ffmpeg")
+        if found:
+            print(f"{_ts()} ✅ ffmpeg found on PATH after pip install: {found}")
+            ffmpeg_path = found
+            return found
+        else:
+            print(
+                f"{_ts()} ⚠️ pip-installed 'ffmpeg' did not place an ffmpeg binary on PATH."
+            )
+    except Exception:
+        tb = traceback.format_exc()
+        print(f"{_ts()} ⚠️ pip install ffmpeg failed: {tb}")
+
+    # Nothing found
+    print(
+        f"{_ts()} ⚠️ Unable to locate or install ffmpeg automatically. Please install ffmpeg manually."
+    )
+    return None
 
 
 # ---------- UTILS ----------
@@ -705,7 +756,19 @@ def _ffmpeg_resample_to_uniform(
     """
     Use ffmpeg to re-encode each path to PCM S16LE, target_rate Hz, target_channels, write to tmp converted files.
     Returns list of re-encoded file paths in the same order.
+    This function verifies ffmpeg_exe and attempts automatic recovery via ensure_ffmpeg_available_and_install_if_missing().
     """
+    # Ensure ffmpeg_exe is valid; attempt to recover if not
+    if not ffmpeg_exe or not os.path.exists(ffmpeg_exe):
+        # Try resolving using global helper
+        ff = ensure_ffmpeg_available_and_install_if_missing()
+        if ff:
+            ffmpeg_exe = ff
+        else:
+            raise RuntimeError(
+                "ffmpeg executable not found. Cannot re-encode WAVs without ffmpeg."
+            )
+
     converted = []
     for i, p in enumerate(paths):
         base = os.path.basename(p)
@@ -814,16 +877,38 @@ def _ffmpeg_concat_encode(
 ) -> str:
     """
     Use ffmpeg concat demuxer and re-encode to consistent PCM WAV, returning concatenated WAV path.
+    Ensures ffmpeg_exe exists (and will attempt install via ensure_ffmpeg_available_and_install_if_missing()).
     """
-    tmpdir = os.path.dirname(chunk_files[0])
+    # resolve ffmpeg_exe if missing
+    if not ffmpeg_exe or not os.path.exists(ffmpeg_exe):
+        ff = ensure_ffmpeg_available_and_install_if_missing()
+        if ff:
+            ffmpeg_exe = ff
+        else:
+            raise RuntimeError(
+                "ffmpeg executable not found. Cannot perform ffmpeg concat/encode."
+            )
+
+    tmpdir = (
+        os.path.dirname(chunk_files[0])
+        if chunk_files
+        else tempfile.mkdtemp(prefix="coqui_ffconcat_")
+    )
     concat_list = os.path.join(tmpdir, "ffconcat_list.txt")
-    # write a safe concat file
+    # write a safe concat file (ffmpeg expects: file 'path')
     with open(concat_list, "w", encoding="utf-8") as L:
         for cf in chunk_files:
-            if "'" in cf:
+            # choose quoting intelligently
+            if "'" in cf and '"' not in cf:
                 L.write(f'file "{cf}"\n')
             else:
-                L.write(f"file '{cf}'\n")
+                # default to single quotes; if both quotes present, escape single quotes
+                if "'" in cf and '"' in cf:
+                    safe = cf.replace("'", r"'\''")
+                    L.write(f"file '{safe}'\n")
+                else:
+                    L.write(f"file '{cf}'\n")
+
     concatenated_wav = os.path.splitext(base_output_path)[0] + "_coqui_storytelling.wav"
     cmd = [
         ffmpeg_exe,
@@ -866,6 +951,7 @@ def synthesize_chunks_and_concatenate(
       - clearer timeout/kill logic (terminate -> wait -> kill)
       - safer reading of child stderr tails and status files
       - prevents zombie processes by waiting where appropriate
+      - improved ffmpeg discovery (tries pip install imageio-ffmpeg / ffmpeg if missing)
     """
     import signal
 
@@ -1201,12 +1287,18 @@ def synthesize_chunks_and_concatenate(
                 )
                 chunk_files_seq.append(silence_path)
 
-        # FFmpeg selection: prefer provided binary else fallback to PATH ffmpeg
+        # FFmpeg selection: prefer provided binary else fallback to PATH ffmpeg.
+        # If none found, call ensure helper (which may attempt pip installs).
         ffmpeg_exe = (
             ffmpeg_path
             if (ffmpeg_path and os.path.exists(ffmpeg_path))
             else shutil.which("ffmpeg")
         )
+        if not ffmpeg_exe:
+            ff = ensure_ffmpeg_available_and_install_if_missing()
+            if ff:
+                ffmpeg_exe = ff
+
         if ffmpeg_exe:
             try:
                 print(
@@ -1244,6 +1336,11 @@ def synthesize_chunks_and_concatenate(
         # If final desired is mp3, try to convert using ffmpeg (provided path first, then PATH fallback)
         desired_ext = os.path.splitext(base_output_path)[1].lower()
         if desired_ext == ".mp3":
+            # Ensure ffmpeg_exe is resolved now (may have been None earlier)
+            if not ffmpeg_exe or not os.path.exists(ffmpeg_exe):
+                ff = ensure_ffmpeg_available_and_install_if_missing()
+                ffmpeg_exe = ff if ff else shutil.which("ffmpeg")
+
             if ffmpeg_exe:
                 try:
                     final_mp3 = base_output_path
@@ -1265,12 +1362,13 @@ def synthesize_chunks_and_concatenate(
                     print(
                         f"{_ts()} ❌ ffmpeg (provided) mp3 conversion failed. Trying PATH ffmpeg fallback."
                     )
-            ffmpeg_path_on_path = shutil.which("ffmpeg")
-            if ffmpeg_path_on_path:
+            # fallback: PATH ffmpeg
+            ff_on_path = shutil.which("ffmpeg")
+            if ff_on_path:
                 try:
                     final_mp3 = base_output_path
                     conv_cmd = [
-                        ffmpeg_path_on_path,
+                        ff_on_path,
                         "-y",
                         "-i",
                         concatenated_wav,
