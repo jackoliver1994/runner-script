@@ -22,31 +22,37 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Run your script (in subfolder)
+      - name: Run your script (llm)
         env:
           R_HOURS: "6"
         run: |
           cd Script_Drive
-          # run the script (make sure run_scripts.py respects R_HOURS or runs long enough)
           python llm.py
-
-      - name: Check for output file (and show size)
+          
+      - name: Run your script (pollinations_image_genrate)
+        env:
+          R_HOURS: "6"
         run: |
-          echo "Listing Script_Drive contents:"
-          ls -la Script_Drive || true
-          if [ -f Script_Drive/video_no_logo.mp4 ]; then
-            echo "Output video found:"
-            ls -lh Script_Drive/video_no_logo.mp4
-          else
-            echo "Output video NOT found. Creating missing.txt for artifact upload."
-            echo "video_no_logo.mp4 NOT produced in this run" > missing.txt
-          fi
+          cd Script_Drive
+          python pollinations_image_genrate.py
+          
+      - name: Run your script (Coqui-narration)
+        env:
+          R_HOURS: "6"
+        run: |
+          cd Script_Drive
+          python Coqui-Colab.py
 
-      - name: Upload generated file (or missing indicator)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: video_no_logo
-          path: |
-            Script_Drive/video_no_logo.mp4
-            missing.txt
+      - name: Run your script (video_genrate)
+        env:
+          R_HOURS: "6"
+        run: |
+          cd Script_Drive
+          python video_genrate.py
+
+      - name: Run your script (remove_logo_from_video)
+        env:
+          R_HOURS: "6"
+        run: |
+          cd Script_Drive
+          python remove_logo_from_video.py
