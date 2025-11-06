@@ -28,7 +28,7 @@ jobs:
         run: |
           cd Script_Drive
           # run the script (make sure run_scripts.py respects R_HOURS or runs long enough)
-          python run_scripts.py
+          python llm.py
 
       - name: Check for output file (and show size)
         run: |
