@@ -76,16 +76,49 @@ class ChatAPI:
         initial_backoff: float = 1.0,
         max_backoff: float = 8.0,
         spinner_message: str = "Waiting for response...",
+        retry_on_html_4xx: bool = True,  # NEW: treat HTML 4xx (e.g., Cloudflare challenge) as transient
     ) -> str:
         """
-        Robust POST with backoff and optional per-call timeout.
-        Returns the raw response text or raises RuntimeError on fatal client error.
+        Robust POST with exponential backoff and optional per-call timeout.
+        - Detects server errors (5xx) and rate limits (429) and retries with backoff.
+        - By default will also treat 4xx responses that return HTML (typical Cloudflare challenge pages)
+        as transient and retryable (enable/disable with retry_on_html_4xx).
+        - For other 4xx client errors, will raise RuntimeError unless retry_on_client_errors=True.
+        Returns the raw response text (usually JSON-decoded "response") or raises RuntimeError for fatal client errors.
         """
+        # ensure headers include sensible UA + Accept to reduce 403 from anti-bot systems
+        self.headers.setdefault(
+            "User-Agent", "StoryPipeline/1.0 (+https://github.com/your-repo)"
+        )
+        # accept JSON but allow HTML fallback detection
+        self.headers.setdefault(
+            "Accept", "application/json, text/plain, text/html;q=0.9"
+        )
+
         spinner = LoadingSpinner(spinner_message)
         attempt = 0
         timeout = timeout or self.base_timeout
         backoff = initial_backoff
         start_time = time.monotonic()
+
+        # small helper to inspect body for obvious HTML/challenge patterns
+        def _looks_like_html_challenge(body: str) -> bool:
+            if not body:
+                return False
+            low = body.lower()
+            # common indicators
+            if "<!doctype html" in low or "<html" in low:
+                # further check for Cloudflare-like challenge strings to reduce false positives
+                if (
+                    "just a moment" in low
+                    or "cf-chl-bypass" in low
+                    or "cloudflare" in low
+                    or "enable javascript and cookies" in low
+                ):
+                    return True
+                # treat generic HTML responses as possible transient block too (conservative)
+                return True
+            return False
 
         while True:
             attempt += 1
@@ -101,7 +134,15 @@ class ChatAPI:
                 spinner.stop()
 
                 status = resp.status_code
+                content_type = resp.headers.get("Content-Type", "") or ""
+                text_body = ""
+                try:
+                    # do not assume JSON — we'll try to parse but keep raw text for diagnostics
+                    text_body = resp.text or ""
+                except Exception:
+                    text_body = ""
 
+                # Rate limiting & server errors => retry
                 if status == 429 or 500 <= status < 600:
                     print(
                         f"⚠️ Server/Rate error HTTP {status}. Backing off {backoff:.1f}s and retrying..."
@@ -111,13 +152,26 @@ class ChatAPI:
                     timeout = min(timeout + 100, 100000)
                     continue
 
+                # Handle client errors
                 if 400 <= status < 500:
-                    # client error - optionally retry
+                    # if HTML-ish body and configured to treat as transient, retry with backoff
+                    if retry_on_html_4xx and _looks_like_html_challenge(text_body):
+                        print(
+                            f"⚠️ HTTP {status} appears to be an HTML challenge/block (e.g. Cloudflare). Treating as transient; backing off {backoff:.1f}s and retrying..."
+                        )
+                        # small jitter and longer backoff to allow page to clear or headers to change
+                        time.sleep(backoff + random.uniform(0.5, 2.0))
+                        backoff = min(backoff * 2, max_backoff * 4)
+                        timeout = min(timeout + 120, 100000)
+                        continue
+
+                    # otherwise parse JSON body for error information if possible
                     try:
                         payload = resp.json()
                         error_msg = payload.get("error") or json.dumps(payload)
                     except Exception:
-                        error_msg = resp.text or f"HTTP {status}"
+                        error_msg = text_body or f"HTTP {status}"
+
                     msg = f"HTTP {status} - {error_msg}"
 
                     if retry_on_client_errors:
@@ -129,22 +183,45 @@ class ChatAPI:
                         timeout = min(timeout + 100, 100000)
                         continue
                     else:
+                        # fatal client error
                         raise RuntimeError(f"Fatal client error (not retried): {msg}")
 
-                # non-error status
-                resp.raise_for_status()
+                # success-range status codes
                 try:
-                    result = resp.json()
-                except json.JSONDecodeError as e:
+                    resp.raise_for_status()
+                except requests.exceptions.HTTPError as e:
+                    # defensive: if we somehow get here, treat as transient
                     print(
-                        f"⚠️ Invalid JSON received (will retry): {e}. Backing off {backoff:.1f}s..."
+                        f"⚠️ HTTP error raised after checks: {e}. Backing off {backoff:.1f}s and retrying..."
                     )
                     time.sleep(backoff + random.uniform(0, 1.0))
                     backoff = min(backoff * 2, max_backoff)
                     timeout = min(timeout + 100, 100000)
                     continue
 
-                # Expecting JSON with {status: "success", response: "..."} per original code
+                # attempt JSON parse
+                try:
+                    result = resp.json()
+                except json.JSONDecodeError as e:
+                    # If server returned HTML or invalid JSON, treat as transient and retry
+                    if _looks_like_html_challenge(text_body):
+                        print(
+                            f"⚠️ Received HTML/invalid JSON body (looks like challenge). Backing off {backoff:.1f}s and retrying..."
+                        )
+                        time.sleep(backoff + random.uniform(0, 1.0))
+                        backoff = min(backoff * 2, max_backoff)
+                        timeout = min(timeout + 100, 100000)
+                        continue
+                    else:
+                        print(
+                            f"⚠️ Invalid JSON received (will retry): {e}. Body preview: {text_body[:200]!r}"
+                        )
+                        time.sleep(backoff + random.uniform(0, 1.0))
+                        backoff = min(backoff * 2, max_backoff)
+                        timeout = min(timeout + 100, 100000)
+                        continue
+
+                # expected result format {status: "success", response: "..."}
                 if isinstance(result, dict) and result.get("status") == "success":
                     content = result.get("response", "")
                     if content is None:
@@ -153,7 +230,7 @@ class ChatAPI:
                     print(f"✅ Success on attempt #{attempt} (elapsed {elapsed}s).")
                     return content
                 else:
-                    # Could be different schema; we'll try fallback to string form
+                    # fallback: if dict but different schema, try to extract a sensible field; otherwise retry
                     err = (
                         result.get("error")
                         if isinstance(result, dict)
