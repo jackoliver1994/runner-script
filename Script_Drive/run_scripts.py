@@ -26,7 +26,7 @@ import random
 SCRIPTS: List[str] = [
     "llm.py",
     "pollinations_image_genrate.py",
-    "Coqui-Colab.py",
+    "Coqui_narration.py",
     "video_genrate.py",
     "remove_logo_from_video.py",
 ]

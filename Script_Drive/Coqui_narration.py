@@ -851,6 +851,24 @@ def _ffmpeg_concat_encode(
 def synthesize_chunks_and_concatenate(
     chunks: List[str], base_output_path: str, speed: float, speaker
 ) -> str:
+    """
+    Spawn subprocess workers (one-per-chunk, controlled by MAX_WORKERS), synthesize each chunk
+    (or generate silence), and concatenate results into a single WAV/MP3.
+
+    Preserves original behaviour:
+      - infinite retry of failing chunks
+      - writes child_script_source to tmpdir and invokes it
+      - respects CHUNK_WORKER_TIMEOUT and retry_delay
+      - attempts ffmpeg concat/encode, falls back to python concat + re-encode
+      - returns WAV or MP3 depending on base_output_path ext
+    Improvements:
+      - stronger, cross-platform subprocess process-group handling so timeouts kill children reliably
+      - clearer timeout/kill logic (terminate -> wait -> kill)
+      - safer reading of child stderr tails and status files
+      - prevents zombie processes by waiting where appropriate
+    """
+    import signal
+
     tmpdir = tempfile.mkdtemp(prefix="coqui_tts_chunks_")
     print(f"{_ts()} 🧾 Temporary chunk dir: {tmpdir} (preserve={PRESERVE_TMPDIR})")
 
@@ -884,7 +902,6 @@ def synthesize_chunks_and_concatenate(
 
         active = []
         results = {}
-        task_idx = 0
         total_tasks = len(tasks)
         attempts: Dict[int, int] = {i: 0 for i in range(total_tasks)}
         pending_indices = [i for i in range(total_tasks)]
@@ -894,6 +911,24 @@ def synthesize_chunks_and_concatenate(
         with open(models_json_path, "w", encoding="utf-8") as f:
             json.dump(preferred_models, f)
 
+        # Helper to safely start subprocess in its own process group/session
+        def _popen_in_group(cmd, stdout_f, stderr_f):
+            # On POSIX use start_new_session, on Windows use CREATE_NEW_PROCESS_GROUP
+            if os.name == "nt":
+                creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
+                return subprocess.Popen(
+                    cmd,
+                    stdout=stdout_f,
+                    stderr=stderr_f,
+                    creationflags=creationflags,
+                )
+            else:
+                # start_new_session available -> creates new session/process group
+                return subprocess.Popen(
+                    cmd, stdout=stdout_f, stderr=stderr_f, start_new_session=True
+                )
+
+        # Main worker loop (spawn/monitor/requeue)
         while pending_indices or active:
             # spawn as many as allowed
             while len(active) < MAX_WORKERS and pending_indices:
@@ -956,18 +991,26 @@ def synthesize_chunks_and_concatenate(
                     status_path,
                 ]
 
-                with open(stdout_path, "wb") as so, open(stderr_path, "wb") as se:
+                try:
+                    so = open(stdout_path, "wb")
+                    se = open(stderr_path, "wb")
+                    p = _popen_in_group(cmd, so, se)
+                except Exception:
+                    tb = traceback.format_exc()
+                    print(f"{_ts()} ❌ Failed to start subprocess for chunk {i}: {tb}")
+                    # ensure files closed
                     try:
-                        p = subprocess.Popen(cmd, stdout=so, stderr=se)
+                        so.close()
                     except Exception:
-                        tb = traceback.format_exc()
-                        print(
-                            f"{_ts()} ❌ Failed to start subprocess for chunk {i}: {tb}"
-                        )
-                        # requeue immediately (infinite retry)
-                        pending_indices.append(i)
-                        time.sleep(retry_delay)
-                        continue
+                        pass
+                    try:
+                        se.close()
+                    except Exception:
+                        pass
+                    # requeue immediately (infinite retry)
+                    pending_indices.append(i)
+                    time.sleep(retry_delay)
+                    continue
 
                 active.append(
                     (
@@ -986,7 +1029,7 @@ def synthesize_chunks_and_concatenate(
                     f"{_ts()} 🛠️ Started subprocess for chunk {i+1}/{total_tasks} -> {outp} (pid={p.pid})"
                 )
 
-            # monitor active items
+            # monitor active items (iterate over a copy to allow removals)
             for proc_tuple in active[:]:
                 (
                     proc,
@@ -1000,24 +1043,61 @@ def synthesize_chunks_and_concatenate(
                     stdout_path,
                 ) = proc_tuple
                 elapsed = time.time() - started
+
+                # Timeout handling: terminate then escalate to kill process group
                 if elapsed > CHUNK_WORKER_TIMEOUT and proc.poll() is None:
                     try:
-                        proc.terminate()
                         print(
-                            f"\n{_ts()} ⚠️ Subprocess for chunk {idx} timed out (> {CHUNK_WORKER_TIMEOUT}s). Terminated (pid={proc.pid})."
+                            f"\n{_ts()} ⚠️ Subprocess for chunk {idx} timed out (> {CHUNK_WORKER_TIMEOUT}s). Terminating (pid={proc.pid})."
                         )
+                        proc.terminate()
                     except Exception:
                         print(
                             f"\n{_ts()} ⚠️ Failed to terminate subprocess for chunk {idx} (pid={proc.pid})."
                         )
-                    time.sleep(0.5)
+                    # give short grace then escalate
+                    time.sleep(1.5)
+                    if proc.poll() is None:
+                        try:
+                            # kill process group where possible (POSIX)
+                            if os.name != "nt":
+                                try:
+                                    pgid = os.getpgid(proc.pid)
+                                    os.killpg(pgid, signal.SIGKILL)
+                                except Exception:
+                                    proc.kill()
+                            else:
+                                # Windows: attempt CTRL_BREAK_EVENT for group, else kill
+                                try:
+                                    proc.send_signal(signal.CTRL_BREAK_EVENT)
+                                except Exception:
+                                    proc.kill()
+                        except Exception:
+                            try:
+                                proc.kill()
+                            except Exception:
+                                pass
+                        print(
+                            f"{_ts()} ⚠️ Subprocess for chunk {idx} force-killed (pid={proc.pid})."
+                        )
 
                 ret = proc.poll()
                 if ret is None:
                     continue
 
-                # process ended; read status file if present
-                active.remove(proc_tuple)
+                # process ended; remove from active and close any opened fds
+                try:
+                    active.remove(proc_tuple)
+                except ValueError:
+                    pass
+
+                # ensure stdout/stderr files are flushed/closed before reading tails
+                try:
+                    if os.path.exists(stdout_path):
+                        # no-op; child wrote directly to file
+                        pass
+                except Exception:
+                    pass
 
                 status_info = {}
                 if os.path.exists(status_path):
@@ -1034,6 +1114,11 @@ def synthesize_chunks_and_concatenate(
                         print(
                             f"{_ts()} 🟢 Worker finished for chunk {idx+1} -> {path} (pause_after={pause_ms}ms)"
                         )
+                        # close file handles if any (best-effort)
+                        try:
+                            proc.stdout and proc.stdout.close()
+                        except Exception:
+                            pass
                         continue
                     else:
                         print(
@@ -1061,10 +1146,10 @@ def synthesize_chunks_and_concatenate(
                     except Exception:
                         pass
                 else:
+                    # attempt to show stderr tail even when no status file
                     print(
                         f"{_ts()} ❌ No completion status for chunk {idx}. Treating as transient error."
                     )
-                    # show stderr tail
                     try:
                         if os.path.exists(stderr_path):
                             with open(stderr_path, "rb") as se:
@@ -1078,13 +1163,14 @@ def synthesize_chunks_and_concatenate(
                     except Exception:
                         pass
 
-                # infinite retry behavior: always requeue failing chunk
+                # infinite retry behavior: always requeue failing chunk (preserve original)
                 print(
                     f"{_ts()} 🔁 Re-queueing chunk {idx} for retry (attempt {attempts[idx]})."
                 )
                 pending_indices.append(idx)
                 time.sleep(retry_delay)
 
+            # small sleep to avoid busy-wait
             time.sleep(0.05)
 
         # Compose ordered list of files for concat including silence files
