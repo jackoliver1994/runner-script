@@ -10,3 +10,4 @@ soundfile
 librosa
 scipy
 numba
+ffmpeg-python
