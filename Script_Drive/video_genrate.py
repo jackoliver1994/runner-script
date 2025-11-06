@@ -16,6 +16,7 @@ import tempfile
 import shutil
 import glob
 import sys
+import imageio_ffmpeg
 
 current_directory = os.getcwd()
 # ---------- FFmpeg paths (user-provided) ----------
@@ -42,10 +43,128 @@ audio_bitrate = "192k"
 audio_sample_rate = 48000
 # -------------------------------------------------------------
 
+
+def ensure_ffmpeg_binaries():
+    """
+    Ensure ffmpeg and ffprobe executables are available.
+    Resolution order:
+     1. Already-configured ffmpeg_path / ffprobe_path (user-provided ffmpeg root)
+     2. Look in PATH via shutil.which()
+     3. Try installing imageio-ffmpeg via pip and use its bundled ffmpeg
+     4. Try pip install ffmpeg (user request) as a last-ditch fallback and re-check PATH/common locations
+
+    On success this updates the module-global ffmpeg_path and ffprobe_path.
+    On failure it raises FileNotFoundError with instructions.
+    """
+    global ffmpeg_path, ffprobe_path
+
+    def _is_exec(p):
+        return bool(p and os.path.exists(p) and os.access(p, os.X_OK))
+
+    # 1) user-provided paths (already set at module top)
+    if _is_exec(ffmpeg_path) and _is_exec(ffprobe_path):
+        return
+
+    # 2) look in PATH
+    path_ffmpeg = shutil.which("ffmpeg")
+    path_ffprobe = shutil.which("ffprobe")
+    if path_ffmpeg:
+        ffmpeg_path = path_ffmpeg
+    if path_ffprobe:
+        ffprobe_path = path_ffprobe
+    if _is_exec(ffmpeg_path) and _is_exec(ffprobe_path):
+        return
+
+    # 3) try imageio-ffmpeg (it bundles a ffmpeg binary that's usable)
+    imageio_ffmpeg = None
+    try:
+        import imageio_ffmpeg  # try import first
+    except Exception:
+        try:
+            print(
+                "⚠ ffmpeg/ffprobe not found — attempting to install imageio-ffmpeg via pip..."
+            )
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", "--upgrade", "imageio-ffmpeg"]
+            )
+            import importlib
+
+            imageio_ffmpeg = importlib.import_module("imageio_ffmpeg")
+        except Exception as e:
+            print("  pip install imageio-ffmpeg failed:", e)
+            imageio_ffmpeg = None
+    else:
+        imageio_ffmpeg = imageio_ffmpeg  # already imported
+
+    if imageio_ffmpeg:
+        try:
+            exe = imageio_ffmpeg.get_ffmpeg_exe()
+            if exe and os.path.exists(exe) and os.access(exe, os.X_OK):
+                ffmpeg_path = exe
+                # ffprobe often sits next to ffmpeg; try to find/provide it
+                candidate_probe = os.path.join(os.path.dirname(exe), "ffprobe")
+                if sys.platform.startswith("win"):
+                    candidate_probe += ".exe"
+                if os.path.exists(candidate_probe) and os.access(
+                    candidate_probe, os.X_OK
+                ):
+                    ffprobe_path = candidate_probe
+                else:
+                    # fallback to PATH probe if available
+                    if shutil.which("ffprobe"):
+                        ffprobe_path = shutil.which("ffprobe")
+                if _is_exec(ffmpeg_path) and _is_exec(ffprobe_path):
+                    return
+        except Exception:
+            pass
+
+    # 4) As user requested: try `pip install ffmpeg` as an additional fallback (may or may not provide a binary)
+    try:
+        print(
+            "⚠ attempting pip install ffmpeg as a fallback (may or may not install binaries)..."
+        )
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "--upgrade", "ffmpeg"]
+        )
+    except Exception as e:
+        print("  pip install ffmpeg failed (or produced no binary):", e)
+
+    # Re-check PATH and several common locations
+    path_ffmpeg = shutil.which("ffmpeg")
+    path_ffprobe = shutil.which("ffprobe")
+    if path_ffmpeg:
+        ffmpeg_path = path_ffmpeg
+    if path_ffprobe:
+        ffprobe_path = path_ffprobe
+
+    for maybe in ["/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/bin/ffmpeg"]:
+        if _is_exec(maybe):
+            ffmpeg_path = maybe
+            break
+    for maybe in ["/usr/bin/ffprobe", "/usr/local/bin/ffprobe", "/bin/ffprobe"]:
+        if _is_exec(maybe):
+            ffprobe_path = maybe
+            break
+
+    if _is_exec(ffmpeg_path) and _is_exec(ffprobe_path):
+        return
+
+    # Final helpful error
+    raise FileNotFoundError(
+        "ffmpeg/ffprobe executables could not be found.\n"
+        f"Tried: user path ({ffmpeg_root_path}), shutil.which, imageio-ffmpeg, pip 'ffmpeg'.\n"
+        "Please install ffmpeg on your system (e.g. apt/yum/brew/choco) or provide a local 'ffmpeg' directory "
+        "with bin/ffmpeg and bin/ffprobe, or ensure ffmpeg/ffprobe are on PATH."
+    )
+
+
 # ---------- Basic validation ----------
-for p in (ffmpeg_path, ffprobe_path):
-    if not os.path.exists(p):
-        raise FileNotFoundError(f"Required executable not found: {p}")
+try:
+    ensure_ffmpeg_binaries()
+except FileNotFoundError as e:
+    # Keep behaviour explicit — you can change this to handle differently in your app
+    print("ERROR: ", e)
+    raise
 
 if not os.path.isdir(image_folder):
     raise FileNotFoundError(f"Image folder not found: {image_folder}")
@@ -56,40 +175,71 @@ if not os.path.isdir(narration_folder):
 
 # ---------- Helpers ----------
 def run(cmd, check=True):
-    """Run subprocess command and return CompletedProcess; prints stderr on error."""
+    """
+    Run subprocess command and return CompletedProcess.
+    Prints debug info and stderr/stdout on failure for easier troubleshooting.
+    """
     try:
         print("\n▶ Running:", " ".join(cmd))
         res = subprocess.run(cmd, capture_output=True, text=True, check=check)
+        # show ffmpeg warnings that might be important (do not flood on success)
+        if res.stderr:
+            print("STDERR (truncated 800 chars):", res.stderr[:800])
         return res
     except subprocess.CalledProcessError as e:
+        # Print full diagnostics to make failure actionable.
         print("\n❌ FFmpeg command failed:")
         print("COMMAND:", " ".join(e.cmd))
         print("RETURN CODE:", e.returncode)
         print("STDOUT:", e.stdout)
         print("STDERR:", e.stderr)
+        # keep original behavior of aborting with SystemExit for clarity in script runs
         raise SystemExit("FFmpeg execution failed. See above for details.")
 
 
 def probe_duration(path):
-    """Return duration in seconds (float) for media file using ffprobe."""
-    cmd = [
-        ffprobe_path,
-        "-v",
-        "error",
-        "-show_entries",
-        "format=duration",
-        "-of",
-        "default=noprint_wrappers=1:nokey=1",
-        path,
-    ]
-    try:
-        res = run(cmd)
-        out = res.stdout.strip()
-        if not out:
-            return None
-        return float(out)
-    except Exception:
-        return None
+    """
+    Return duration in seconds (float) for media file.
+    Preferred: use ffprobe. If ffprobe is unavailable or fails, fall back to
+    parsing ffmpeg -i stderr for 'Duration: HH:MM:SS.xx'.
+    """
+    # Try ffprobe first if available
+    if ffprobe_path and os.path.exists(ffprobe_path):
+        cmd = [
+            ffprobe_path,
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            path,
+        ]
+        try:
+            res = run(cmd)
+            out = (res.stdout or "").strip()
+            if out:
+                return float(out)
+        except Exception:
+            # fall through to ffmpeg parsing
+            pass
+
+    # Fallback: use ffmpeg -i and parse STDERR (Duration: HH:MM:SS.ms)
+    if ffmpeg_path and os.path.exists(ffmpeg_path):
+        try:
+            res = subprocess.run(
+                [ffmpeg_path, "-i", path], capture_output=True, text=True
+            )
+            stderr = res.stderr or ""
+            m = re.search(r"Duration:\s+(\d{2}:\d{2}:\d{2}\.\d+)", stderr)
+            if m:
+                h, m_, s = m.group(1).split(":")
+                secs = int(h) * 3600 + int(m_) * 60 + float(s)
+                return float(secs)
+        except Exception:
+            pass
+
+    return None
 
 
 def find_best_audio(folder):

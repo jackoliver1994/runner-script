@@ -11,3 +11,4 @@ librosa
 scipy
 numba
 ffmpeg-python
+imageio-ffmpeg
