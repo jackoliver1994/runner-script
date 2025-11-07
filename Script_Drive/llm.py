@@ -192,7 +192,7 @@ class ChatAPI:
                             raise RuntimeError(f"Aborting; {stop_reason} after timeout")
                         time.sleep(backoff + random.uniform(0, 1.0))
                         backoff = min(backoff * 2, max_backoff)
-                        timeout = min(timeout + 100, 100000)
+                        timeout = min(timeout + 1000, 100000000)
                         continue
 
                 # If we reach here we have a response_wrapper dict
@@ -211,7 +211,7 @@ class ChatAPI:
                         )
                     time.sleep(backoff + random.uniform(0, 1.0))
                     backoff = min(backoff * 2, max_backoff)
-                    timeout = min(timeout + 100, 100000)
+                    timeout = min(timeout + 1000, 100000000)
                     continue
 
                 status = int(response_wrapper.get("status", 0))
@@ -230,7 +230,7 @@ class ChatAPI:
                         )
                     time.sleep(backoff + random.uniform(0, 1.0))
                     backoff = min(backoff * 2, max_backoff)
-                    timeout = min(timeout + 100, 100000)
+                    timeout = min(timeout + 1000, 100000000)
                     continue
 
                 # Client errors (4xx) - possibly retry if configured; special-case Cloudflare-like 403
@@ -265,7 +265,7 @@ class ChatAPI:
                             )
                         time.sleep(backoff + random.uniform(0, 1.0))
                         backoff = min(backoff * 2, max_backoff)
-                        timeout = min(timeout + 100, 100000)
+                        timeout = min(timeout + 1000, 100000000)
                         continue
 
                     msg_payload = (
@@ -285,7 +285,7 @@ class ChatAPI:
                             )
                         time.sleep(backoff + random.uniform(0, 1.0))
                         backoff = min(backoff * 2, max_backoff)
-                        timeout = min(timeout + 100, 100000)
+                        timeout = min(timeout + 1000, 100000000)
                         continue
                     else:
                         raise RuntimeError(f"Fatal client error (not retried): {msg}")
@@ -306,7 +306,7 @@ class ChatAPI:
                         )
                     time.sleep(backoff + random.uniform(0, 1.0))
                     backoff = min(backoff * 2, max_backoff)
-                    timeout = min(timeout + 100, 100000)
+                    timeout = min(timeout + 1000, 100000000)
                     continue
 
                 # Expecting JSON with {status: "success", response: "..."} per original code
@@ -334,7 +334,7 @@ class ChatAPI:
                         )
                     time.sleep(backoff + random.uniform(0, 1.0))
                     backoff = min(backoff * 2, max_backoff)
-                    timeout = min(timeout + 100, 100000)
+                    timeout = min(timeout + 1000, 100000000)
                     continue
 
             except Exception as e:
@@ -353,7 +353,7 @@ class ChatAPI:
                     )
                 time.sleep(backoff + random.uniform(0, 1.0))
                 backoff = min(backoff * 2, max_backoff)
-                timeout = min(timeout + 100, 100000)
+                timeout = min(timeout + 1000, 100000000)
                 continue
 
             finally:
