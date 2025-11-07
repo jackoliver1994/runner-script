@@ -76,54 +76,113 @@ class ChatAPI:
         initial_backoff: float = 1.0,
         max_backoff: float = 8.0,
         spinner_message: str = "Waiting for response...",
-        max_attempts: Optional[int] = None,
-        max_elapsed_time: Optional[int] = None,
+        max_attempts: Optional[
+            int
+        ] = None,  # None => allow unlimited attempts (preserves infinite loop feature)
+        max_elapsed_time: Optional[
+            int
+        ] = None,  # seconds; None => no elapsed-time limit
     ) -> str:
         """
-        Robust POST with backoff and optional per-call timeout.
-
-        Behavior and fixes:
-        - Preserves all original features (backoff growth, spinner, option to retry client errors).
-        - Adds safe retry limits via max_attempts and max_elapsed_time (so CI/GitHub won't loop forever).
-            * If max_attempts is None:
-                - If retry_forever is True -> a safe default of 60 attempts is used to avoid infinite loops.
-                - If retry_forever is False -> max_attempts becomes 1 (single attempt).
-        - Recognizes common anti-bot/Cloudflare 403 pages (e.g. "Just a moment..." HTML) and treats them
-            as transient server-side issues to be retried even though status is 403.
-        - Ensures spinner is stopped reliably in all codepaths.
-        - Provides useful, truncated messages for HTML responses instead of huge dumps.
+        Robust POST with:
+        - hard per-attempt timeout (SIGALRM on Unix, ThreadPool fallback elsewhere)
+        - guaranteed minimum attempt duration == `timeout` seconds (so attempts won't rush past in 1s)
+        - exponential backoff, spinner, Cloudflare/403 handling, optional guards.
         """
+        import time
+        import json
+        import random
+        import requests
+        import signal
+        import concurrent.futures
+        from typing import Optional
+
         spinner = LoadingSpinner(spinner_message)
         attempt = 0
-        timeout = timeout or self.base_timeout
+        timeout = float(timeout or self.base_timeout)
         backoff = float(initial_backoff)
         start_time = time.monotonic()
 
-        # Safety defaults for stopping conditions
-        if max_attempts is None:
-            # default guard to avoid infinite retries in CI (but user can override by passing max_attempts=None explicitly)
-            max_attempts = 60 if retry_forever else 1
-
-        # Allow explicit zero/None to disable elapsed-time guard; otherwise enforce if provided
-        if max_elapsed_time is not None:
-            max_elapsed_time = int(max_elapsed_time)
-
+        # Helpers
         def _elapsed_seconds() -> int:
             return int(time.monotonic() - start_time)
 
-        # Helper to decide whether to abort retry loop
         def _should_stop_retrying() -> Optional[str]:
-            # returns reason string if should stop, otherwise None
             if max_attempts is not None and attempt >= max_attempts:
                 return f"reached max_attempts={max_attempts}"
-            if max_elapsed_time is not None and _elapsed_seconds() >= max_elapsed_time:
-                return f"reached max_elapsed_time={max_elapsed_time}s"
+            if max_elapsed_time is not None and _elapsed_seconds() >= int(
+                max_elapsed_time
+            ):
+                return f"reached max_elapsed_time={int(max_elapsed_time)}s"
             return None
 
+        def _post_with_hard_timeout(timeout_seconds: float):
+            """
+            Do requests.post but ensure it does not run longer than timeout_seconds.
+            Uses SIGALRM (Unix) or ThreadPoolExecutor fallback.
+            Also passes a requests timeout tuple (connect_timeout, read_timeout) for best-effort shorter internals.
+            """
+            req_kwargs = {
+                "headers": self.headers,
+                "json": {"message": message},
+                # connect timeout smallish; read timeout equals attempt timeout
+                "timeout": (10.0, float(timeout_seconds)),
+            }
+
+            # UNIX path: SIGALRM / setitimer (supports fractional seconds)
+            if hasattr(signal, "SIGALRM"):
+
+                def _alarm_handler(signum, frame):
+                    raise requests.exceptions.Timeout(
+                        f"Hard timeout {timeout_seconds}s reached (SIGALRM)"
+                    )
+
+                old_handler = signal.getsignal(signal.SIGALRM)
+                try:
+                    signal.signal(signal.SIGALRM, _alarm_handler)
+                    signal.setitimer(signal.ITIMER_REAL, float(timeout_seconds))
+                    try:
+                        return requests.post(self.url, **req_kwargs)
+                    finally:
+                        # cancel alarm
+                        signal.setitimer(signal.ITIMER_REAL, 0)
+                finally:
+                    signal.signal(signal.SIGALRM, old_handler)
+
+            # Fallback: ThreadPoolExecutor + future.result(timeout=...)
+            else:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                    future = ex.submit(requests.post, self.url, **req_kwargs)
+                    try:
+                        return future.result(timeout=float(timeout_seconds))
+                    except concurrent.futures.TimeoutError:
+                        future.cancel()
+                        raise requests.exceptions.Timeout(
+                            f"Hard timeout {timeout_seconds}s reached (ThreadPool fallback)"
+                        )
+
+        def _ensure_min_attempt_duration(attempt_start: float, min_duration: float):
+            """
+            Ensures that the current attempt *takes at least* min_duration seconds from attempt_start.
+            Keeps spinner running while waiting.
+            """
+            elapsed = time.monotonic() - attempt_start
+            remaining = float(min_duration) - elapsed
+            if remaining > 0:
+                # Sleep in small chunks to remain responsive to interrupts and keep spinner alive
+                end = time.monotonic() + remaining
+                while time.monotonic() < end:
+                    to_sleep = min(1.0, end - time.monotonic())
+                    if to_sleep <= 0:
+                        break
+                    time.sleep(to_sleep)
+
+        # Main loop: if max_attempts is None, allow unlimited attempts (preserve infinite behavior)
         while True:
             attempt += 1
+            attempt_start = time.monotonic()
 
-            # pre-loop safety check (in case max_attempts==0)
+            # pre-loop guard (if someone set max_attempts==0)
             stop_reason = _should_stop_retrying()
             if stop_reason:
                 raise RuntimeError(
@@ -131,25 +190,27 @@ class ChatAPI:
                 )
 
             try:
-                print(f"\nAttempt #{attempt} — timeout={timeout}s — sending request...")
-                spinner.start()
-                resp = requests.post(
-                    self.url,
-                    headers=self.headers,
-                    json={"message": message},
-                    timeout=timeout,
+                print(
+                    f"\nAttempt #{attempt} — timeout={int(timeout)}s — sending request..."
                 )
-                # Stop spinner immediately after request returns
-                spinner.stop()
+                spinner.start()
 
+                # Make the request with a hard timeout wrapper
+                resp = _post_with_hard_timeout(timeout)
+
+                # We got a response quickly or after some time. **But we must enforce
+                # that this attempt lasts at least `timeout` seconds** before we retry/raise.
+                # Keep spinner running while waiting.
+                _ensure_min_attempt_duration(attempt_start, timeout)
+
+                spinner.stop()
                 status = resp.status_code
 
-                # Treat typical server-side recoverable errors (rate-limit / 5xx) as retriable
+                # Server-side or rate errors -> retry (still enforced min attempt duration above)
                 if status == 429 or 500 <= status < 600:
                     print(
                         f"⚠️ Server/Rate error HTTP {status}. Backing off {backoff:.1f}s and retrying..."
                     )
-                    # check stop conditions before sleeping
                     stop_reason = _should_stop_retrying()
                     if stop_reason:
                         raise RuntimeError(
@@ -157,12 +218,13 @@ class ChatAPI:
                         )
                     time.sleep(backoff + random.uniform(0, 1.0))
                     backoff = min(backoff * 2, max_backoff)
-                    timeout = min(timeout + 1000, 1000000)
+                    # progressive timeout growth preserved
+                    timeout = min(timeout + 100, 100000)
                     continue
 
-                # Handle 4xx client errors
+                # Client errors 4xx
                 if 400 <= status < 500:
-                    # small helper to get readable payload or snippet for big HTML bodies
+
                     def _payload_snippet():
                         ct = resp.headers.get("Content-Type", "")
                         if "application/json" in ct:
@@ -170,13 +232,11 @@ class ChatAPI:
                                 return resp.json()
                             except Exception:
                                 return resp.text[:1000]
-                        # If HTML or big text, return small snippet
                         return (resp.text or f"HTTP {status}")[:1000]
 
                     payload = _payload_snippet()
-
-                    # Detect anti-bot/Cloudflare pages that return 403 but are transient
                     text_lower = (resp.text or "").lower()
+                    # Detect anti-bot HTML returned as 403 and treat as transient (per earlier logic)
                     is_cloudflare_like = status == 403 and (
                         "just a moment" in text_lower
                         or "cf-chl-bypass" in text_lower
@@ -196,10 +256,9 @@ class ChatAPI:
                             )
                         time.sleep(backoff + random.uniform(0, 1.0))
                         backoff = min(backoff * 2, max_backoff)
-                        timeout = min(timeout + 1000, 1000000)
+                        timeout = min(timeout + 100, 100000)
                         continue
 
-                    # For other 4xx, decide to retry only if configured
                     msg_payload = (
                         payload if isinstance(payload, str) else json.dumps(payload)
                     )
@@ -215,17 +274,16 @@ class ChatAPI:
                             )
                         time.sleep(backoff + random.uniform(0, 1.0))
                         backoff = min(backoff * 2, max_backoff)
-                        timeout = min(timeout + 1000, 1000000)
+                        timeout = min(timeout + 100, 100000)
                         continue
                     else:
-                        # fatal client error
+                        # Ensure we still honored the min-attempt-duration above before raising
                         raise RuntimeError(f"Fatal client error (not retried): {msg}")
 
-                # If we reach here, the status is not an error handled above. Ensure raise_for_status for unexpected cases.
+                # Non-error: ensure status ok
                 try:
                     resp.raise_for_status()
                 except requests.HTTPError as he:
-                    # defensive: if raise_for_status triggers for some reason, treat like a retryable server error
                     print(
                         f"⚠️ HTTPError after raise_for_status: {he}. Will back off and retry."
                     )
@@ -236,10 +294,10 @@ class ChatAPI:
                         )
                     time.sleep(backoff + random.uniform(0, 1.0))
                     backoff = min(backoff * 2, max_backoff)
-                    timeout = min(timeout + 1000, 1000000)
+                    timeout = min(timeout + 100, 100000)
                     continue
 
-                # Try to parse JSON
+                # Parse JSON (if not valid, retry)
                 try:
                     result = resp.json()
                 except json.JSONDecodeError as e:
@@ -254,10 +312,10 @@ class ChatAPI:
                         )
                     time.sleep(backoff + random.uniform(0, 1.0))
                     backoff = min(backoff * 2, max_backoff)
-                    timeout = min(timeout + 1000, 1000000)
+                    timeout = min(timeout + 100, 100000)
                     continue
 
-                # Expecting JSON with {status: "success", response: "..."} per original code
+                # Success schema check preserved
                 if isinstance(result, dict) and result.get("status") == "success":
                     content = result.get("response", "")
                     if content is None:
@@ -266,7 +324,6 @@ class ChatAPI:
                     print(f"✅ Success on attempt #{attempt} (elapsed {elapsed}s).")
                     return content
                 else:
-                    # Could be different schema; fallback behavior: retry with backoff
                     err = (
                         result.get("error")
                         if isinstance(result, dict)
@@ -282,10 +339,18 @@ class ChatAPI:
                         )
                     time.sleep(backoff + random.uniform(0, 1.0))
                     backoff = min(backoff * 2, max_backoff)
-                    timeout = min(timeout + 1000, 1000000)
+                    timeout = min(timeout + 100, 100000)
                     continue
 
             except requests.exceptions.Timeout as e:
+                # Request hit the hard-per-attempt timeout or ThreadPool fallback timed out.
+                # We still enforce min-attempt-duration above for request completion; but if the timeout
+                # exception is raised before we honored min duration (e.g., SIGALRM fired),
+                # sleep the remaining time to ensure min attempt duration.
+                try:
+                    _ensure_min_attempt_duration(attempt_start, timeout)
+                except Exception:
+                    pass
                 spinner.stop()
                 print(
                     f"\n⚠️ Timeout on attempt #{attempt}: {e}. Backing off {backoff:.1f}s and retrying..."
@@ -295,15 +360,19 @@ class ChatAPI:
                     raise RuntimeError(f"Aborting; {stop_reason} after timeout")
                 time.sleep(backoff + random.uniform(0, 1.0))
                 backoff = min(backoff * 2, max_backoff)
-                timeout = min(timeout + 1000, 1000000)
+                timeout = min(timeout + 100, 100000)
                 continue
 
             except (
                 requests.exceptions.ConnectionError,
                 requests.exceptions.RequestException,
             ) as e:
+                # Network level issues; ensure min attempt duration before retrying
+                try:
+                    _ensure_min_attempt_duration(attempt_start, timeout)
+                except Exception:
+                    pass
                 spinner.stop()
-                # Treat these as transient network errors and retry
                 print(
                     f"\n⚠️ Network error on attempt #{attempt}: {e}. Backing off {backoff:.1f}s and retrying..."
                 )
@@ -312,15 +381,19 @@ class ChatAPI:
                     raise RuntimeError(f"Aborting; {stop_reason} after network error")
                 time.sleep(backoff + random.uniform(0, 1.0))
                 backoff = min(backoff * 2, max_backoff)
-                timeout = min(timeout + 1000, 1000000)
+                timeout = min(timeout + 100, 100000)
                 continue
 
             except RuntimeError:
-                # Re-raise runtime errors produced above (fatal client error, abort reason...)
                 spinner.stop()
                 raise
 
             except Exception as e:
+                # Unexpected error: ensure min attempt duration then retry
+                try:
+                    _ensure_min_attempt_duration(attempt_start, timeout)
+                except Exception:
+                    pass
                 spinner.stop()
                 print(
                     f"\n⚠️ Unexpected error on attempt #{attempt}: {e}. Backing off {backoff:.1f}s and retrying..."
@@ -332,11 +405,10 @@ class ChatAPI:
                     )
                 time.sleep(backoff + random.uniform(0, 1.0))
                 backoff = min(backoff * 2, max_backoff)
-                timeout = min(timeout + 1000, 1000000)
+                timeout = min(timeout + 100, 100000)
                 continue
 
             finally:
-                # final defensive stop of spinner (idempotent)
                 try:
                     spinner.stop()
                 except Exception:
