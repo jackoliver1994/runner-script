@@ -1,58 +1,62 @@
-name: Run script (6h) and upload video
+name: Launch EC2, keep 6h, terminate
 
 on:
-  workflow_dispatch:    # manual trigger from Actions UI
+  workflow_dispatch:
 
 jobs:
-  run-and-upload:
+  start-ec2:
     runs-on: ubuntu-latest
-    timeout-minutes: 360   # 6 hours max on GitHub-hosted runners
+    timeout-minutes: 360
+    env:
+      AWS_REGION: us-east-1
+      INSTANCE_TYPE: t3.micro
+      AMI_ID: ami-0123456789abcdef0   # replace with valid AMI for your region
+      KEY_NAME: my-github-keypair     # must exist in your AWS account
+      SECURITY_GROUP_ID: sg-0abcd1234 # must allow SSH (22) if you want to SSH
 
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v4
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
         with:
-          python-version: "3.11"
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
 
-      - name: Install dependencies
+      - name: Launch EC2 instance
+        id: launch
         run: |
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          INSTANCE_ID=$(aws ec2 run-instances \
+            --image-id $AMI_ID \
+            --instance-type $INSTANCE_TYPE \
+            --key-name $KEY_NAME \
+            --security-group-ids $SECURITY_GROUP_ID \
+            --query 'Instances[0].InstanceId' --output text)
+          echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
+          echo "Launched $INSTANCE_ID"
+          # Wait for instance to be running and get public ip
+          aws ec2 wait instance-running --instance-ids $INSTANCE_ID
+          PUBLIC_IP=$(aws ec2 describe-instances --instance-ids $INSTANCE_ID \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+          echo "public_ip=$PUBLIC_IP" >> $GITHUB_OUTPUT
 
-      - name: Run your script (llm)
-        env:
-          R_HOURS: "6"
+      - name: Print connection info
         run: |
-          cd Script_Drive
-          python llm.py
-          
-      - name: Run your script (pollinations_image_genrate)
-        env:
-          R_HOURS: "6"
-        run: |
-          cd Script_Drive
-          python pollinations_image_genrate.py
-          
-      - name: Run your script (Coqui-narration)
-        env:
-          R_HOURS: "6"
-        run: |
-          cd Script_Drive
-          python Coqui-Colab.py
+          echo "Instance ID: ${{ steps.launch.outputs.instance_id }}"
+          echo "Public IP:  ${{ steps.launch.outputs.public_ip }}"
+          echo "You can SSH to it with: ssh -i /path/to/your/key.pem ec2-user@${{ steps.launch.outputs.public_ip }}"
 
-      - name: Run your script (video_genrate)
-        env:
-          R_HOURS: "6"
+      - name: Keep EC2 running for 6 hours
         run: |
-          cd Script_Drive
-          python video_genrate.py
+          echo "Sleeping for 6 hours while EC2 stays up..."
+          sleep 21600
 
-      - name: Run your script (remove_logo_from_video)
-        env:
-          R_HOURS: "6"
+      - name: Terminate EC2 instance
+        if: always()
         run: |
-          cd Script_Drive
-          python remove_logo_from_video.py
+          echo "Terminating instance ${{ steps.launch.outputs.instance_id }}"
+          aws ec2 terminate-instances --instance-ids ${{ steps.launch.outputs.instance_id }}
+          aws ec2 wait instance-terminated --instance-ids ${{ steps.launch.outputs.instance_id }}
+          echo "Terminated"
