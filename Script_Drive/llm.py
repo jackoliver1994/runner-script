@@ -75,150 +75,125 @@ class ChatAPI:
         retry_on_client_errors: bool = False,
         initial_backoff: float = 1.0,
         max_backoff: float = 8.0,
-        spinner_base: str = "Waiting for response",
-        retry_on_html_4xx: bool = False,  # default: do NOT keep retrying HTML 4xx blindly
-        max_attempts_for_non_forever: int = 6,
+        spinner_message: str = "Waiting for response.",
+        retry_on_html_4xx: bool = True,  # treat HTML 4xx as transient by default
     ) -> str:
         """
-        Robust POST with exponential backoff.
+        Robust POST with exponential backoff and optional per-call timeout.
 
-        Key changes vs your original:
-        - Compose spinner message inside the retry loop so the attempt number is correct.
-        - Use requests.Session() for connection reuse.
-        - Treat HTML 4xx (Cloudflare/CAPTCHA) as fatal by default (configurable).
-        - Provide helpful debug output for 403 responses.
-        - Keep timeout growth bounded to reasonable values.
+        - Preserves infinite-retry by default (retry_forever=True).
+        - If retry_forever=False, we cap attempts (max_attempts_for_non_forever).
+        - Use a local copy of headers to avoid mutating self.headers across threads/calls.
+        - If a 200/2xx is returned but body isn't JSON, return resp.text (do not treat as transient).
         """
         import requests
         import random
         import time
         import json
-        from copy import deepcopy
 
-        # local safe copy of headers
+        # local headers copy so we don't mutate self.headers globally
         headers = dict(self.headers or {})
         headers.setdefault(
             "User-Agent", "StoryPipeline/1.0 (+https://github.com/your-repo)"
         )
         headers.setdefault("Accept", "application/json, text/plain, text/html;q=0.9")
 
-        spinner = LoadingSpinner("")  # message will be set per-attempt
+        spinner = LoadingSpinner(spinner_message)
         attempt = 0
-        timeout = timeout or getattr(self, "base_timeout", 60)
+        timeout = timeout or self.base_timeout
         backoff = initial_backoff
-        session = requests.Session()
-        session.headers.update(headers)
+        start_time = time.monotonic()
 
+        # small helper to inspect body for obvious HTML/challenge patterns
         def _looks_like_html_challenge(body: str) -> bool:
             if not body:
                 return False
             low = body.lower()
-            # detect HTML, Cloudflare, js/cookies requirement, etc.
             if "<!doctype html" in low or "<html" in low:
-                # treat any HTML as suspicious; keywords make it more certain
-                keywords = (
-                    "just a moment",
-                    "cf-chl-bypass",
-                    "cloudflare",
-                    "enable javascript and cookies",
-                    "captcha",
-                )
-                if any(k in low for k in keywords):
+                if (
+                    "just a moment" in low
+                    or "cf-chl-bypass" in low
+                    or "cloudflare" in low
+                    or "enable javascript and cookies" in low
+                ):
                     return True
-                # fallback: generic HTML body from an endpoint that should return JSON
                 return True
             return False
 
+        # if caller doesn't want infinite retries, pick a reasonable cap
+        max_attempts_for_non_forever = 6
+
         while True:
             attempt += 1
-            # build a dynamic spinner/log message that includes the current attempt
-            spinner_msg = f"{spinner_base} (attempt {attempt})..."
-            (
-                spinner.update_message(spinner_msg)
-                if hasattr(spinner, "update_message")
-                else None
-            )
-
             try:
                 print(f"\nAttempt #{attempt} — timeout={timeout}s — sending request.")
-                spinner.start(spinner_msg) if hasattr(spinner, "start") else None
-
-                resp = session.post(
+                spinner.start()
+                resp = requests.post(
                     self.url,
+                    headers=headers,
                     json={"message": message},
                     timeout=timeout,
                 )
-
-                spinner.stop() if hasattr(spinner, "stop") else None
+                spinner.stop()
 
                 status = resp.status_code
                 content_type = resp.headers.get("Content-Type", "") or ""
-                text_body = resp.text or ""
 
-                # Successful responses (2xx)
+                # handle success-ish responses (2xx)
                 if 200 <= status < 300:
+                    # try JSON first if content-type indicates JSON or if body looks like JSON
+                    text_body = resp.text or ""
                     if "application/json" in content_type.lower():
                         try:
                             j = resp.json()
+                            # If the API uses {"response": ...} convention, prefer that
                             if isinstance(j, dict) and "response" in j:
                                 return j["response"]
+                            # otherwise return the full JSON string for callers to interpret
                             return json.dumps(j, ensure_ascii=False)
                         except Exception:
+                            # fall back to returning text body (valid 200, non-JSON)
                             return text_body
                     else:
-                        # valid 2xx but not JSON — return text
+                        # not JSON content-type -> still often valid; return text to avoid unnecessary retries
                         return text_body
 
-                # Rate limit / server errors -> retry
+                # handle rate limit / server errors -> retry
                 if status == 429 or 500 <= status < 600:
                     print(
                         f"\n⚠️ Server returned {status}. Backing off {backoff:.1f}s and retrying..."
                     )
                     time.sleep(backoff + random.uniform(0, 1.0))
                     backoff = min(backoff * 2, max_backoff)
-                    # modest timeout increase but bounded
-                    timeout = min(timeout + 30, 1200)
+                    # for robustness slowly increase timeout on retries (keeps infinite behavior)
+                    timeout = min(timeout + 100, 100000)
+                    # if non-forever and we passed the cap -> raise
                     if not retry_forever and attempt >= max_attempts_for_non_forever:
                         raise RuntimeError(
                             f"send_message failed after {attempt} attempts with status {status}"
                         )
                     continue
 
-                # HTML 4xx challenge (usually Cloudflare / CAPTCHA) -> usually fatal
-                if 400 <= status < 500 and _looks_like_html_challenge(text_body):
-                    # helpful debug for 403 from GitHub or Cloudflare
-                    print(f"\n⚠️ Received an HTML 4xx challenge (status {status}).")
-                    # show a short slice of body for debugging (don't dump huge HTML)
-                    snippet = (
-                        (text_body[:1000] + "...")
-                        if len(text_body) > 1000
-                        else text_body
+                # handle HTML 4xx challenges (optionally treat transient)
+                body_text = resp.text or ""
+                if (
+                    retry_on_html_4xx
+                    and 400 <= status < 500
+                    and _looks_like_html_challenge(body_text)
+                ):
+                    print(
+                        f"\n⚠️ Received an HTML 4xx challenge (status {status}). Backing off {backoff:.1f}s and retrying..."
                     )
-                    print(f"Response headers: {dict(resp.headers)}")
-                    print(f"Response body snippet: {snippet!r}")
-
-                    if retry_on_html_4xx:
-                        print(
-                            f"Retrying HTML 4xx (backoff {backoff:.1f}s) because retry_on_html_4xx=True"
-                        )
-                        time.sleep(backoff + random.uniform(0, 1.0))
-                        backoff = min(backoff * 2, max_backoff)
-                        timeout = min(timeout + 30, 1200)
-                        if (
-                            not retry_forever
-                            and attempt >= max_attempts_for_non_forever
-                        ):
-                            raise RuntimeError(
-                                f"send_message failed after {attempt} attempts due to HTML 4xx challenge (status {status})."
-                            )
-                        continue
-                    else:
-                        # fatal: fail fast and give details so caller can fix headers/auth/endpoint
+                    time.sleep(backoff + random.uniform(0, 1.0))
+                    backoff = min(backoff * 2, max_backoff)
+                    timeout = min(timeout + 100, 100000)
+                    if not retry_forever and attempt >= max_attempts_for_non_forever:
                         raise RuntimeError(
-                            f"Fatal HTML 4xx challenge (status {status}). Check endpoint/auth/headers and if this is a Cloudflare challenge."
+                            f"send_message failed after {attempt} attempts due to HTML 4xx challenge (status {status})."
                         )
+                    continue
 
-                # other client errors (4xx)
+                # other client errors (4xx) - either treat as fatal or allow caller to request retries
                 if 400 <= status < 500:
                     if retry_on_client_errors:
                         print(
@@ -226,7 +201,7 @@ class ChatAPI:
                         )
                         time.sleep(backoff + random.uniform(0, 1.0))
                         backoff = min(backoff * 2, max_backoff)
-                        timeout = min(timeout + 30, 1200)
+                        timeout = min(timeout + 100, 100000)
                         if (
                             not retry_forever
                             and attempt >= max_attempts_for_non_forever
@@ -236,18 +211,16 @@ class ChatAPI:
                             )
                         continue
                     else:
-                        # fatal client error: return body for debugging
-                        raise RuntimeError(
-                            f"Fatal client error: {status} {text_body[:1000]}"
-                        )
+                        # fatal client error
+                        raise RuntimeError(f"Fatal client error: {status} {resp.text}")
 
-                # any other unexpected status -> retry conservatively
+                # fallback: unexpected status -> treat as transient and retry
                 print(
                     f"\n⚠️ Unexpected status {status}. Backing off {backoff:.1f}s and retrying..."
                 )
                 time.sleep(backoff + random.uniform(0, 1.0))
                 backoff = min(backoff * 2, max_backoff)
-                timeout = min(timeout + 30, 1200)
+                timeout = min(timeout + 100, 100000)
                 if not retry_forever and attempt >= max_attempts_for_non_forever:
                     raise RuntimeError(
                         f"send_message failed after {attempt} attempts (unexpected status {status})."
@@ -255,13 +228,13 @@ class ChatAPI:
                 continue
 
             except requests.exceptions.RequestException as re:
-                spinner.stop() if hasattr(spinner, "stop") else None
+                spinner.stop()
                 print(
                     f"\n⚠️ Request error on attempt #{attempt}: {re}. Backing off {backoff:.1f}s and retrying."
                 )
                 time.sleep(backoff + random.uniform(0, 1.0))
                 backoff = min(backoff * 2, max_backoff)
-                timeout = min(timeout + 30, 1200)
+                timeout = min(timeout + 100, 100000)
                 if not retry_forever and attempt >= max_attempts_for_non_forever:
                     raise RuntimeError(
                         f"send_message failed after {attempt} attempts due to network errors: {re}"
@@ -269,17 +242,17 @@ class ChatAPI:
                 continue
 
             except RuntimeError:
-                spinner.stop() if hasattr(spinner, "stop") else None
+                spinner.stop()
                 raise
 
             except Exception as e:
-                spinner.stop() if hasattr(spinner, "stop") else None
+                spinner.stop()
                 print(
                     f"\n⚠️ Unexpected error on attempt #{attempt}: {e}. Backing off {backoff:.1f}s and retrying."
                 )
                 time.sleep(backoff + random.uniform(0, 1.0))
                 backoff = min(backoff * 2, max_backoff)
-                timeout = min(timeout + 30, 1200)
+                timeout = min(timeout + 100, 100000)
                 if not retry_forever and attempt >= max_attempts_for_non_forever:
                     raise RuntimeError(
                         f"send_message failed after {attempt} attempts due to: {e}"
@@ -288,7 +261,7 @@ class ChatAPI:
 
             finally:
                 try:
-                    spinner.stop() if hasattr(spinner, "stop") else None
+                    spinner.stop()
                 except Exception:
                     pass
 
