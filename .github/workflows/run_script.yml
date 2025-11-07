@@ -22,53 +22,6 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Call ApiFreeLLM (curl, with custom User-Agent + retries)
-        run: |
-          URL="https://apifreellm.com/api/chat"
-          DATA='{"model":"gpt-3.5-mini","messages":[{"role":"user","content":"hi"}]}'
-          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-          attempt=0
-          max_attempts=5
-          until [ $attempt -ge $max_attempts ]
-          do
-            attempt=$((attempt+1))
-            echo "Attempt #$attempt..."
-            curl -v --fail --show-error \
-              -A "$UA" \
-              -H "Accept: application/json" \
-              -H "Content-Type: application/json" \
-              --max-time 60 \
-              -d "$DATA" \
-              "$URL" && break
-            echo "Request failed — sleeping before retry..."
-            sleep $((attempt * 2))
-          done
-
-      - name: Call ApiFreeLLM (node fetch)
-        run: |
-          node -e "
-          const fetch = (...args) => import('node-fetch').then(m=>m.default(...args));
-          (async () => {
-            const url = 'https://apifreellm.com/api/chat';
-            const body = { model: 'gpt-3.5-mini', messages: [{ role: 'user', content: 'hello from GH Actions' }] };
-            const res = await fetch(url, {
-              method: 'POST',
-              headers: {
-                'User-Agent': 'Mozilla/5.0 (compatible; MyGithubAction/1.0)',
-                'Content-Type': 'application/json',
-                'Accept': 'application/json'
-              },
-              body: JSON.stringify(body),
-              timeout: 60000
-            });
-            console.log('status', res.status);
-            console.log('headers', Object.fromEntries(res.headers.entries()));
-            const text = await res.text();
-            console.log('body:', text);
-          })().catch(e=>{ console.error(e); process.exit(1) });
-          "
-
-
       - name: Run your script (llm)
         env:
           R_HOURS: "6"
