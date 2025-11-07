@@ -75,170 +75,119 @@ class ChatAPI:
         retry_on_client_errors: bool = False,
         initial_backoff: float = 1.0,
         max_backoff: float = 8.0,
-        spinner_message: str = "Waiting for response.",
-        retry_on_html_4xx: bool = True,  # treat HTML 4xx as transient by default
+        spinner_message: str = "Waiting for response...",
     ) -> str:
         """
-        Robust POST with exponential backoff and optional per-call timeout.
-
-        - Preserves infinite-retry by default (retry_forever=True).
-        - If retry_forever=False, we cap attempts (max_attempts_for_non_forever).
-        - Use a local copy of headers to avoid mutating self.headers across threads/calls.
-        - If a 200/2xx is returned but body isn't JSON, return resp.text (do not treat as transient).
+        Robust POST with backoff and optional per-call timeout.
+        Returns the raw response text or raises RuntimeError on fatal client error.
         """
-        import requests
-        import random
-        import time
-        import json
-
-        # local headers copy so we don't mutate self.headers globally
-        headers = dict(self.headers or {})
-        headers.setdefault(
-            "User-Agent", "StoryPipeline/1.0 (+https://github.com/your-repo)"
-        )
-        headers.setdefault("Accept", "application/json, text/plain, text/html;q=0.9")
-
         spinner = LoadingSpinner(spinner_message)
         attempt = 0
         timeout = timeout or self.base_timeout
         backoff = initial_backoff
         start_time = time.monotonic()
 
-        # small helper to inspect body for obvious HTML/challenge patterns
-        def _looks_like_html_challenge(body: str) -> bool:
-            if not body:
-                return False
-            low = body.lower()
-            if "<!doctype html" in low or "<html" in low:
-                if (
-                    "just a moment" in low
-                    or "cf-chl-bypass" in low
-                    or "cloudflare" in low
-                    or "enable javascript and cookies" in low
-                ):
-                    return True
-                return True
-            return False
-
-        # if caller doesn't want infinite retries, pick a reasonable cap
-        max_attempts_for_non_forever = 6
-
         while True:
             attempt += 1
             try:
-                print(f"\nAttempt #{attempt} — timeout={timeout}s — sending request.")
+                print(f"\nAttempt #{attempt} — timeout={timeout}s — sending request...")
                 spinner.start()
                 resp = requests.post(
                     self.url,
-                    headers=headers,
+                    headers=self.headers,
                     json={"message": message},
                     timeout=timeout,
                 )
                 spinner.stop()
 
                 status = resp.status_code
-                content_type = resp.headers.get("Content-Type", "") or ""
 
-                # handle success-ish responses (2xx)
-                if 200 <= status < 300:
-                    # try JSON first if content-type indicates JSON or if body looks like JSON
-                    text_body = resp.text or ""
-                    if "application/json" in content_type.lower():
-                        try:
-                            j = resp.json()
-                            # If the API uses {"response": ...} convention, prefer that
-                            if isinstance(j, dict) and "response" in j:
-                                return j["response"]
-                            # otherwise return the full JSON string for callers to interpret
-                            return json.dumps(j, ensure_ascii=False)
-                        except Exception:
-                            # fall back to returning text body (valid 200, non-JSON)
-                            return text_body
-                    else:
-                        # not JSON content-type -> still often valid; return text to avoid unnecessary retries
-                        return text_body
-
-                # handle rate limit / server errors -> retry
                 if status == 429 or 500 <= status < 600:
                     print(
-                        f"\n⚠️ Server returned {status}. Backing off {backoff:.1f}s and retrying..."
-                    )
-                    time.sleep(backoff + random.uniform(0, 1.0))
-                    backoff = min(backoff * 2, max_backoff)
-                    # for robustness slowly increase timeout on retries (keeps infinite behavior)
-                    timeout = min(timeout + 100, 100000)
-                    # if non-forever and we passed the cap -> raise
-                    if not retry_forever and attempt >= max_attempts_for_non_forever:
-                        raise RuntimeError(
-                            f"send_message failed after {attempt} attempts with status {status}"
-                        )
-                    continue
-
-                # handle HTML 4xx challenges (optionally treat transient)
-                body_text = resp.text or ""
-                if (
-                    retry_on_html_4xx
-                    and 400 <= status < 500
-                    and _looks_like_html_challenge(body_text)
-                ):
-                    print(
-                        f"\n⚠️ Received an HTML 4xx challenge (status {status}). Backing off {backoff:.1f}s and retrying..."
+                        f"⚠️ Server/Rate error HTTP {status}. Backing off {backoff:.1f}s and retrying..."
                     )
                     time.sleep(backoff + random.uniform(0, 1.0))
                     backoff = min(backoff * 2, max_backoff)
                     timeout = min(timeout + 100, 100000)
-                    if not retry_forever and attempt >= max_attempts_for_non_forever:
-                        raise RuntimeError(
-                            f"send_message failed after {attempt} attempts due to HTML 4xx challenge (status {status})."
-                        )
                     continue
 
-                # other client errors (4xx) - either treat as fatal or allow caller to request retries
                 if 400 <= status < 500:
+                    # client error - optionally retry
+                    try:
+                        payload = resp.json()
+                        error_msg = payload.get("error") or json.dumps(payload)
+                    except Exception:
+                        error_msg = resp.text or f"HTTP {status}"
+                    msg = f"HTTP {status} - {error_msg}"
+
                     if retry_on_client_errors:
                         print(
-                            f"\n⚠️ Client error {status} but retry_on_client_errors=True -> backing off and retrying."
+                            f"⚠️ Client error {msg} — retrying because retry_on_client_errors=True. Backoff {backoff:.1f}s..."
                         )
                         time.sleep(backoff + random.uniform(0, 1.0))
                         backoff = min(backoff * 2, max_backoff)
                         timeout = min(timeout + 100, 100000)
-                        if (
-                            not retry_forever
-                            and attempt >= max_attempts_for_non_forever
-                        ):
-                            raise RuntimeError(
-                                f"send_message failed after {attempt} attempts with client error {status}"
-                            )
                         continue
                     else:
-                        # fatal client error
-                        raise RuntimeError(f"Fatal client error: {status} {resp.text}")
+                        raise RuntimeError(f"Fatal client error (not retried): {msg}")
 
-                # fallback: unexpected status -> treat as transient and retry
-                print(
-                    f"\n⚠️ Unexpected status {status}. Backing off {backoff:.1f}s and retrying..."
-                )
-                time.sleep(backoff + random.uniform(0, 1.0))
-                backoff = min(backoff * 2, max_backoff)
-                timeout = min(timeout + 100, 100000)
-                if not retry_forever and attempt >= max_attempts_for_non_forever:
-                    raise RuntimeError(
-                        f"send_message failed after {attempt} attempts (unexpected status {status})."
+                # non-error status
+                resp.raise_for_status()
+                try:
+                    result = resp.json()
+                except json.JSONDecodeError as e:
+                    print(
+                        f"⚠️ Invalid JSON received (will retry): {e}. Backing off {backoff:.1f}s..."
                     )
-                continue
+                    time.sleep(backoff + random.uniform(0, 1.0))
+                    backoff = min(backoff * 2, max_backoff)
+                    timeout = min(timeout + 100, 100000)
+                    continue
 
-            except requests.exceptions.RequestException as re:
+                # Expecting JSON with {status: "success", response: "..."} per original code
+                if isinstance(result, dict) and result.get("status") == "success":
+                    content = result.get("response", "")
+                    if content is None:
+                        content = ""
+                    elapsed = int(time.monotonic() - start_time)
+                    print(f"✅ Success on attempt #{attempt} (elapsed {elapsed}s).")
+                    return content
+                else:
+                    # Could be different schema; we'll try fallback to string form
+                    err = (
+                        result.get("error")
+                        if isinstance(result, dict)
+                        else f"Unexpected body: {result}"
+                    )
+                    print(
+                        f"⚠️ API returned error or unexpected payload: {err}. Backing off {backoff:.1f}s and retrying..."
+                    )
+                    time.sleep(backoff + random.uniform(0, 1.0))
+                    backoff = min(backoff * 2, max_backoff)
+                    timeout = min(timeout + 100, 100000)
+                    continue
+
+            except requests.exceptions.Timeout as e:
                 spinner.stop()
                 print(
-                    f"\n⚠️ Request error on attempt #{attempt}: {re}. Backing off {backoff:.1f}s and retrying."
+                    f"\n⚠️ Timeout on attempt #{attempt}: {e}. Backing off {backoff:.1f}s and retrying..."
                 )
                 time.sleep(backoff + random.uniform(0, 1.0))
                 backoff = min(backoff * 2, max_backoff)
                 timeout = min(timeout + 100, 100000)
-                if not retry_forever and attempt >= max_attempts_for_non_forever:
-                    raise RuntimeError(
-                        f"send_message failed after {attempt} attempts due to network errors: {re}"
-                    )
+                continue
+
+            except (
+                requests.exceptions.ConnectionError,
+                requests.exceptions.RequestException,
+            ) as e:
+                spinner.stop()
+                print(
+                    f"\n⚠️ Network error on attempt #{attempt}: {e}. Backing off {backoff:.1f}s and retrying..."
+                )
+                time.sleep(backoff + random.uniform(0, 1.0))
+                backoff = min(backoff * 2, max_backoff)
+                timeout = min(timeout + 100, 100000)
                 continue
 
             except RuntimeError:
@@ -248,15 +197,11 @@ class ChatAPI:
             except Exception as e:
                 spinner.stop()
                 print(
-                    f"\n⚠️ Unexpected error on attempt #{attempt}: {e}. Backing off {backoff:.1f}s and retrying."
+                    f"\n⚠️ Unexpected error on attempt #{attempt}: {e}. Backing off {backoff:.1f}s and retrying..."
                 )
                 time.sleep(backoff + random.uniform(0, 1.0))
                 backoff = min(backoff * 2, max_backoff)
                 timeout = min(timeout + 100, 100000)
-                if not retry_forever and attempt >= max_attempts_for_non_forever:
-                    raise RuntimeError(
-                        f"send_message failed after {attempt} attempts due to: {e}"
-                    )
                 continue
 
             finally:
