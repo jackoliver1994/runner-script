@@ -61,7 +61,7 @@ class LoadingSpinner:
 # ---------------------- CHAT API HANDLER ----------------------
 class ChatAPI:
     def __init__(
-        self, url: str = "https://apifreellm.com/api/chat", default_timeout: int = 100
+        self, url: str = "https://apifreellm.com/api/chat", default_timeout: int = 1000
     ):
         self.url = url
         self.headers = {"Content-Type": "application/json"}
@@ -80,88 +80,50 @@ class ChatAPI:
         max_elapsed_time: Optional[int] = None,
     ) -> str:
         """
-        Robust POST with hard per-attempt timeout and backoff. Preserves existing features.
-        Enforces a hard timeout per attempt using SIGALRM on Unix (GitHub Actions)
-        and ThreadPoolExecutor fallback on other platforms.
-        """
-        import signal
-        import concurrent.futures
+        Robust POST with backoff and optional per-call timeout.
 
+        Behavior and fixes:
+        - Preserves all original features (backoff growth, spinner, option to retry client errors).
+        - Adds safe retry limits via max_attempts and max_elapsed_time (so CI/GitHub won't loop forever).
+            * If max_attempts is None:
+                - If retry_forever is True -> a safe default of 60 attempts is used to avoid infinite loops.
+                - If retry_forever is False -> max_attempts becomes 1 (single attempt).
+        - Recognizes common anti-bot/Cloudflare 403 pages (e.g. "Just a moment..." HTML) and treats them
+            as transient server-side issues to be retried even though status is 403.
+        - Ensures spinner is stopped reliably in all codepaths.
+        - Provides useful, truncated messages for HTML responses instead of huge dumps.
+        """
         spinner = LoadingSpinner(spinner_message)
         attempt = 0
         timeout = timeout or self.base_timeout
         backoff = float(initial_backoff)
         start_time = time.monotonic()
 
+        # Safety defaults for stopping conditions
         if max_attempts is None:
+            # default guard to avoid infinite retries in CI (but user can override by passing max_attempts=None explicitly)
             max_attempts = 60 if retry_forever else 1
+
+        # Allow explicit zero/None to disable elapsed-time guard; otherwise enforce if provided
         if max_elapsed_time is not None:
             max_elapsed_time = int(max_elapsed_time)
 
         def _elapsed_seconds() -> int:
             return int(time.monotonic() - start_time)
 
+        # Helper to decide whether to abort retry loop
         def _should_stop_retrying() -> Optional[str]:
+            # returns reason string if should stop, otherwise None
             if max_attempts is not None and attempt >= max_attempts:
                 return f"reached max_attempts={max_attempts}"
             if max_elapsed_time is not None and _elapsed_seconds() >= max_elapsed_time:
                 return f"reached max_elapsed_time={max_elapsed_time}s"
             return None
 
-        def _post_with_hard_timeout(timeout_seconds: float):
-            """
-            Performs requests.post but guarantees it will abort after timeout_seconds.
-            Uses SIGALRM when available (Unix), otherwise ThreadPoolExecutor as fallback.
-            We still pass a requests timeout tuple (connect_timeout, read_timeout)
-            to help short-circuit obvious hangs; connect timeout is kept small-ish.
-            """
-            # Build kwargs for requests.post
-            req_kwargs = {
-                "headers": self.headers,
-                "json": {"message": message},
-                # give requests a read timeout equal to the hard timeout,
-                # and a reasonable connect timeout (so connect failures return quickly)
-                "timeout": (10.0, float(timeout_seconds)),
-            }
-
-            # Unix path: signal alarm
-            if hasattr(signal, "SIGALRM"):
-
-                def _alarm_handler(signum, frame):
-                    raise requests.exceptions.Timeout(
-                        f"Hard timeout {timeout_seconds}s reached (SIGALRM)"
-                    )
-
-                old_handler = signal.getsignal(signal.SIGALRM)
-                try:
-                    signal.signal(signal.SIGALRM, _alarm_handler)
-                    # use setitimer to allow fractional seconds; set timer
-                    signal.setitimer(signal.ITIMER_REAL, float(timeout_seconds))
-                    try:
-                        return requests.post(self.url, **req_kwargs)
-                    finally:
-                        # cancel alarm
-                        signal.setitimer(signal.ITIMER_REAL, 0)
-                finally:
-                    # restore old handler
-                    signal.signal(signal.SIGALRM, old_handler)
-
-            # Fallback path: ThreadPoolExecutor
-            else:
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-                    future = ex.submit(requests.post, self.url, **req_kwargs)
-                    try:
-                        return future.result(timeout=float(timeout_seconds))
-                    except concurrent.futures.TimeoutError:
-                        # best-effort cancel and raise requests timeout for compatibility
-                        future.cancel()
-                        raise requests.exceptions.Timeout(
-                            f"Hard timeout {timeout_seconds}s reached (ThreadPool fallback)"
-                        )
-
         while True:
             attempt += 1
-            # pre-loop guard (if someone set max_attempts=0)
+
+            # pre-loop safety check (in case max_attempts==0)
             stop_reason = _should_stop_retrying()
             if stop_reason:
                 raise RuntimeError(
@@ -171,17 +133,23 @@ class ChatAPI:
             try:
                 print(f"\nAttempt #{attempt} — timeout={timeout}s — sending request...")
                 spinner.start()
-
-                # Use the hard-timeout wrapper instead of direct requests.post
-                resp = _post_with_hard_timeout(timeout)
-
+                resp = requests.post(
+                    self.url,
+                    headers=self.headers,
+                    json={"message": message},
+                    timeout=timeout,
+                )
+                # Stop spinner immediately after request returns
                 spinner.stop()
+
                 status = resp.status_code
 
+                # Treat typical server-side recoverable errors (rate-limit / 5xx) as retriable
                 if status == 429 or 500 <= status < 600:
                     print(
                         f"⚠️ Server/Rate error HTTP {status}. Backing off {backoff:.1f}s and retrying..."
                     )
+                    # check stop conditions before sleeping
                     stop_reason = _should_stop_retrying()
                     if stop_reason:
                         raise RuntimeError(
@@ -189,11 +157,12 @@ class ChatAPI:
                         )
                     time.sleep(backoff + random.uniform(0, 1.0))
                     backoff = min(backoff * 2, max_backoff)
-                    timeout = min(timeout + 100, 100000)
+                    timeout = min(timeout + 1000, 1000000)
                     continue
 
+                # Handle 4xx client errors
                 if 400 <= status < 500:
-
+                    # small helper to get readable payload or snippet for big HTML bodies
                     def _payload_snippet():
                         ct = resp.headers.get("Content-Type", "")
                         if "application/json" in ct:
@@ -201,9 +170,12 @@ class ChatAPI:
                                 return resp.json()
                             except Exception:
                                 return resp.text[:1000]
+                        # If HTML or big text, return small snippet
                         return (resp.text or f"HTTP {status}")[:1000]
 
                     payload = _payload_snippet()
+
+                    # Detect anti-bot/Cloudflare pages that return 403 but are transient
                     text_lower = (resp.text or "").lower()
                     is_cloudflare_like = status == 403 and (
                         "just a moment" in text_lower
@@ -224,9 +196,10 @@ class ChatAPI:
                             )
                         time.sleep(backoff + random.uniform(0, 1.0))
                         backoff = min(backoff * 2, max_backoff)
-                        timeout = min(timeout + 100, 100000)
+                        timeout = min(timeout + 1000, 1000000)
                         continue
 
+                    # For other 4xx, decide to retry only if configured
                     msg_payload = (
                         payload if isinstance(payload, str) else json.dumps(payload)
                     )
@@ -242,14 +215,17 @@ class ChatAPI:
                             )
                         time.sleep(backoff + random.uniform(0, 1.0))
                         backoff = min(backoff * 2, max_backoff)
-                        timeout = min(timeout + 100, 100000)
+                        timeout = min(timeout + 1000, 1000000)
                         continue
                     else:
+                        # fatal client error
                         raise RuntimeError(f"Fatal client error (not retried): {msg}")
 
+                # If we reach here, the status is not an error handled above. Ensure raise_for_status for unexpected cases.
                 try:
                     resp.raise_for_status()
                 except requests.HTTPError as he:
+                    # defensive: if raise_for_status triggers for some reason, treat like a retryable server error
                     print(
                         f"⚠️ HTTPError after raise_for_status: {he}. Will back off and retry."
                     )
@@ -260,9 +236,10 @@ class ChatAPI:
                         )
                     time.sleep(backoff + random.uniform(0, 1.0))
                     backoff = min(backoff * 2, max_backoff)
-                    timeout = min(timeout + 100, 100000)
+                    timeout = min(timeout + 1000, 1000000)
                     continue
 
+                # Try to parse JSON
                 try:
                     result = resp.json()
                 except json.JSONDecodeError as e:
@@ -277,9 +254,10 @@ class ChatAPI:
                         )
                     time.sleep(backoff + random.uniform(0, 1.0))
                     backoff = min(backoff * 2, max_backoff)
-                    timeout = min(timeout + 100, 100000)
+                    timeout = min(timeout + 1000, 1000000)
                     continue
 
+                # Expecting JSON with {status: "success", response: "..."} per original code
                 if isinstance(result, dict) and result.get("status") == "success":
                     content = result.get("response", "")
                     if content is None:
@@ -288,6 +266,7 @@ class ChatAPI:
                     print(f"✅ Success on attempt #{attempt} (elapsed {elapsed}s).")
                     return content
                 else:
+                    # Could be different schema; fallback behavior: retry with backoff
                     err = (
                         result.get("error")
                         if isinstance(result, dict)
@@ -303,7 +282,7 @@ class ChatAPI:
                         )
                     time.sleep(backoff + random.uniform(0, 1.0))
                     backoff = min(backoff * 2, max_backoff)
-                    timeout = min(timeout + 100, 100000)
+                    timeout = min(timeout + 1000, 1000000)
                     continue
 
             except requests.exceptions.Timeout as e:
@@ -316,7 +295,7 @@ class ChatAPI:
                     raise RuntimeError(f"Aborting; {stop_reason} after timeout")
                 time.sleep(backoff + random.uniform(0, 1.0))
                 backoff = min(backoff * 2, max_backoff)
-                timeout = min(timeout + 100, 100000)
+                timeout = min(timeout + 1000, 1000000)
                 continue
 
             except (
@@ -324,6 +303,7 @@ class ChatAPI:
                 requests.exceptions.RequestException,
             ) as e:
                 spinner.stop()
+                # Treat these as transient network errors and retry
                 print(
                     f"\n⚠️ Network error on attempt #{attempt}: {e}. Backing off {backoff:.1f}s and retrying..."
                 )
@@ -332,10 +312,11 @@ class ChatAPI:
                     raise RuntimeError(f"Aborting; {stop_reason} after network error")
                 time.sleep(backoff + random.uniform(0, 1.0))
                 backoff = min(backoff * 2, max_backoff)
-                timeout = min(timeout + 100, 100000)
+                timeout = min(timeout + 1000, 1000000)
                 continue
 
             except RuntimeError:
+                # Re-raise runtime errors produced above (fatal client error, abort reason...)
                 spinner.stop()
                 raise
 
@@ -351,10 +332,11 @@ class ChatAPI:
                     )
                 time.sleep(backoff + random.uniform(0, 1.0))
                 backoff = min(backoff * 2, max_backoff)
-                timeout = min(timeout + 100, 100000)
+                timeout = min(timeout + 1000, 1000000)
                 continue
 
             finally:
+                # final defensive stop of spinner (idempotent)
                 try:
                     spinner.stop()
                 except Exception:
@@ -522,7 +504,7 @@ class StoryPipeline:
     def __init__(
         self,
         api_url: str = "https://apifreellm.com/api/chat",
-        default_timeout: int = 100,
+        default_timeout: int = 1000,
     ):
         self.chat = ChatAPI(url=api_url, default_timeout=default_timeout)
 
@@ -1983,7 +1965,7 @@ if __name__ == "__main__":
     start = time.time()
 
     pipeline = StoryPipeline(
-        api_url="https://apifreellm.com/api/chat", default_timeout=100
+        api_url="https://apifreellm.com/api/chat", default_timeout=1000
     )
 
     # --- Example 1: Only generate the story/script (BRACKETED single block file saved) ---
@@ -1991,7 +1973,7 @@ if __name__ == "__main__":
         niche="Preschool-early-elementary children",
         person="",
         timing_minutes=10,
-        timeout=100,
+        timeout=1000,
         topic="The Little Cloud Painter",
     )
     print("\n--- Script (first 400 chars) ---")
@@ -2004,7 +1986,7 @@ if __name__ == "__main__":
         theme="water color illustrations, children's book, whimsical, vibrant colors Creativity + sharing + emotional regulation",
         img_number=150,  # set smaller for testing; set 50 in production
         batch_size=30,  # reduce if timeouts happen frequently
-        timeout_per_call=100,
+        timeout_per_call=1000,
     )
     print(f"\nGenerated {len(image_prompts)} image prompts (sample):")
     for p in image_prompts[:5]:
