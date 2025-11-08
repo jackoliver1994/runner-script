@@ -17,36 +17,14 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps (if any)
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          python -c "import requests" 2>/dev/null || pip install requests
 
-      - name: Run full_robust_runner.py
+      - name: Run your script (test)
         env:
-          API_URL: ${{ secrets.API_URL }}
-          MESSAGE: "Hello from GitHub Actions"
-          REQUEST_TIMEOUT: "100"
-          REQUEST_RETRIES: "3"
-          REQUEST_BACKOFF: "1"
-          HEARTBEAT_PATH: "heartbeat/heartbeat.txt"
-          OUTPUTS_DIR: "outputs"
-          RUN_HOURS: "0"   # set to >0 to run repeated iterations for that many hours
+          R_HOURS: "6"
         run: |
-          cd Script_Drive || true
-          python test.py --artifact-zip ../artifacts.zip || echo "script exited non-zero (still upload artifacts)"
-
-      - name: Upload artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: run-artifacts
-          path: |
-            artifacts.zip
-            heartbeat/*
-            last_response_*.txt
-            error_trace_*.txt
-            run_summary_*.txt
-            robust_request.log
-            outputs/**
+          cd Script_Drive
+          python test.py
