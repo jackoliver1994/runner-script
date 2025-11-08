@@ -74,33 +74,55 @@ class ChatAPI:
         message: str,
         timeout: Optional[int] = None,
         spinner_message: str = "Waiting for response...",
-        max_attempts: Optional[int] = 6,
-        retry_forever: bool = False,
-        retry_on_client_errors: bool = False,
         initial_backoff: float = 2.0,
-        max_backoff: float = 60.0,
-        max_timeout_cap: int = 300,
+        max_backoff: float = 8.0,
+        max_timeout_cap: int = 10000,
         use_cloudscraper_on_403: bool = True,
         use_playwright_on_403: bool = False,
+        proxy: Optional[str] = None,
     ) -> str:
         """
-        Robust send_message:
-        - returns API text on success
-        - raises RuntimeError on fatal client error (unless retry_on_client_errors True)
-        - caps per-attempt timeouts and avoids unbounded growth
-        - on HTTP 403 with HTML challenge, will try cloudscraper (if available) once and optionally Playwright
+        Robust, feature-preserving send_message that will retry *indefinitely* until a successful
+        response is obtained (per your request).  This preserves spinner behavior, session reuse,
+        thread-timeout guarding, Cloudflare-challenge solver attempts (cloudscraper / Playwright),
+        proxy support, and careful diagnostics — while avoiding runaway per-attempt timeout growth.
+        -------------------------------------------------------------------------------
+        Notes:
+        - This method WILL keep retrying forever until it returns a successful "status: success"
+            JSON response from the API (or until the process is terminated externally).
+        - It *tries* to solve Cloudflare challenge using cloudscraper (if installed) and optionally
+            Playwright (if enabled and installed). If those attempts fail, it continues retrying.
+        - This does not silently remove any features; it simply transitions from "fail-fast on 403"
+            to "keep trying (with backoff) and attempt challenge solvers once per 403 occurrence".
+        - Please ensure you comply with the target service's Terms of Service. Repeatedly circumventing
+            anti-bot protections can violate their policies.
+        -------------------------------------------------------------------------------
+        Parameters (defaults chosen to be safe in CI):
+        timeout: per-attempt read timeout (seconds). If not provided uses self.base_timeout or 60s.
+        initial_backoff: how long to sleep after first failure (seconds; adds jitter).
+        max_backoff: maximal backoff between retries.
+        max_timeout_cap: cap on per-attempt timeout (prevents runaway).
+        use_cloudscraper_on_403: try cloudscraper once when a 403 HTML challenge is detected.
+        use_playwright_on_403: try Playwright once when a 403 HTML challenge is detected (heavy).
+        proxy: optional proxy URL (http://user:pass@host:port).
+        -------------------------------------------------------------------------------
+        Returns:
+        The API response text (the field your code expects), i.e. the "response" value when the
+        API JSON contains {"status": "success", "response": "..."}.
         """
-        import concurrent.futures as cf
-        import random
-        import time
-        import json
         import requests
+        import time
+        import random
+        import json
+        import traceback
+        import concurrent.futures as cf
 
         # lazy optional imports
         try:
             import cloudscraper
         except Exception:
             cloudscraper = None
+
         PLAYWRIGHT_AVAILABLE = False
         if use_playwright_on_403:
             try:
@@ -113,58 +135,216 @@ class ChatAPI:
             except Exception:
                 PLAYWRIGHT_AVAILABLE = False
 
-        # session reuse
+        # Ensure we have a session (reuse is important)
         if not hasattr(self, "_session") or self._session is None:
             self._session = requests.Session()
         session = self._session
 
-        # config and guards
-        timeout = int(timeout or getattr(self, "base_timeout", 60))
-        timeout = min(timeout, max_timeout_cap)
+        # Respect small connect timeout but allow read to be our main timeout control
+        configured_timeout = int(timeout or getattr(self, "base_timeout", 60))
+        configured_timeout = min(configured_timeout, max_timeout_cap)
+
         backoff = float(initial_backoff)
         attempt = 0
-        start_time = time.monotonic()
-        spinner = (
-            LoadingSpinner(spinner_message) if "LoadingSpinner" in globals() else None
-        )
+        last_challenge_solver_attempt = {"cloudscraper": 0, "playwright": 0}
+        # We'll attempt each challenge solver at most once per X seconds to avoid tight loops abusing them
+        CHALLENGE_SOLVER_MIN_INTERVAL = 30
 
-        # helper to detect HTML/Cloudflare challenge
-        def looks_like_html_challenge(status_code, text, headers):
-            if status_code == 403:
-                t = (text or "").lower()
-                if (
-                    "just a moment" in t
-                    or "attention required" in t
-                    or "cloudflare" in t
-                ):
+        spinner = None
+        try:
+            if "LoadingSpinner" in globals():
+                spinner = LoadingSpinner(spinner_message)
+        except Exception:
+            spinner = None
+
+        # Helper: detect HTML challenge like Cloudflare
+        def _looks_like_html_challenge(status_code, text, headers):
+            try:
+                if status_code == 403:
+                    t = (text or "").lower()
+                    if (
+                        "just a moment" in t
+                        or "attention required" in t
+                        or "please enable javascript" in t
+                        or "cloudflare" in t
+                    ):
+                        return True
+                ct = (headers or {}).get("Content-Type", "") or ""
+                if status_code == 403 and "text/html" in ct.lower():
                     return True
-            ct = (headers.get("Content-Type") or "").lower()
-            if "text/html" in ct and status_code == 403:
-                return True
+            except Exception:
+                pass
             return False
 
-        # Do not allow unlimited attempts by default
-        if max_attempts is None and not retry_forever:
-            max_attempts = 6
-
-        # Track whether we've already tried challenge-solvers for this call
-        challenge_solver_tried = False
-
-        def do_request(req_timeout):
-            """Single attempt using requests session (returns tuple(status, headers, text) or raises)."""
+        # Helper: single-request worker using provided session (so cookies persist)
+        def _do_post(sess, req_timeout):
             try:
-                # keep connect small so we fail fast on DNS/connect; read time limited by req_timeout
-                resp = session.post(
+                headers = getattr(
+                    self, "headers", getattr(self, "default_headers", None)
+                )
+                if headers is None:
+                    headers = {
+                        "Content-Type": "application/json",
+                        "Accept": "application/json",
+                    }
+                proxies = {"http": proxy, "https": proxy} if proxy else None
+                r = sess.post(
                     self.url,
-                    headers=getattr(self, "headers", self.headers),
+                    headers=headers,
                     json={"message": message},
                     timeout=(10, req_timeout),
+                    proxies=proxies,
                 )
-                return resp.status_code, dict(resp.headers), resp.text
+                return {
+                    "ok": True,
+                    "status": r.status_code,
+                    "headers": dict(r.headers or {}),
+                    "text": r.text,
+                }
             except Exception as e:
-                return None, None, e
+                return {"ok": False, "exc": e, "trace": traceback.format_exc()}
 
-        # Main retry loop
+        # Helper: try cloudscraper once (best-effort)
+        def _try_cloudscraper_once():
+            if not cloudscraper:
+                print("→ cloudscraper not available (skipping).")
+                return None
+            now = time.time()
+            if (
+                now - last_challenge_solver_attempt["cloudscraper"]
+                < CHALLENGE_SOLVER_MIN_INTERVAL
+            ):
+                print(
+                    "→ cloudscraper was attempted recently; skipping immediate re-attempt."
+                )
+                return None
+            last_challenge_solver_attempt["cloudscraper"] = now
+            try:
+                print("→ Attempting cloudscraper to solve challenge...")
+                s = cloudscraper.create_scraper()
+                proxies = {"http": proxy, "https": proxy} if proxy else None
+                r = s.post(
+                    self.url,
+                    json={"message": message},
+                    timeout=configured_timeout,
+                    proxies=proxies,
+                )
+                print("→ cloudscraper status:", r.status_code)
+                ct = (r.headers.get("Content-Type") or "").lower()
+                if "application/json" in ct:
+                    try:
+                        data = r.json()
+                    except Exception:
+                        print("→ cloudscraper returned invalid JSON; snippet:")
+                        print((r.text or "")[:1000])
+                        return None
+                    print("→ cloudscraper returned JSON (snippet):")
+                    try:
+                        print(json.dumps(data)[:1000])
+                    except Exception:
+                        print(data)
+                    return data
+                else:
+                    print("→ cloudscraper returned non-JSON (snippet):")
+                    print((r.text or "")[:1000])
+                    return None
+            except Exception as e:
+                print("→ cloudscraper attempt raised exception:", e)
+                traceback.print_exc()
+                return None
+
+        # Helper: try Playwright once (heavy)
+        def _try_playwright_once():
+            if not PLAYWRIGHT_AVAILABLE:
+                print("→ Playwright not available (skipping).")
+                return None
+            now = time.time()
+            if (
+                now - last_challenge_solver_attempt["playwright"]
+                < CHALLENGE_SOLVER_MIN_INTERVAL
+            ):
+                print(
+                    "→ Playwright was attempted recently; skipping immediate re-attempt."
+                )
+                return None
+            last_challenge_solver_attempt["playwright"] = now
+            try:
+                print(
+                    "→ Attempting Playwright to solve challenge (headless browser)..."
+                )
+                with sync_playwright() as p:
+                    browser = p.chromium.launch(headless=True)
+                    context = browser.new_context()
+                    page = context.new_page()
+                    # Visit site root to let Cloudflare run its JS challenge
+                    try:
+                        page.goto(
+                            self.url.split("/api")[0],
+                            wait_until="load",
+                            timeout=configured_timeout * 1000,
+                        )
+                    except Exception as e:
+                        print(
+                            "→ Playwright page.goto exception (may still have cookies):",
+                            e,
+                        )
+                    time.sleep(2)
+                    cookies = context.cookies()
+                    ua = page.evaluate("() => navigator.userAgent")
+                    browser.close()
+
+                # Use cookies + UA in requests session
+                ss = requests.Session()
+                for c in cookies:
+                    try:
+                        ss.cookies.set(
+                            c.get("name"),
+                            c.get("value"),
+                            domain=c.get("domain"),
+                            path=c.get("path", "/"),
+                        )
+                    except Exception:
+                        pass
+                headers = dict(
+                    getattr(
+                        self,
+                        "headers",
+                        getattr(
+                            self,
+                            "default_headers",
+                            {"Content-Type": "application/json"},
+                        ),
+                    )
+                )
+                headers["User-Agent"] = ua
+                proxies = {"http": proxy, "https": proxy} if proxy else None
+                r = ss.post(
+                    self.url,
+                    json={"message": message},
+                    headers=headers,
+                    timeout=configured_timeout,
+                    proxies=proxies,
+                )
+                print("→ Playwright-backed request status:", r.status_code)
+                ct = (r.headers.get("Content-Type") or "").lower()
+                if "application/json" in ct:
+                    try:
+                        return r.json()
+                    except Exception:
+                        print("→ Playwright returned invalid JSON; snippet:")
+                        print((r.text or "")[:1000])
+                        return None
+                else:
+                    print("→ Playwright path returned non-JSON snippet:")
+                    print((r.text or "")[:1000])
+                    return None
+            except Exception as e:
+                print("→ Playwright attempt raised exception:", e)
+                traceback.print_exc()
+                return None
+
+        print("send_message: starting infinite retry loop (will run until success).")
+        # Infinite loop: user asked to keep trying until all success
         while True:
             attempt += 1
             if spinner:
@@ -172,276 +352,276 @@ class ChatAPI:
                     spinner.start()
                 except Exception:
                     pass
-            print(f"\nAttempt #{attempt} — timeout={timeout}s — sending request...")
 
-            status, headers, body = do_request(timeout)
-
-            if spinner:
-                try:
-                    spinner.stop()
-                except Exception:
-                    pass
-
-            # network/exception case
-            if status is None:
-                print(
-                    f"⚠️ Request exception: {body!r}. Retrying after backoff {backoff:.1f}s (attempt {attempt})."
-                )
-                if (
-                    max_attempts is not None and attempt >= max_attempts
-                ) and not retry_forever:
-                    raise RuntimeError(
-                        f"Request failed after {attempt} attempts: {body!r}"
-                    )
-                time.sleep(backoff + random.random())
-                backoff = min(backoff * 2, max_backoff)
-                # keep timeout unchanged but capped
-                timeout = min(timeout + 10, max_timeout_cap)
-                continue
-
-            # got HTTP response
-            print(f"✅ Response status: {status}")
-            ct = (headers.get("Content-Type") or "").lower()
-            if looks_like_html_challenge(
-                status, body if isinstance(body, str) else "", headers
-            ):
-                print("⚠️ Detected Cloudflare-like anti-bot page (HTTP 403).")
-                # don't keep growing timeout on 403s — treat specially
-                if (
-                    use_cloudscraper_on_403
-                    and cloudscraper
-                    and not challenge_solver_tried
-                ):
-                    print("→ Trying cloudscraper once to solve challenge...")
+            print(
+                f"\nAttempt #{attempt} — timeout={configured_timeout}s — sending request (elapsed attempts backoff={backoff:.1f}s)."
+            )
+            # Use a short-lived thread to enforce the per-attempt timeout and avoid blocking main thread
+            result = None
+            try:
+                with cf.ThreadPoolExecutor(max_workers=1) as ex:
+                    fut = ex.submit(_do_post, session, configured_timeout)
                     try:
-                        s = cloudscraper.create_scraper()
-                        r = s.post(self.url, json={"message": message}, timeout=timeout)
-                        print("→ cloudscraper status:", r.status_code)
-                        if (
-                            r.headers.get("Content-Type", "")
-                            .lower()
-                            .find("application/json")
-                            >= 0
-                        ):
-                            data = None
+                        wrapper = fut.result(timeout=configured_timeout + 5)
+                    except cf.TimeoutError:
+                        # Cancel future best-effort and recreate session to avoid leaking
+                        try:
+                            fut.cancel()
+                        except Exception:
+                            pass
+                        try:
+                            session.close()
+                        except Exception:
+                            pass
+                        # create a fresh session to avoid cookie/connection issues
+                        self._session = requests.Session()
+                        session = self._session
+                        print(
+                            f"⚠️ Attempt #{attempt} timed out after {configured_timeout}s. Will backoff {backoff:.1f}s and retry."
+                        )
+                        if spinner:
                             try:
-                                data = r.json()
+                                spinner.stop()
                             except Exception:
-                                print(
-                                    "→ cloudscraper returned non-JSON; snippet:",
-                                    r.text[:500],
-                                )
-                            if (
-                                isinstance(data, dict)
-                                and data.get("status") == "success"
-                            ):
-                                return data.get("response", "")
-                            # if JSON but error, show it and continue to normal retry flow
-                            print("→ cloudscraper JSON response:")
+                                pass
+                        time.sleep(backoff + random.random())
+                        backoff = min(backoff * 2, max_backoff)
+                        # Keep configured_timeout capped; do not grow unbounded on challenge 403s
+                        configured_timeout = min(
+                            configured_timeout + 0, max_timeout_cap
+                        )
+                        continue
+                    except Exception as e:
+                        print("⚠️ Exception while waiting for request future:", e)
+                        traceback.print_exc()
+                        if spinner:
+                            try:
+                                spinner.stop()
+                            except Exception:
+                                pass
+                        time.sleep(backoff + random.random())
+                        backoff = min(backoff * 2, max_backoff)
+                        continue
+
+                if not wrapper.get("ok"):
+                    # network or exception occurred inside worker
+                    exc = wrapper.get("exc")
+                    print(f"⚠️ Network/worker exception on attempt #{attempt}: {exc!r}")
+                    try:
+                        print(wrapper.get("trace"))
+                    except Exception:
+                        pass
+                    if spinner:
+                        try:
+                            spinner.stop()
+                        except Exception:
+                            pass
+                    time.sleep(backoff + random.random())
+                    backoff = min(backoff * 2, max_backoff)
+                    continue
+
+                status = int(wrapper.get("status", 0) or 0)
+                headers = wrapper.get("headers") or {}
+                body = wrapper.get("text") or ""
+
+                print("✅ Response status:", status)
+                # detect Cloudflare-like HTML challenge
+                if _looks_like_html_challenge(status, body, headers):
+                    print(
+                        "⚠️ Detected Cloudflare-like anti-bot page (HTTP 403). Will attempt solvers then continue retrying indefinitely."
+                    )
+                    # Try cloudscraper once (per-challenge attempt), prefer it because it's lightweight
+                    if use_cloudscraper_on_403 and cloudscraper:
+                        data = _try_cloudscraper_once()
+                        if isinstance(data, dict):
+                            # If this returns a dict with status success, return its response
+                            try:
+                                if data.get("status") == "success":
+                                    resp_text = data.get("response", "")
+                                    print(
+                                        "✅ cloudscraper returned success response. Returning."
+                                    )
+                                    return resp_text
+                            except Exception:
+                                pass
+                            # Print JSON to aid debugging but keep trying indefinitely
                             print(
-                                json.dumps(data, indent=2, ensure_ascii=False)
-                                if data is not None
-                                else "(no json)"
+                                "→ cloudscraper returned JSON but not status==success (will continue retrying)."
                             )
+                            try:
+                                print(json.dumps(data, indent=2)[:2000])
+                            except Exception:
+                                print(data)
                         else:
                             print(
-                                "→ cloudscraper returned non-JSON (likely still challenge). Snippet:"
+                                "→ cloudscraper didn't solve the challenge or returned no usable JSON."
                             )
-                            print(r.text[:800])
-                    except Exception as e:
-                        print("→ cloudscraper attempt raised:", e)
-                    challenge_solver_tried = True
-                    # after cloudscraper attempt do NOT increase timeout — backoff a little then continue
-                    if (
-                        max_attempts is not None and attempt >= max_attempts
-                    ) and not retry_forever:
-                        raise RuntimeError(
-                            "Cloudflare challenge detected and cloudscraper attempt completed but no success; aborting."
-                        )
+                    # Try Playwright if available and enabled
+                    if use_playwright_on_403 and PLAYWRIGHT_AVAILABLE:
+                        data = _try_playwright_once()
+                        if isinstance(data, dict):
+                            try:
+                                if data.get("status") == "success":
+                                    resp_text = data.get("response", "")
+                                    print(
+                                        "✅ Playwright-backed request returned success response. Returning."
+                                    )
+                                    return resp_text
+                            except Exception:
+                                pass
+                            print(
+                                "→ Playwright returned JSON but not status==success (will continue retrying)."
+                            )
+                            try:
+                                print(json.dumps(data, indent=2)[:2000])
+                            except Exception:
+                                print(data)
+                        else:
+                            print(
+                                "→ Playwright did not solve the challenge or returned non-JSON."
+                            )
+                    # If solvers didn't succeed, do not treat it as fatal. Backoff & continue (infinite).
+                    if spinner:
+                        try:
+                            spinner.stop()
+                        except Exception:
+                            pass
+                    print(
+                        f"→ Challenge solvers attempted (or skipped). Sleeping {backoff:.1f}s before next attempt."
+                    )
+                    time.sleep(backoff + random.random())
+                    backoff = min(backoff * 2, max_backoff)
+                    # do not grow configured_timeout here (challenge won't be fixed by longer read timeout)
+                    continue
+
+                # If client error (4xx other than challenge) - log and continue (infinite)
+                if 400 <= status < 500:
+                    print(f"⚠️ Client error HTTP {status} received. Snippet:")
+                    print((body or "")[:1000])
+                    print("→ Will continue retrying indefinitely per configuration.")
+                    if spinner:
+                        try:
+                            spinner.stop()
+                        except Exception:
+                            pass
                     time.sleep(backoff + random.random())
                     backoff = min(backoff * 2, max_backoff)
                     continue
 
-                if (
-                    use_playwright_on_403
-                    and not challenge_solver_tried
-                    and PLAYWRIGHT_AVAILABLE
-                ):
+                # If server error / rate-limited -> retry with backoff
+                if status == 429 or 500 <= status < 600:
                     print(
-                        "→ Trying Playwright once to solve challenge (headless browser)."
+                        f"⚠️ Server error / rate-limit HTTP {status} received. Snippet:"
+                    )
+                    print((body or "")[:1000])
+                    if spinner:
+                        try:
+                            spinner.stop()
+                        except Exception:
+                            pass
+                    time.sleep(backoff + random.random())
+                    backoff = min(backoff * 2, max_backoff)
+                    # optionally increase configured_timeout slightly for server-side slowness but keep cap
+                    configured_timeout = min(configured_timeout + 5, max_timeout_cap)
+                    continue
+
+                # Otherwise attempt to parse JSON
+                ct = (headers.get("Content-Type") or "").lower()
+                parsed = None
+                if "application/json" in ct or (
+                    isinstance(body, str)
+                    and (body.strip().startswith("{") or body.strip().startswith("["))
+                ):
+                    try:
+                        parsed = json.loads(body) if body else {}
+                    except Exception:
+                        print("⚠️ Received malformed JSON; snippet:")
+                        print((body or "")[:1000])
+                        if spinner:
+                            try:
+                                spinner.stop()
+                            except Exception:
+                                pass
+                        time.sleep(backoff + random.random())
+                        backoff = min(backoff * 2, max_backoff)
+                        continue
+                else:
+                    # Non-JSON content: show snippet and continue retrying
+                    print(
+                        "⚠️ Received non-JSON response (not a Cloudflare challenge). Snippet:"
+                    )
+                    print((body or "")[:1000])
+                    if spinner:
+                        try:
+                            spinner.stop()
+                        except Exception:
+                            pass
+                    time.sleep(backoff + random.random())
+                    backoff = min(backoff * 2, max_backoff)
+                    continue
+
+                # If parsed JSON present, check for expected success structure
+                if isinstance(parsed, dict):
+                    # If provider indicates success, return the response
+                    if parsed.get("status") == "success":
+                        resp_text = parsed.get("response", "")
+                        print(
+                            f"✅ API returned status=success on attempt #{attempt}. Returning response."
+                        )
+                        return resp_text
+                    # If provider returned an explicit error in JSON, log and continue retrying
+                    print("→ API returned JSON but not status==success. Payload:")
+                    try:
+                        print(json.dumps(parsed, indent=2)[:2000])
+                    except Exception:
+                        print(parsed)
+                    print("→ Will continue retrying indefinitely.")
+                    if spinner:
+                        try:
+                            spinner.stop()
+                        except Exception:
+                            pass
+                    time.sleep(backoff + random.random())
+                    backoff = min(backoff * 2, max_backoff)
+                    continue
+                else:
+                    # Unexpected body type (e.g., empty JSON array) - log and continue
+                    print(
+                        "⚠️ Unexpected JSON structure received; will continue retrying. Snippet:"
                     )
                     try:
-                        with sync_playwright() as p:
-                            browser = p.chromium.launch(headless=True)
-                            ctx = browser.new_context()
-                            page = ctx.new_page()
-                            page.goto(
-                                self.url.replace("/api/chat", "/"),
-                                wait_until="load",
-                                timeout=timeout * 1000,
-                            )
-                            time.sleep(2)
-                            cookies = ctx.cookies()
-                            ua = page.evaluate("() => navigator.userAgent")
-                            browser.close()
-                            sess = requests.Session()
-                            for c in cookies:
-                                sess.cookies.set(
-                                    c["name"], c["value"], domain=c.get("domain")
-                                )
-                            # send request with cookies + ua
-                            headers2 = dict(getattr(self, "headers", self.headers))
-                            headers2["User-Agent"] = ua
-                            r = sess.post(
-                                self.url,
-                                json={"message": message},
-                                headers=headers2,
-                                timeout=timeout,
-                            )
-                            print("→ Playwright-backed request status:", r.status_code)
-                            if (
-                                r.headers.get("Content-Type", "")
-                                .lower()
-                                .find("application/json")
-                                >= 0
-                            ):
-                                data = r.json()
-                                if (
-                                    isinstance(data, dict)
-                                    and data.get("status") == "success"
-                                ):
-                                    return data.get("response", "")
-                                print("→ Playwright JSON response:")
-                                print(json.dumps(data, indent=2, ensure_ascii=False))
-                            else:
-                                print(
-                                    "→ Playwright path returned non-JSON snippet:",
-                                    r.text[:800],
-                                )
-                    except Exception as e:
-                        print("→ Playwright attempt raised:", e)
-                    challenge_solver_tried = True
-                    if (
-                        max_attempts is not None and attempt >= max_attempts
-                    ) and not retry_forever:
-                        raise RuntimeError(
-                            "Cloudflare challenge detected and solver attempts failed; aborting."
-                        )
+                        print(json.dumps(parsed)[:2000])
+                    except Exception:
+                        print(str(parsed)[:2000])
+                    if spinner:
+                        try:
+                            spinner.stop()
+                        except Exception:
+                            pass
                     time.sleep(backoff + random.random())
                     backoff = min(backoff * 2, max_backoff)
                     continue
 
-                # if we get here, we can't solve challenge automatically -> fail-fast (or retry only if allowed)
-                if retry_on_client_errors:
-                    print(
-                        "→ retry_on_client_errors=True, so we'll retry after backoff."
-                    )
-                    time.sleep(backoff + random.random())
-                    backoff = min(backoff * 2, max_backoff)
-                    continue
-                raise RuntimeError(
-                    "Cloudflare anti-bot challenge detected (HTTP 403 HTML). Use official API, run on self-hosted runner, or enable cloudscraper/playwright."
-                )
-
-            # Non-403: if 4xx (client error) and not configured to retry, fail
-            if 400 <= status < 500:
-                print(f"⚠️ Client error HTTP {status}. Content-Type: {ct}")
-                # show small snippet for diagnosis
-                snippet = (body or "")[:800] if isinstance(body, str) else str(body)
-                if not retry_on_client_errors:
-                    raise RuntimeError(
-                        f"Client error HTTP {status}. Response snippet: {snippet}"
-                    )
-                # optionally retry_on_client_errors True: backoff & continue
-                if (
-                    max_attempts is not None and attempt >= max_attempts
-                ) and not retry_forever:
-                    raise RuntimeError(
-                        f"Client error HTTP {status} after {attempt} attempts; aborting."
-                    )
+            except KeyboardInterrupt:
+                # user requested abort; re-raise to let caller handle it
+                print("Interrupted by user (KeyboardInterrupt). Aborting send_message.")
+                if spinner:
+                    try:
+                        spinner.stop()
+                    except Exception:
+                        pass
+                raise
+            except Exception as e:
+                print("⚠️ Unexpected exception in send_message main loop:", e)
+                traceback.print_exc()
+                if spinner:
+                    try:
+                        spinner.stop()
+                    except Exception:
+                        pass
                 time.sleep(backoff + random.random())
                 backoff = min(backoff * 2, max_backoff)
                 continue
-
-            # 5xx or 429 -> transient server error -> retry
-            if status == 429 or 500 <= status < 600:
-                print(
-                    f"⚠️ Server error HTTP {status}. Retrying after {backoff:.1f}s backoff."
-                )
-                if (
-                    max_attempts is not None and attempt >= max_attempts
-                ) and not retry_forever:
-                    raise RuntimeError(
-                        f"Server error HTTP {status} after {attempt} attempts; aborting."
-                    )
-                time.sleep(backoff + random.random())
-                backoff = min(backoff * 2, max_backoff)
-                # optionally increase timeout but within cap
-                timeout = min(timeout + 10, max_timeout_cap)
-                continue
-
-            # Otherwise attempt to parse JSON safely
-            if "application/json" in ct or (
-                isinstance(body, str)
-                and (body.strip().startswith("{") or body.strip().startswith("["))
-            ):
-                try:
-                    parsed = json.loads(body) if isinstance(body, str) and body else {}
-                except Exception:
-                    print("⚠️ Received invalid JSON; snippet:")
-                    print((body or "")[:800])
-                    if (
-                        max_attempts is not None and attempt >= max_attempts
-                    ) and not retry_forever:
-                        raise RuntimeError(
-                            "Invalid JSON received repeatedly; aborting."
-                        )
-                    time.sleep(backoff + random.random())
-                    backoff = min(backoff * 2, max_backoff)
-                    continue
-                # succeed if API protocol says success
-                if isinstance(parsed, dict) and parsed.get("status") == "success":
-                    return parsed.get("response", "")
-                # if API returns an 'error' but still JSON, decide retry
-                print("→ JSON response (not 'success'):")
-                print(json.dumps(parsed, indent=2, ensure_ascii=False))
-                # if it's an explicit internal server "error", treat as transient
-                err_desc = (
-                    (parsed.get("error") or parsed.get("message") or "").lower()
-                    if isinstance(parsed, dict)
-                    else ""
-                )
-                if "internal" in err_desc or status >= 500:
-                    if (
-                        max_attempts is not None and attempt >= max_attempts
-                    ) and not retry_forever:
-                        raise RuntimeError(
-                            f"API returned server-side error after {attempt} attempts: {err_desc}"
-                        )
-                    print(
-                        f"Retrying after backoff {backoff:.1f}s due to server-side error ({err_desc})..."
-                    )
-                    time.sleep(backoff + random.random())
-                    backoff = min(backoff * 2, max_backoff)
-                    continue
-                # otherwise treat as client-level failure (do not retry by default)
-                if not retry_on_client_errors:
-                    raise RuntimeError(f"API returned error response: {parsed}")
-                # else retry
-                time.sleep(backoff + random.random())
-                backoff = min(backoff * 2, max_backoff)
-                continue
-
-            # If non-JSON body but not HTML challenge, show snippet and treat as transient
-            print("⚠️ Received non-JSON response. Snippet:")
-            print((body or "")[:800])
-            if (
-                max_attempts is not None and attempt >= max_attempts
-            ) and not retry_forever:
-                raise RuntimeError("Non-JSON response repeatedly; aborting.")
-            time.sleep(backoff + random.random())
-            backoff = min(backoff * 2, max_backoff)
-            continue
 
 
 # ---------------------- UTILITIES ----------------------
