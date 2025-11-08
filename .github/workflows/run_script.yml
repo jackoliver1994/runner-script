@@ -1,34 +1,52 @@
-name: Run script (6h) and upload video
+name: Run single script and upload artifacts
 
 on:
-  workflow_dispatch:    # manual trigger from Actions UI
+  workflow_dispatch:
 
 jobs:
-  run-and-upload:
+  run-script:
     runs-on: ubuntu-latest
-    timeout-minutes: 360   # 6 hours max on GitHub-hosted runners
+    timeout-minutes: 360
 
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v4
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install deps (if any)
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          
-      - name: Run robust_request
+          python -c "import requests" 2>/dev/null || pip install requests
+
+      - name: Run full_robust_runner.py
         env:
-          API_URL: ${{ secrets.API_URL }}      # or set directly
+          API_URL: ${{ secrets.API_URL }}
           MESSAGE: "Hello from GitHub Actions"
-          REQUEST_TIMEOUT: "100"               # seconds
+          REQUEST_TIMEOUT: "100"
           REQUEST_RETRIES: "3"
           REQUEST_BACKOFF: "1"
+          HEARTBEAT_PATH: "heartbeat/heartbeat.txt"
+          OUTPUTS_DIR: "outputs"
+          RUN_HOURS: "0"   # set to >0 to run repeated iterations for that many hours
         run: |
-         cd Script_Drive
-          python test.py --logfile api_call.log
+          cd Script_Drive || true
+          python test.py --artifact-zip ../artifacts.zip || echo "script exited non-zero (still upload artifacts)"
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-artifacts
+          path: |
+            artifacts.zip
+            heartbeat/*
+            last_response_*.txt
+            error_trace_*.txt
+            run_summary_*.txt
+            robust_request.log
+            outputs/**
