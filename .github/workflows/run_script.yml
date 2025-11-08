@@ -21,10 +21,14 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-
-      - name: Run your script (llm)
+          
+      - name: Run robust_request
         env:
-          R_HOURS: "6"
+          API_URL: ${{ secrets.API_URL }}      # or set directly
+          MESSAGE: "Hello from GitHub Actions"
+          REQUEST_TIMEOUT: "100"               # seconds
+          REQUEST_RETRIES: "3"
+          REQUEST_BACKOFF: "1"
         run: |
-          cd Script_Drive
-          python test.py
+         cd Script_Drive
+          python test.py --logfile api_call.log
