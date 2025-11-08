@@ -1,28 +1,20 @@
 #!/usr/bin/env python3
 """
-All-in-one diagnostic script to try multiple approaches against an API protected by Cloudflare.
-Prints everything to console. No file writes.
-
-Approaches tried (in order):
-  1) requests + browser headers
-  2) cloudscraper
-  3) Playwright headless to solve JS challenge, extract cookies, then requests
-  4) requests via user-provided proxy (if PROXY env var set)
-
-Configure via environment:
-  API_URL  - the target URL (default: https://apifreellm.com/api/chat)
-  PROXY    - optional proxy URL (http://user:pass@host:port)
-Note: Playwright browsers must be installed: `playwright install`.
+Robust cloudscraper-first probe for apifreellm-style endpoints.
+- Prints all diagnostics to stdout (no files).
+- Uses cloudscraper if available (solves CF). Falls back to requests + Playwright.
+- Retries server errors (5xx) and JSON responses with {"status":"error"} using exponential backoff.
+- Does NOT retry on 4xx client errors (403, 400, ...).
+Configure via env:
+  API_URL (default https://apifreellm.com/api/chat)
+  MESSAGE (default "Hello, how are you?")
+  PROXY (optional proxy URL if you want to try proxy)
 """
 
-import os
-import sys
-import time
-import json
-import traceback
+import os, sys, time, json, traceback, random
 import requests
 
-# Try to import cloudscraper and playwright lazily so script still runs if not installed
+# lazy imports
 try:
     import cloudscraper
 except Exception:
@@ -36,10 +28,11 @@ except Exception:
     PLAYWRIGHT_AVAILABLE = False
 
 API_URL = os.getenv("API_URL", "https://apifreellm.com/api/chat")
-PROXY = os.getenv("PROXY")  # optional proxy URL
-TIMEOUT = int(os.getenv("TIMEOUT", "100"))
 MESSAGE = os.getenv("MESSAGE", "Hello, how are you?")
-MAX_RETRIES = 1  # each method does a single attempt; we don't retry endlessly here
+PROXY = os.getenv("PROXY") or None
+TIMEOUT = int(os.getenv("TIMEOUT", "100"))
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", "4"))
+INITIAL_BACKOFF = 2.0
 
 def pretty(obj):
     try:
@@ -47,225 +40,213 @@ def pretty(obj):
     except Exception:
         print(obj)
 
-def is_html_body(resp_text):
+def is_html(resp_text):
     if not resp_text:
         return False
     t = resp_text.strip().lower()
-    return t.startswith("<!doctype") or t.lstrip().startswith("<html") or "just a moment" in t or "please enable javascript" in t
+    return t.startswith("<!doctype") or t.startswith("<html") or "just a moment" in t or "please enable javascript" in t
 
-def try_requests_headers(url):
-    print("\n=== METHOD 1: requests with browser-like headers ===")
+def perform_post(sess_post, url, headers, payload, proxies=None):
+    try:
+        resp = sess_post(url, headers=headers, json=payload, timeout=TIMEOUT, proxies=proxies)
+    except requests.Timeout:
+        print("→ Request timed out")
+        return None, "timeout"
+    except requests.ConnectionError as e:
+        print("→ Connection error:", e)
+        return None, "connection_error"
+    except Exception as e:
+        print("→ Unexpected exception sending request:", e)
+        traceback.print_exc()
+        return None, "exception"
+
+    print("→ status:", resp.status_code)
+    print("→ response headers:", dict(resp.headers))
+    text = resp.text or ""
+    ct = resp.headers.get("Content-Type", "").lower()
+    if "application/json" in ct:
+        try:
+            data = resp.json()
+            return data, None
+        except Exception as e:
+            print("→ JSON decode failed:", e)
+            print("→ text snippet:", text[:2000])
+            return None, "json_decode"
+    else:
+        print("→ Non-JSON response (first 2000 chars):")
+        print(text[:2000])
+        if is_html(text):
+            print("→ detected HTML / Cloudflare challenge page.")
+            return None, "html_challenge"
+        return None, "non_json"
+
+def cloudscraper_attempt(url, payload, proxies=None):
+    if cloudscraper is None:
+        print("cloudscraper not installed — skipping this method.")
+        return None, "no_cloudscraper"
+    print("\n=== cloudscraper attempt ===")
+    try:
+        s = cloudscraper.create_scraper()
+        # optional: respect PROXY
+        if proxies:
+            r = s.post(url, json=payload, timeout=TIMEOUT, proxies=proxies)
+            ct = r.headers.get("Content-Type","")
+            if "application/json" in ct:
+                return r.json(), None
+            else:
+                return None, "non_json"
+        else:
+            r = s.post(url, json=payload, timeout=TIMEOUT)
+            ct = r.headers.get("Content-Type","")
+            if "application/json" in ct:
+                return r.json(), None
+            else:
+                return None, "non_json"
+    except Exception as e:
+        print("cloudscraper exception:", repr(e))
+        traceback.print_exc()
+        return None, "cloudscraper_exception"
+
+def requests_attempt(url, payload, proxies=None):
+    print("\n=== requests attempt (browser-like headers) ===")
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json, text/plain, */*",
         "Accept-Language": "en-US,en;q=0.9",
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/118.0.0.0 Safari/537.36"
-        ),
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36"),
         "Origin": "https://apifreellm.com",
         "Referer": "https://apifreellm.com/",
     }
-    payload = {"message": MESSAGE}
-    proxies = {"http": PROXY, "https": PROXY} if PROXY else None
+    return perform_post(requests.post, url, headers, payload, proxies=proxies)
 
-    try:
-        print(f"Sending POST to {url} (timeout={TIMEOUT}s) with headers (masked):")
-        masked = dict(headers)
-        if "authorization" in masked:
-            masked["authorization"] = masked["authorization"][:8] + "..."  # just in case
-        print({k: (v if k.lower() not in ("authorization","x-api-key") else "****") for k,v in masked.items()})
-        r = requests.post(url, headers=headers, json=payload, timeout=TIMEOUT, proxies=proxies)
-        print("Status:", r.status_code)
-        print("Response headers:", dict(r.headers))
-        ct = r.headers.get("Content-Type","")
-        if "application/json" in ct:
-            try:
-                pretty(r.json())
-                return True
-            except Exception as e:
-                print("Failed to decode JSON:", e)
-                print("First 2000 chars of body:")
-                print(r.text[:2000])
-                return False
-        else:
-            print("Non-JSON response (first 2000 chars):")
-            print(r.text[:2000])
-            if is_html_body(r.text):
-                print("[detected HTML challenge / Cloudflare page]")
-            return False
-    except Exception as e:
-        print("Exception while requests attempt:", repr(e))
-        traceback.print_exc()
-        return False
-
-def try_cloudscraper(url):
-    print("\n=== METHOD 2: cloudscraper (attempt to solve some CF challenges) ===")
-    if cloudscraper is None:
-        print("cloudscraper not installed. Skipping. Install: pip install cloudscraper")
-        return False
-    payload = {"message": MESSAGE}
-    try:
-        scraper = cloudscraper.create_scraper()
-        r = scraper.post(url, json=payload, timeout=TIMEOUT)
-        print("Status:", r.status_code)
-        ct = r.headers.get("Content-Type","")
-        if "application/json" in ct:
-            try:
-                pretty(r.json())
-                return True
-            except Exception as e:
-                print("Failed to decode JSON:", e)
-                print("Body (first 2000):")
-                print(r.text[:2000])
-                return False
-        else:
-            print("Non-JSON response (first 2000 chars):")
-            print(r.text[:2000])
-            if is_html_body(r.text):
-                print("[detected HTML challenge / Cloudflare page]")
-            return False
-    except Exception as e:
-        print("Exception while cloudscraper attempt:", repr(e))
-        traceback.print_exc()
-        return False
-
-def try_playwright_then_requests(url):
-    print("\n=== METHOD 3: Playwright headless -> extract cookies -> requests ===")
+def playwright_attempt_then_requests(url, payload, proxies=None):
+    print("\n=== Playwright attempt (solve challenge in headless browser, reuse cookies) ===")
     if not PLAYWRIGHT_AVAILABLE:
-        print("Playwright not installed or not available. Skipping. Install: pip install playwright and run `playwright install`")
-        return False
-
-    # Strategy:
-    # 1) Navigate to the site root to let Cloudflare challenge run (may set cookies)
-    # 2) Extract cookies & user-agent from the page context
-    # 3) Use requests.Session with those cookies and same UA to POST to API_URL
-    base_origin = os.getenv("PLAYWRIGHT_VISIT", "https://apifreellm.com/")
-
+        print("Playwright not installed — skipping this method.")
+        return None, "no_playwright"
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             context = browser.new_context()
             page = context.new_page()
-            print(f"Opening {base_origin} in headless browser (timeout {TIMEOUT*1000}ms)")
+            print("Opening site root to allow JS challenge to run...")
             try:
-                page.goto(base_origin, wait_until="load", timeout=TIMEOUT*1000)
+                page.goto("https://apifreellm.com/", wait_until="load", timeout=TIMEOUT*1000)
             except PlaywrightTimeoutError:
-                print("Playwright navigation timed out (page may be slow). Continuing - cookies may still be present.")
-            except Exception as e:
-                print("Playwright navigation exception:", e)
-            # Wait a little for JS challenges to run
-            time.sleep(3)
-            # get cookies
+                print("Playwright load timed out (may still have cookies).")
+            time.sleep(2)
             cookies = context.cookies()
             ua = page.evaluate("() => navigator.userAgent")
-            print("Collected cookies (truncated):", [{c['name']: c.get('value')[:30] + ("..." if len(c.get('value',''))>30 else "")} for c in cookies])
             browser.close()
 
-        # Build a requests.Session with cookies from Playwright
         sess = requests.Session()
         for c in cookies:
-            # requests cookiejar expects domain without leading dot sometimes; keep as-is
-            sess.cookies.set(c['name'], c['value'], domain=c.get('domain', None), path=c.get('path','/'))
+            sess.cookies.set(c["name"], c["value"], domain=c.get("domain"), path=c.get("path", "/"))
 
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "en-US,en;q=0.9",
             "User-Agent": ua,
             "Origin": "https://apifreellm.com",
             "Referer": "https://apifreellm.com/",
         }
         print("Using extracted UA:", ua)
-        print("Attempting POST to API_URL using session and cookies...")
-        r = sess.post(url, headers=headers, json={"message": MESSAGE}, timeout=TIMEOUT)
-        print("Status:", r.status_code)
-        ct = r.headers.get("Content-Type","")
-        if "application/json" in ct:
-            try:
-                pretty(r.json())
-                return True
-            except Exception as e:
-                print("Failed to decode JSON after Playwright:", e)
-                print(r.text[:2000])
-                return False
-        else:
-            print("Non-JSON response (first 2000 chars):")
-            print(r.text[:2000])
-            if is_html_body(r.text):
-                print("[detected HTML challenge / Cloudflare page even after Playwright]")
-            return False
+        return perform_post(sess.post, url, headers, payload, proxies=proxies)
     except Exception as e:
-        print("Playwright attempt raised exception:", repr(e))
+        print("Playwright attempt exception:", e)
         traceback.print_exc()
-        return False
+        return None, "playwright_exception"
 
-def try_proxy(url):
-    print("\n=== METHOD 4: requests via PROXY (if PROXY env var set) ===")
-    if not PROXY:
-        print("No PROXY environment variable provided. Skipping.")
-        return False
-    print("Using proxy:", PROXY)
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json, text/plain, */*",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-    }
-    try:
-        r = requests.post(url, headers=headers, json={"message": MESSAGE}, timeout=TIMEOUT, proxies={"http": PROXY, "https": PROXY})
-        print("Status:", r.status_code)
-        ct = r.headers.get("Content-Type","")
-        if "application/json" in ct:
-            pretty(r.json())
-            return True
+def robust_post_with_backoff(method_fn, url, payload, proxies=None, max_retries=MAX_RETRIES):
+    attempt = 0
+    backoff = INITIAL_BACKOFF
+    while attempt < max_retries:
+        attempt += 1
+        print(f"\n-- attempt {attempt}/{max_retries} using {method_fn.__name__}")
+        result, err = method_fn(url, payload, proxies=proxies)
+        if result is not None:
+            # if API returns JSON but with status:error — treat as server-side issue and retry
+            if isinstance(result, dict) and result.get("status") == "error":
+                print("API returned JSON with status=error:")
+                pretty(result)
+                # decide to retry for server/internal errors
+                # if error explicitly says internal server error -> retry
+                # but if it says authentication/client issue, break
+                msg = result.get("error") or result.get("message") or ""
+                if "internal" in msg.lower() or not msg:
+                    if attempt < max_retries:
+                        sleep = backoff + random.random()
+                        print(f"Transient server error detected; retrying in {sleep:.1f}s...")
+                        time.sleep(sleep)
+                        backoff *= 2
+                        continue
+                    else:
+                        return result, "server_error_final"
+                else:
+                    # non-transient error (client-like) — do not retry
+                    return result, "api_client_error"
+            else:
+                # success-like JSON or other acceptable content
+                print("Successful JSON response:")
+                pretty(result)
+                return result, None
         else:
-            print("Non-JSON response (first 2000):")
-            print(r.text[:2000])
-            return False
-    except Exception as e:
-        print("Proxy attempt exception:", repr(e))
-        traceback.print_exc()
-        return False
+            # no JSON or error code; err explains why
+            print("Method returned no JSON; error:", err)
+            # If it's an HTML challenge or 4xx, do not retry with the same method
+            if err in ("html_challenge", "non_json", "cloudscraper_exception", "no_cloudscraper"):
+                return None, err
+            # For transient network errors, retry
+            if err in ("timeout", "connection_error", "json_decode", "exception"):
+                if attempt < max_retries:
+                    sleep = backoff + random.random()
+                    print(f"Transient transport error; retrying in {sleep:.1f}s...")
+                    time.sleep(sleep)
+                    backoff *= 2
+                    continue
+            return None, err
+    return None, "max_retries_exceeded"
 
 def main():
-    print("Ultimate probe starting for URL:", API_URL)
-    print("Playwright available:", PLAYWRIGHT_AVAILABLE)
-    print("cloudscraper available:", cloudscraper is not None)
+    payload = {"message": MESSAGE}
+    proxies = {"http": PROXY, "https": PROXY} if PROXY else None
+
+    print("Probe starting. API_URL:", API_URL)
+    print("cloudscraper available:", bool(cloudscraper))
+    print("playwright available:", PLAYWRIGHT_AVAILABLE)
     print("PROXY configured:", bool(PROXY))
 
-    # Try 1: requests headers
-    ok = try_requests_headers(API_URL)
-    if ok:
-        print("\nSUCCESS via Method 1 (requests + headers).")
+    # Prefer cloudscraper (it solved CF in your run)
+    if cloudscraper:
+        res, err = robust_post_with_backoff(cloudscraper_attempt, API_URL, payload, proxies=proxies)
+        if res is not None and err is None:
+            print("\nDONE: cloudscraper succeeded and returned usable JSON.")
+            return 0
+        else:
+            print("\ncloudscraper did not produce usable response. err:", err)
+
+    # Fallback: Playwright (if available)
+    if PLAYWRIGHT_AVAILABLE:
+        res, err = robust_post_with_backoff(playwright_attempt_then_requests, API_URL, payload, proxies=proxies)
+        if res is not None and err is None:
+            print("\nDONE: Playwright path succeeded and returned usable JSON.")
+            return 0
+        else:
+            print("\nPlaywright path failed. err:", err)
+
+    # Last fallback: basic requests
+    res, err = robust_post_with_backoff(requests_attempt, API_URL, payload, proxies=proxies)
+    if res is not None and err is None:
+        print("\nDONE: requests succeeded.")
         return 0
 
-    # Try 2: cloudscraper
-    ok = try_cloudscraper(API_URL)
-    if ok:
-        print("\nSUCCESS via Method 2 (cloudscraper).")
-        return 0
-
-    # Try 3: Playwright solve
-    ok = try_playwright_then_requests(API_URL)
-    if ok:
-        print("\nSUCCESS via Method 3 (Playwright -> cookies -> requests).")
-        return 0
-
-    # Try 4: proxy
-    ok = try_proxy(API_URL)
-    if ok:
-        print("\nSUCCESS via Method 4 (requests via PROXY).")
-        return 0
-
-    print("\nALL METHODS FAILED — see logs above.")
-    print("Recommendations:")
-    print(" - Confirm the provider has a proper programmatic API (official API domain/path).")
-    print(" - Run the script locally (if it works locally but not on GitHub hosted runners, use a self-hosted runner).")
-    print(" - Contact the provider to request API access or whitelist your runner IPs.")
-    print(" - If you choose to experiment with cloudscraper/playwright/proxies, ensure it complies with provider TOS.")
+    print("\nALL METHODS exhausted. See logs above. Recommendations:")
+    print(" - Check provider docs for exact required payload fields (maybe not 'message').")
+    print(" - If server returns Internal Server Error repeatedly, contact provider or retry later.")
+    print(" - For CI use, prefer self-hosted runner for stability.")
     return 2
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     code = main()
     sys.exit(code)
