@@ -31,3 +31,10 @@ jobs:
         run: |
           cd Script_Drive
           python test.py
+
+      - name: Run your script (llm)
+        env:
+          R_HOURS: "6"
+        run: |
+          cd Script_Drive
+          python llm.py

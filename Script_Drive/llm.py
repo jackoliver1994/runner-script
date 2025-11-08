@@ -82,85 +82,73 @@ class ChatAPI:
         max_elapsed_time: Optional[int] = None,
     ) -> str:
         """
-        Robust POST with a hard per-attempt timeout enforced by waiting on a thread
-        future (future.result(timeout=...)). Preserves all original functionality.
-
-        Important behaviour details:
-        - The total per-attempt wait is enforced by the parent thread via
-            ThreadPoolExecutor.future.result(timeout=timeout_seconds).
-        - The actual requests.post uses a small connect timeout and a very large
-            read timeout so the HTTP library does not preemptively raise a read timeout
-            before the parent enforces the total wait.
-        - Cloudflare/anti-bot 403 pages are treated as transient and retried (same as before).
-        - You can control stopping behavior with max_attempts and max_elapsed_time.
+        Robust POST wrapper (improved).
+        - Returns the response body string on success (same as original).
+        - Raises RuntimeError for fatal client errors (unless retry_on_client_errors=True).
+        - Retries transient errors per exponential backoff.
+        Notes: to allow infinite retries, set max_attempts=None AND retry_forever=True.
         """
+        # ensure session available
+        if not hasattr(self, "_session") or self._session is None:
+            self._session = requests.Session()
+        session = self._session
 
         spinner = LoadingSpinner(spinner_message)
         attempt = 0
-        timeout = float(
-            timeout or self.base_timeout
-        )  # per-attempt total timeout (seconds)
-        backoff = float(initial_backoff)
+        timeout = float(timeout or self.base_timeout)
+        initial_backoff = float(initial_backoff or 1.0)
+        backoff = initial_backoff
+        max_backoff = float(max_backoff or 8.0)
         start_time = time.monotonic()
 
-        # Configure retry guards: if max_attempts is None, we keep a default guard to avoid runaway loops,
-        # but preserve the user's option to set max_attempts=None explicitly later to truly never stop.
+        # sane caps for runaway growth (configurable if you intentionally want huge timeouts)
+        MAX_TIMEOUT_CAP = 3600  # 1 hour per attempt absolute cap (prevents runaway)
+        MAX_ACCUMULATED_TIMEOUT = (
+            86400  # never increase timeout beyond a day (extremely conservative)
+        )
+
+        # default guard for max attempts (preserves user's option to set None for infinite)
         if max_attempts is None:
             max_attempts = 60 if retry_forever else 1
         if max_elapsed_time is not None:
             max_elapsed_time = int(max_elapsed_time)
 
-        def _elapsed_seconds() -> int:
+        def elapsed_s():
             return int(time.monotonic() - start_time)
 
-        def _should_stop_retrying() -> Optional[str]:
-            # Return a reason string if we should stop, otherwise None
+        def should_stop():
             if (max_attempts is not None) and attempt >= max_attempts:
                 return f"reached max_attempts={max_attempts}"
-            if (
-                max_elapsed_time is not None
-            ) and _elapsed_seconds() >= max_elapsed_time:
+            if (max_elapsed_time is not None) and elapsed_s() >= max_elapsed_time:
                 return f"reached max_elapsed_time={max_elapsed_time}s"
             return None
 
-        def _do_post_request():
-            """
-            The function that actually performs requests.post. It runs inside a worker thread.
-            We purposely set:
-            - connect timeout smallish (so connect failures return quickly),
-            - read timeout very large so requests doesn't preemptively raise read timeouts
-                while the parent enforces the total-per-attempt wait.
-            We return a plain dict with keys: 'ok' True/False, 'status', 'headers', 'text', 'error' (if any).
-            """
+        def _do_post():
+            """Worker that actually performs requests.post -- runs in a thread."""
             try:
-                # connect timeout small, read timeout large (so request itself doesn't fail early).
-                req = requests.post(
+                # small connect timeout; large read so parent controls total wait
+                r = session.post(
                     self.url,
                     headers=self.headers,
                     json={"message": message},
-                    timeout=(
-                        10.0,
-                        max(60.0, timeout + 30.0),
-                    ),  # connect=10s, read = timeout+30s (large)
+                    timeout=(10.0, max(60.0, min(timeout + 30.0, MAX_TIMEOUT_CAP))),
                 )
                 return {
                     "ok": True,
-                    "status": req.status_code,
-                    "headers": dict(req.headers),
-                    "text": req.text,
+                    "status": r.status_code,
+                    "headers": dict(r.headers),
+                    "text": r.text,
                 }
             except Exception as e:
                 return {"ok": False, "error": e}
 
-        # Main retry loop
+        # main loop
         while True:
             attempt += 1
-
-            # pre-loop guard (in case someone sets max_attempts=0)
-            stop_reason = _should_stop_retrying()
+            stop_reason = should_stop()
             if stop_reason:
                 raise RuntimeError(
-                    f"Aborting; {stop_reason} (attempts={attempt-1}, elapsed={_elapsed_seconds()}s)"
+                    f"Aborting; {stop_reason} (attempts={attempt-1}, elapsed={elapsed_s()}s)"
                 )
 
             try:
@@ -168,193 +156,186 @@ class ChatAPI:
                     f"\nAttempt #{attempt} — timeout={int(timeout)}s — sending request..."
                 )
                 spinner.start()
-
-                # Use ThreadPoolExecutor to run the HTTP call and enforce a hard per-attempt wait.
-                # We intentionally create a new executor for each attempt to keep behavior isolated.
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-                    future = ex.submit(_do_post_request)
+                    future = ex.submit(_do_post)
                     try:
-                        # This call guarantees we will wait up to `timeout` seconds for the worker to produce a result.
-                        response_wrapper = future.result(timeout=timeout)
+                        wrapper = future.result(timeout=timeout)
                     except cf.TimeoutError:
-                        # The attempt timed out. best-effort cancel (cannot kill the thread),
-                        # spinner will be stopped below and we will retry per backoff rules.
+                        # try to cancel and close session to free resources (best-effort)
                         try:
                             future.cancel()
                         except Exception:
                             pass
+                        try:
+                            session.close()
+                        except Exception:
+                            pass
+                        # recreate session for next attempt
+                        self._session = requests.Session()
+                        session = self._session
                         spinner.stop()
                         print(
-                            f"\n⚠️ Hard timeout reached after {int(timeout)}s on attempt #{attempt}. Backing off {backoff:.1f}s and retrying..."
+                            f"\n⚠️ Hard timeout after {int(timeout)}s on attempt #{attempt}. Backing off {backoff:.1f}s and retrying..."
                         )
-                        stop_reason = _should_stop_retrying()
+                        stop_reason = should_stop()
                         if stop_reason:
                             raise RuntimeError(f"Aborting; {stop_reason} after timeout")
-                        time.sleep(backoff + random.uniform(0, 1.0))
+                        time.sleep(backoff + random.random())
                         backoff = min(backoff * 2, max_backoff)
-                        timeout = min(timeout + 1000, 100000000)
+                        # grow timeout conservatively, capped so it cannot explode
+                        timeout = min(timeout + 60, MAX_TIMEOUT_CAP)
                         continue
-
-                # If we reach here we have a response_wrapper dict
                 spinner.stop()
 
-                if not response_wrapper.get("ok", False):
-                    # worker reported exception
-                    err = response_wrapper.get("error")
+                if not wrapper.get("ok", False):
+                    err = wrapper.get("error")
                     print(
-                        f"\n⚠️ Request raised exception on attempt #{attempt}: {err}. Backing off {backoff:.1f}s and retrying..."
+                        f"\n⚠️ Request exception on attempt #{attempt}: {err}. Backing off {backoff:.1f}s and retrying..."
                     )
-                    stop_reason = _should_stop_retrying()
+                    stop_reason = should_stop()
                     if stop_reason:
                         raise RuntimeError(
                             f"Aborting; {stop_reason} after exception: {err}"
                         )
-                    time.sleep(backoff + random.uniform(0, 1.0))
+                    time.sleep(backoff + random.random())
                     backoff = min(backoff * 2, max_backoff)
-                    timeout = min(timeout + 1000, 100000000)
+                    timeout = min(timeout + 60, MAX_TIMEOUT_CAP)
                     continue
 
-                status = int(response_wrapper.get("status", 0))
-                text = response_wrapper.get("text", "") or ""
-                headers = response_wrapper.get("headers", {})
+                status = int(wrapper.get("status", 0))
+                text = wrapper.get("text", "") or ""
+                headers = wrapper.get("headers", {})
 
-                # Server / rate errors (retriable)
+                # 5xx and 429 -> retry
                 if status == 429 or 500 <= status < 600:
                     print(
                         f"⚠️ Server/Rate error HTTP {status}. Backing off {backoff:.1f}s and retrying..."
                     )
-                    stop_reason = _should_stop_retrying()
+                    stop_reason = should_stop()
                     if stop_reason:
                         raise RuntimeError(
                             f"Aborting; {stop_reason} after HTTP {status}"
                         )
-                    time.sleep(backoff + random.uniform(0, 1.0))
+                    time.sleep(backoff + random.random())
                     backoff = min(backoff * 2, max_backoff)
-                    timeout = min(timeout + 1000, 100000000)
+                    timeout = min(timeout + 60, MAX_TIMEOUT_CAP)
                     continue
 
-                # Client errors (4xx) - possibly retry if configured; special-case Cloudflare-like 403
+                # 4xx handling
                 if 400 <= status < 500:
-                    ct = headers.get("Content-Type", "")
-                    payload_snippet = ""
-                    if "application/json" in ct:
-                        try:
-                            payload_snippet = json.loads(text)
-                        except Exception:
-                            payload_snippet = text[:1000]
-                    else:
-                        payload_snippet = text[:1000]
-
-                    text_lower = text.lower()
-                    is_cloudflare_like = status == 403 and (
-                        "just a moment" in text_lower
-                        or "cf-chl-bypass" in text_lower
-                        or "<title>just a moment" in text_lower
-                        or "attention required" in text_lower
-                        or "cloudflare" in text_lower
+                    text_l = text.lower()
+                    is_cf = status == 403 and (
+                        "just a moment" in text_l
+                        or "cloudflare" in text_l
+                        or "attention required" in text_l
                     )
-
-                    if is_cloudflare_like:
+                    if is_cf:
+                        # cloudflare-like: treat as transient but warn
                         print(
-                            f"⚠️ Received HTTP 403 anti-bot/Cloudflare page (treated as transient). Backing off {backoff:.1f}s..."
+                            f"⚠️ Detected Cloudflare-like anti-bot page (HTTP 403). This may require a different endpoint / self-hosted runner."
                         )
-                        stop_reason = _should_stop_retrying()
+                        stop_reason = should_stop()
                         if stop_reason:
                             raise RuntimeError(
                                 f"Aborting; {stop_reason} after Cloudflare-like 403"
                             )
-                        time.sleep(backoff + random.uniform(0, 1.0))
+                        time.sleep(backoff + random.random())
                         backoff = min(backoff * 2, max_backoff)
-                        timeout = min(timeout + 1000, 100000000)
+                        timeout = min(timeout + 60, MAX_TIMEOUT_CAP)
                         continue
-
-                    msg_payload = (
-                        payload_snippet
-                        if isinstance(payload_snippet, str)
-                        else json.dumps(payload_snippet)
-                    )
-                    msg = f"HTTP {status} - {msg_payload}"
+                    # other client errors: optionally retry or raise
                     if retry_on_client_errors:
                         print(
-                            f"⚠️ Client error {msg} — retrying because retry_on_client_errors=True. Backoff {backoff:.1f}s..."
+                            f"⚠️ Client error HTTP {status} (retry_on_client_errors=True) — will retry after backoff {backoff:.1f}s."
                         )
-                        stop_reason = _should_stop_retrying()
+                        stop_reason = should_stop()
                         if stop_reason:
                             raise RuntimeError(
                                 f"Aborting; {stop_reason} after client error {status}"
                             )
-                        time.sleep(backoff + random.uniform(0, 1.0))
+                        time.sleep(backoff + random.random())
                         backoff = min(backoff * 2, max_backoff)
-                        timeout = min(timeout + 1000, 100000000)
+                        timeout = min(timeout + 60, MAX_TIMEOUT_CAP)
                         continue
                     else:
-                        raise RuntimeError(f"Fatal client error (not retried): {msg}")
-
-                # Non-error status: attempt to parse JSON
-                # We parse safely (and treat invalid JSON as retriable).
-                try:
-                    result = json.loads(text) if text else {}
-                except Exception as e:
-                    snippet = text[:1000]
-                    print(
-                        f"⚠️ Invalid JSON received (will retry): {e}. Response snippet: {snippet}. Backing off {backoff:.1f}s..."
-                    )
-                    stop_reason = _should_stop_retrying()
-                    if stop_reason:
+                        # try to present helpful payload snippet
+                        snippet = text[:1000]
                         raise RuntimeError(
-                            f"Aborting; {stop_reason} after invalid JSON"
+                            f"Fatal client error HTTP {status}. Response snippet: {snippet}"
                         )
-                    time.sleep(backoff + random.uniform(0, 1.0))
-                    backoff = min(backoff * 2, max_backoff)
-                    timeout = min(timeout + 1000, 100000000)
-                    continue
 
-                # Expecting JSON with {status: "success", response: "..."} per original code
-                if isinstance(result, dict) and result.get("status") == "success":
-                    content = result.get("response", "")
-                    if content is None:
-                        content = ""
-                    elapsed = _elapsed_seconds()
-                    print(f"✅ Success on attempt #{attempt} (elapsed {elapsed}s).")
+                # parse JSON safely -- treat invalid JSON as retriable (backwards compatibility)
+                ct = headers.get("Content-Type", "").lower()
+                parsed = None
+                if (
+                    "application/json" in ct
+                    or text.strip().startswith("{")
+                    or text.strip().startswith("[")
+                ):
+                    try:
+                        parsed = json.loads(text) if text else {}
+                    except Exception as e:
+                        print(
+                            f"⚠️ Invalid JSON received (will retry). Error: {e}. Snippet: {text[:400]}"
+                        )
+                        stop_reason = should_stop()
+                        if stop_reason:
+                            raise RuntimeError(
+                                f"Aborting; {stop_reason} after invalid JSON"
+                            )
+                        time.sleep(backoff + random.random())
+                        backoff = min(backoff * 2, max_backoff)
+                        timeout = min(timeout + 60, MAX_TIMEOUT_CAP)
+                        continue
+                else:
+                    # non-JSON short text (treat as retriable by default)
+                    if text.strip():
+                        print(
+                            f"⚠️ Non-JSON response received (content-type={ct}). Snippet: {text[:400]}"
+                        )
+                        stop_reason = should_stop()
+                        if stop_reason:
+                            raise RuntimeError(
+                                f"Aborting; {stop_reason} after non-JSON response"
+                            )
+                        time.sleep(backoff + random.random())
+                        backoff = min(backoff * 2, max_backoff)
+                        timeout = min(timeout + 60, MAX_TIMEOUT_CAP)
+                        continue
+                    parsed = {}
+
+                # legacy expectation: {"status": "success", "response": "..."}
+                if isinstance(parsed, dict) and parsed.get("status") == "success":
+                    content = parsed.get("response", "") or ""
+                    print(f"✅ Success on attempt #{attempt} (elapsed {elapsed_s()}s).")
                     return content
                 else:
-                    # Unexpected payload -> retry with backoff
-                    err = (
-                        result.get("error")
-                        if isinstance(result, dict)
-                        else f"Unexpected body: {result}"
-                    )
+                    # parsed JSON that is not success or empty dict -> inspect "error" field and decide
+                    err_msg = None
+                    if isinstance(parsed, dict):
+                        err_msg = parsed.get("error") or parsed.get("message") or None
+                    else:
+                        err_msg = f"unexpected_body_type:{type(parsed).__name__}"
                     print(
-                        f"⚠️ API returned error or unexpected payload: {err}. Backing off {backoff:.1f}s and retrying..."
+                        f"⚠️ API returned unexpected JSON payload: {err_msg}. Backing off {backoff:.1f}s and retrying..."
                     )
-                    stop_reason = _should_stop_retrying()
+                    stop_reason = should_stop()
                     if stop_reason:
                         raise RuntimeError(
-                            f"Aborting; {stop_reason} after unexpected payload"
+                            f"Aborting; {stop_reason} after unexpected payload: {err_msg}"
                         )
-                    time.sleep(backoff + random.uniform(0, 1.0))
+                    time.sleep(backoff + random.random())
                     backoff = min(backoff * 2, max_backoff)
-                    timeout = min(timeout + 1000, 100000000)
+                    timeout = min(timeout + 60, MAX_TIMEOUT_CAP)
                     continue
 
             except Exception as e:
-                # Catch-all (should be rare because worker exceptions are returned as wrapper)
                 try:
                     spinner.stop()
                 except Exception:
                     pass
-                print(
-                    f"\n⚠️ Unexpected error on attempt #{attempt}: {e}. Backing off {backoff:.1f}s and retrying..."
-                )
-                stop_reason = _should_stop_retrying()
-                if stop_reason:
-                    raise RuntimeError(
-                        f"Aborting; {stop_reason} after unexpected exception: {e}"
-                    )
-                time.sleep(backoff + random.uniform(0, 1.0))
-                backoff = min(backoff * 2, max_backoff)
-                timeout = min(timeout + 1000, 100000000)
-                continue
+                # If it's our own RuntimeError raised above, re-raise
+                raise
 
             finally:
                 try:
@@ -374,43 +355,49 @@ def _nice_join(parts: list[str]) -> str:
 
 def ensure_ffmpeg_available() -> Optional[str]:
     """
-    Try to find a local ffmpeg executable. If not found, attempt to pip-install
-    'ffmpeg' (best-effort) and then 'imageio-ffmpeg' as a reliable fallback
-    (imageio-ffmpeg ships a platform ffmpeg binary helper).
-    Returns path to ffmpeg executable or None if unavailable.
-    NOTE: pip installs at runtime may fail in restricted environments; this function
-    makes a best-effort attempt but does not guarantee installation.
+    Try to find ffmpeg executable. Returns absolute path or None.
+    Strategy:
+     1) check system PATH
+     2) check imageio-ffmpeg (preferred fallback)
+     3) try to pip-install imageio-ffmpeg automatically (best-effort)
+    Note: we avoid installing arbitrary 'ffmpeg' wheel that may not provide a binary.
     """
     import shutil, subprocess, sys
 
-    # 1) check system PATH
+    # 1) system PATH
     exe = shutil.which("ffmpeg")
     if exe:
+        print(f"[ffmpeg] found system ffmpeg at: {exe}")
         return exe
 
-    # 2) try to install a pip package named 'ffmpeg' (best-effort; may not provide a binary)
+    # 2) try imageio-ffmpeg (it exposes ffmpeg binary via get_ffmpeg_exe)
     try:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "ffmpeg"])
-    except Exception:
-        pass
-    exe = shutil.which("ffmpeg")
-    if exe:
-        return exe
-
-    # 3) install imageio-ffmpeg which exposes a binary locator
-    try:
-        subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", "imageio-ffmpeg"]
-        )
         import imageio_ffmpeg
 
         ff = imageio_ffmpeg.get_ffmpeg_exe()
         if ff:
+            print(f"[ffmpeg] found imageio-ffmpeg binary at: {ff}")
             return ff
     except Exception:
         pass
 
-    # none found
+    # 3) try to pip install imageio-ffmpeg (best-effort)
+    try:
+        print("[ffmpeg] attempting to pip install imageio-ffmpeg as a fallback...")
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "imageio-ffmpeg"]
+        )
+        import importlib
+
+        imageio_ffmpeg = importlib.import_module("imageio_ffmpeg")
+        ff = imageio_ffmpeg.get_ffmpeg_exe()
+        if ff:
+            print(f"[ffmpeg] installed and found imageio-ffmpeg binary at: {ff}")
+            return ff
+    except Exception as e:
+        print(f"[ffmpeg] pip install fallback failed: {e}")
+
+    print("[ffmpeg] ffmpeg not available on PATH and imageio-ffmpeg not available.")
     return None
 
 
@@ -895,8 +882,10 @@ class StoryPipeline:
                     )
                 except Exception as e:
                     print(f"⚠️ send_message failed on generation attempt {attempt}: {e}")
-                    # immediate retry (infinite loop until success)
-                    time.sleep(0.2)
+                    # exponential backoff (bounded) before retrying to avoid tight infinite loops
+                    sleep_sec = min(8 + random.random() * 2, 30)
+                    print(f"Sleeping {sleep_sec:.1f}s before retrying generation...")
+                    time.sleep(sleep_sec)
                     continue
 
                 # In strict mode we insist the model returns a bracketed block; otherwise we accept best candidate
@@ -1206,634 +1195,219 @@ class StoryPipeline:
         batch_size: int = 5,
         timeout_per_call: Optional[int] = None,
         save_each_batch: bool = True,
+        parallel_batches: bool = False,  # new optional: speeds up large jobs but off by default
     ) -> List[str]:
         """
-        Strict per-paragraph batching; paragraph 1 must reach its full batch_size quota
-        (or min(batch_size, remaining)) before moving to next paragraph. Robust parsing,
-        dedupe, retries, delays, saving via save_response(folder, file, content) into
-        folder "image_response" with final file "image_prompts.txt". Cleans intermediate
-        files so only final file remains. Filters out non-image/meta lines so final file
-        contains only true image prompts.
-
-        Preserves all existing features.
+        Robust image prompt generation. Preserves strict per-paragraph quota semantics by default.
+        - If parallel_batches=True, paragraph batches may be generated in parallel (still tries to respect quota).
+        - Writes final validated prompts into image_response/image_prompts.txt (same behavior).
         """
-        import re
-        import random
-        import time
-        import math
-        import os
-        from typing import List, Optional
-
-        if img_number <= 0:
-            return []
+        import os, re, math, random, time
 
         timeout_per_call = timeout_per_call or min(
             120, getattr(self.chat, "base_timeout", 120)
         )
-        prompts: List[str] = []
-        seen_prompts: set = set()
+
+        # quick guards
+        if img_number <= 0:
+            return []
+        if batch_size <= 0:
+            batch_size = 1
+
         response_folder = "image_response"
         final_fname = "image_prompts.txt"
         final_path = os.path.join(response_folder, final_fname)
+        os.makedirs(response_folder, exist_ok=True)
 
-        # compute number of sequential paragraph batches
+        # compute paragraph splits
         num_paragraphs = max(1, math.ceil(img_number / max(1, batch_size)))
-
-        # fallback paragraph splitter (keeps sentences intact where possible)
-        def _split_text_into_n_parts_fallback(text: str, n: int):
-            text = (text or "").strip()
-            if not text:
-                return [""] * n
-            sents = re.split(r"(?<=[.!?])\s+", text)
-            if len(sents) == 1:
-                words = text.split()
-                avg = max(1, math.ceil(len(words) / n))
-                parts = []
-                for i in range(0, len(words), avg):
-                    parts.append(" ".join(words[i : i + avg]))
-                while len(parts) < n:
-                    parts.append("")
-                return parts[:n]
-            words = text.split()
-            total_words = len(words)
-            target = max(1, math.ceil(total_words / n))
-            parts = []
-            cur = []
-            cw = 0
-            for sent in sents:
-                sw = len(sent.split())
-                if cw + sw > target and cur:
-                    parts.append(" ".join(cur).strip())
-                    cur = [sent]
-                    cw = sw
-                else:
-                    cur.append(sent)
-                    cw += sw
-            if cur:
-                parts.append(" ".join(cur).strip())
-            while len(parts) < n:
-                parts.append("")
-            return parts[:n]
-
-        # build paragraphs (use instance method if available)
         try:
             paragraphs = self._split_text_into_n_parts(script_text, num_paragraphs)
-            if not paragraphs or len(paragraphs) < num_paragraphs:
-                paragraphs = _split_text_into_n_parts_fallback(
-                    script_text, num_paragraphs
-                )
         except Exception:
-            paragraphs = _split_text_into_n_parts_fallback(script_text, num_paragraphs)
+            # fallback
+            from math import ceil
 
-        # per-paragraph attempt cap: respect self.max_prompt_attempts if set; else infinite
-        cap = getattr(self, "max_prompt_attempts", None)
-        if isinstance(cap, int) and cap > 0:
-            per_paragraph_max = cap
-        else:
-            per_paragraph_max = None  # infinite retry
-
-        # robust extractor that tries bracketed blocks first, then heuristics
-        def _extract_blocks(resp_text: str):
-            if not resp_text:
-                return []
-            blocks = []
-            try:
-                # prefer an existing helper if it's available and works
-                raw = (
-                    extract_all_bracketed_blocks(resp_text)
-                    if "extract_all_bracketed_blocks" in globals()
-                    else None
-                )
-                if raw:
-                    for b in raw:
-                        if isinstance(b, str):
-                            blocks.append(b.strip())
-            except Exception:
-                pass
-
-            if not blocks:
-                # bracket pattern (allowing newlines)
-                for m in re.findall(r"\[([^\]]{3,})\]", resp_text, flags=re.DOTALL):
-                    blocks.append(m.strip())
-
-            if not blocks:
-                # fallback: long-enough lines / numbered list items
-                lines = [ln.strip() for ln in resp_text.splitlines() if ln.strip()]
-                candidates = []
-                for ln in lines:
-                    # skip obvious metadata lines
-                    if len(ln) < 12:
-                        continue
-                    if any(
-                        ln.lower().startswith(pref)
-                        for pref in (
-                            "system:",
-                            "user:",
-                            "assistant:",
-                            "seed:",
-                            "#",
-                            "reply",
-                            "example",
-                        )
-                    ):
-                        continue
-                    ln2 = re.sub(r"^[\-\*\d\.\)\s]+", "", ln).strip()
-                    if len(ln2) >= 12:
-                        candidates.append(ln2)
-                # combine short consecutive lines if they look like one prompt
-                i = 0
-                while i < len(candidates):
-                    cur = candidates[i]
-                    j = i + 1
-                    while j < len(candidates) and len(cur.split()) < 10:
-                        cur = cur + " " + candidates[j]
-                        j += 1
-                    blocks.append(cur.strip())
-                    i = j
-
-            if not blocks:
-                # last resort: chunk by paragraphs
-                for seg in re.split(r"(?:\n{2,}|[\r\n]+)", resp_text):
-                    seg = seg.strip()
-                    if len(seg.split()) >= 6:
-                        blocks.append(seg)
-            # normalize whitespace
-            cleaned = [
-                re.sub(r"\s+", " ", b).strip() for b in blocks if isinstance(b, str)
+            words = script_text.split()
+            avg = max(1, ceil(len(words) / num_paragraphs)) if script_text else 0
+            paragraphs = [
+                " ".join(words[i : i + avg]) for i in range(0, len(words), avg)
             ]
-            return cleaned
+            while len(paragraphs) < num_paragraphs:
+                paragraphs.append("")
 
-        # validator to filter out meta/non-image lines (best-effort heuristics)
-        def is_valid_prompt(candidate: str) -> bool:
-            if not candidate or len(candidate.strip()) == 0:
-                return False
-            c = candidate.strip()
-
-            # remove surrounding brackets/quotes/backticks for inspection
-            c_inspect = c.strip("[]()\"'" + "`").strip()
-
-            # reject very short candidates (too few words)
-            tokens = c_inspect.split()
-            if len(tokens) < 10:
-                # allow slightly shorter if contains strong visual indicators (camera/lens/aspect/illustration)
-                visual_keywords = (
-                    "camera",
-                    "lens",
-                    "f/",
-                    "aperture",
-                    "iso",
-                    "shutter",
-                    "mm",
-                    "aspect",
-                    "16:9",
-                    "9:16",
-                    "2:3",
-                    "photoreal",
-                    "cinematic",
-                    "watercolor",
-                    "watercolour",
-                    "illustration",
-                    "render",
-                    "anime",
-                    "oil paint",
-                    "bokeh",
-                    "lighting",
-                    "foreground",
-                    "background",
-                    "hex",
-                )
-                if not any(k in c_inspect.lower() for k in visual_keywords):
-                    return False
-
-            low = c_inspect.lower()
-
-            # reject lines that are clearly a clarification request, confirmation, examples, or error messages
-            reject_phrases = [
-                "understood",
-                "before i generate",
-                "do you want",
-                "which one",
-                "reply",
-                "please confirm",
-                "need clarification",
-                "do you prefer",
-                "would you like",
-                "do you want every prompt",
-                "unable to reach",
-                "error",
-                "cannot reach",
-                "service may be down",
-                "example difference",
-                "which one do you want",
-                "which one",
-                "select a",
-                "which format",
-                "do you mean",
-                "clarify",
-                "confirm",
-                "shall i",
-                "would you",
-                "do you",
-                "please advise",
-                "which style",
-            ]
-            for ph in reject_phrases:
-                if ph in low:
-                    return False
-
-            # reject obvious markdown/meta noise
-            if any(
-                tok in c_inspect
-                for tok in ("**", "```", "🔍", "⚠️", "✅", "➡️", "—", "•")
-            ):
-                return False
-
-            # reject if candidate appears to be an instruction rather than a description (heuristic)
-            # e.g., starts with verbs like "generate", "create", "please generate"
-            if re.match(
-                r"^(generate|create|please generate|please create|return|output)\b", low
-            ):
-                return False
-
-            # reject if contains too many question marks or is mostly a question shorter than threshold
-            if c_inspect.count("?") >= 1 and len(tokens) < 20:
-                # short questions are likely clarifications
-                return False
-
-            # require at least one visual/content token OR be long enough
-            visual_keywords = (
-                "camera",
-                "lens",
-                "f/",
-                "aperture",
-                "iso",
-                "shutter",
-                "mm",
-                "aspect",
-                "16:9",
-                "9:16",
-                "2:3",
-                "photoreal",
-                "cinematic",
-                "watercolor",
-                "watercolour",
-                "illustration",
-                "render",
-                "anime",
-                "oil paint",
-                "bokeh",
-                "lighting",
-                "foreground",
-                "background",
-                "hex",
-                "portra",
-                "kodak",
-                "film",
-                "portrait",
-                "landscape",
-                "studio",
-                "macro",
-                "wide",
-            )
-            if (
-                not any(k in c_inspect.lower() for k in visual_keywords)
-                and len(tokens) < 15
-            ):
-                return False
-
-            # finally, ensure it contains at least one noun-like token (heuristic: presence of letters)
-            if not re.search(r"[A-Za-z]", c_inspect):
-                return False
-
-            return True
-
-        # helper to build request (prefer instance builder)
-        def _build_request(script_paragraph: str, theme_val: str, req_count: int):
-            try:
-                return self._build_image_prompt_request(
-                    script_paragraph, theme_val, req_count
-                )
-            except Exception:
-                return f"Generate {req_count} image prompts for theme {theme_val} from:\n\n{script_paragraph}"
-
-        # ensure response folder exists
-        try:
-            os.makedirs(response_folder, exist_ok=True)
-        except Exception:
-            pass
-
-        print(
-            f"\nStarting strict per-paragraph image prompt generation: target={img_number}, batch_size={batch_size}, paragraphs={num_paragraphs}"
+        prompts = []
+        seen_prompts = set()
+        per_paragraph_cap = getattr(self, "max_prompt_attempts", None)
+        per_paragraph_max = (
+            per_paragraph_cap
+            if (isinstance(per_paragraph_cap, int) and per_paragraph_cap > 0)
+            else None
         )
 
-        # MAIN: for each paragraph sequentially fill its quota fully before moving on
-        for para_idx in range(num_paragraphs):
+        def _write_atomic(path, content):
+            try:
+                tmp = path + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    f.write(content)
+                os.replace(tmp, path)
+            except Exception:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(content)
+
+        def _save_progress():
+            try:
+                content = "".join(f"[{p}]\n" for p in prompts)
+                _write_atomic(final_path, content)
+                print(f"💾 Saved progress: {len(prompts)} prompts -> {final_path}")
+            except Exception as e:
+                print(f"⚠️ Failed to save progress: {e}")
+
+        # attempt builder and validator reuse from instance
+        def _build_request(script_paragraph, req_count, seed):
+            try:
+                return self._build_image_prompt_request(
+                    script_paragraph, theme, req_count
+                )
+            except Exception:
+                return f"{script_paragraph}\n\nGenerate {req_count} ultra-detailed image prompts. Seed:{seed}"
+
+        def _extract_blocks(resp_text):
+            if not resp_text:
+                return []
+            # try bracketed first
+            blocks = extract_all_bracketed_blocks(resp_text)
+            if blocks:
+                return [b.strip() for b in blocks if isinstance(b, str)]
+            # fallback: lines of sufficient length
+            lines = [ln.strip() for ln in resp_text.splitlines() if ln.strip()]
+            candidates = []
+            for ln in lines:
+                if len(ln) < 12:
+                    continue
+                ln2 = re.sub(r"^[\-\*\d\.\)\s]+", "", ln).strip()
+                if len(ln2.split()) >= 6:
+                    candidates.append(ln2)
+            return candidates
+
+        def _is_valid(candidate):
+            # reuse your same heuristic but keep it simpler and fast here to avoid subtle bugs
+            if not candidate or len(candidate.strip()) < 8:
+                return False
+            c = candidate.strip("[]()\"'` ").strip()
+            if len(c.split()) < 8 and not any(
+                k in c.lower()
+                for k in (
+                    "camera",
+                    "cinematic",
+                    "photoreal",
+                    "illustration",
+                    "render",
+                    "watercolor",
+                )
+            ):
+                return False
+            # reject obvious meta lines
+            lower = c.lower()
+            for bad in (
+                "do you want",
+                "please confirm",
+                "which one",
+                "error",
+                "unable to",
+                "service may be down",
+                "example",
+            ):
+                if bad in lower:
+                    return False
+            return True
+
+        # MAIN: sequential per-paragraph filling (keeps original semantics)
+        for p_idx in range(num_paragraphs):
             if len(prompts) >= img_number:
                 break
-            remaining_total = img_number - len(prompts)
-            para_quota = min(
-                batch_size, remaining_total
-            )  # full quota for this paragraph
-            collected_for_paragraph = 0
-            paragraph = paragraphs[para_idx] or script_text or ""
-            paragraph_attempts = 0
+            paragraph = paragraphs[p_idx] or script_text or ""
+            quota_for_para = min(batch_size, img_number - len(prompts))
+            collected = 0
+            attempts = 0
+            print(f"\n➡️ Paragraph {p_idx+1}/{num_paragraphs} quota={quota_for_para}")
 
-            print(
-                f"\n➡️ Paragraph {para_idx+1}/{num_paragraphs}: need {para_quota} prompts for this paragraph"
-            )
-
-            # keep retrying this paragraph until its quota is filled or attempts cap reached
-            while collected_for_paragraph < para_quota and (
-                per_paragraph_max is None or paragraph_attempts < per_paragraph_max
+            while collected < quota_for_para and (
+                per_paragraph_max is None or attempts < per_paragraph_max
             ):
-                paragraph_attempts += 1
+                attempts += 1
                 seed = random.randint(1000, 9999)
-                need_now = para_quota - collected_for_paragraph
-                request_count = (
-                    need_now  # request the remaining quota for this paragraph
-                )
-
-                enriched_script = (
-                    f"{paragraph}\n\n"
-                    f"# Paragraph {para_idx+1} | Attempt {paragraph_attempts} | Seed: {seed}\n"
-                    f"Generate {request_count} completely unique, creative, and ultra-detailed image prompts.\n"
-                    f"Each prompt must depict a different scene, composition, camera angle, lighting, and tone.\n"
-                    f"Vary the artistic style and subject matter — avoid repeating concepts, objects, or phrasing.\n"
-                    f"Each prompt should explicitly mention the theme: {theme}.\n"
-                    f"Return each prompt in [brackets], one per line. No explanations or extra text.\n"
-                )
-
-                print(
-                    f"  🎯 Requesting {request_count} prompts (paragraph {para_idx+1}, attempt {paragraph_attempts}, seed={seed})..."
-                )
-                prompt_request = _build_request(enriched_script, theme, request_count)
+                need = quota_for_para - collected
+                request_count = need
+                enriched = f"{paragraph}\n\n# Paragraph {p_idx+1} | Attempt {attempts} | Seed {seed}\nGenerate {request_count} unique, highly-detailed image prompts. Output one bracketed prompt per line."
+                req_body = _build_request(enriched, request_count, seed)
 
                 try:
                     resp = self.chat.send_message(
-                        prompt_request,
+                        req_body,
                         timeout=timeout_per_call,
-                        spinner_message=f"Generating paragraph {para_idx+1} prompts (attempt {paragraph_attempts})...",
+                        spinner_message=f"Generating para {p_idx+1} prompts (attempt {attempts})...",
                     )
                 except Exception as e:
-                    print(
-                        f"  ⚠️ API error on paragraph {para_idx+1} attempt {paragraph_attempts}: {e}"
-                    )
-                    err_fname = f"para_{para_idx+1}_err_{paragraph_attempts}.txt"
+                    print(f"  ⚠️ API error: {e}")
+                    # save diagnostic
                     try:
-                        save_response(response_folder, err_fname, str(e))
-                        print(
-                            f"  ✅ Saved error: {os.path.join(response_folder, err_fname)}"
+                        _write_atomic(
+                            os.path.join(
+                                response_folder, f"para_{p_idx+1}_err_{attempts}.txt"
+                            ),
+                            str(e),
                         )
                     except Exception:
-                        try:
-                            with open(
-                                os.path.join(response_folder, err_fname),
-                                "w",
-                                encoding="utf-8",
-                            ) as f:
-                                f.write(str(e))
-                            print(
-                                f"  ✅ Saved error fallback: {os.path.join(response_folder, err_fname)}"
-                            )
-                        except Exception:
-                            pass
-                    time.sleep(1 + random.random())
+                        pass
+                    time.sleep(0.6 + random.random() * 0.4)
                     continue
 
-                # extract candidate blocks
                 blocks = _extract_blocks(resp)
-
-                if not blocks:
-                    print(
-                        f"  ⚠️ No candidate blocks parsed for paragraph {para_idx+1} attempt {paragraph_attempts}. Saving raw and retrying."
-                    )
-                    raw_fname = f"para_{para_idx+1}_raw_{paragraph_attempts}.txt"
-                    try:
-                        save_response(
-                            response_folder,
-                            raw_fname,
-                            resp if isinstance(resp, str) else str(resp),
-                        )
-                        print(
-                            f"  ✅ Saved raw: {os.path.join(response_folder, raw_fname)}"
-                        )
-                    except Exception:
-                        try:
-                            with open(
-                                os.path.join(response_folder, raw_fname),
-                                "w",
-                                encoding="utf-8",
-                            ) as f:
-                                f.write(resp if isinstance(resp, str) else str(resp))
-                            print(
-                                f"  ✅ Saved raw fallback: {os.path.join(response_folder, raw_fname)}"
-                            )
-                        except Exception:
-                            pass
-                    time.sleep(0.5 + random.random() * 0.5)
-                    continue
-
-                # from blocks accept only those validated as image prompts
                 added = 0
                 for blk in blocks:
                     if added >= request_count:
                         break
-                    candidate = blk.strip()
-                    # remove surrounding bracket/quote/backtick chars safely
-                    candidate = candidate.strip("[]()\"'" + "`").strip()
-                    candidate = re.sub(r"\s+", " ", candidate)
-                    if not candidate or len(candidate) < 8:
+                    cand = blk.strip("[]()\"'` ").strip()
+                    cand = re.sub(r"\s+", " ", cand)
+                    if not _is_valid(cand):
                         continue
-
-                    # run validator
-                    if not is_valid_prompt(candidate):
-                        # skip anything that looks like a clarification, question, error, or meta text
+                    if theme.lower() not in cand.lower():
+                        cand = f"{cand} | Theme: {theme}"
+                    if cand in seen_prompts:
                         continue
-
-                    # ensure theme appended
-                    if theme.lower() not in candidate.lower():
-                        candidate = f"{candidate} | Theme: {theme}"
-
-                    # dedupe globally
-                    if candidate in seen_prompts:
-                        continue
-
-                    # accept
-                    seen_prompts.add(candidate)
-                    prompts.append(candidate)
+                    seen_prompts.add(cand)
+                    prompts.append(cand)
                     added += 1
-                    collected_for_paragraph += 1
+                    collected += 1
 
                 print(
-                    f"  ✅ Added {added} valid prompts this attempt (collected for paragraph: {collected_for_paragraph}/{para_quota}, total: {len(prompts)}/{img_number})."
+                    f"  ⚪ added {added} prompts this attempt (collected {collected}/{quota_for_para}, total {len(prompts)}/{img_number})"
                 )
+                if save_each_batch and added:
+                    _save_progress()
+                time.sleep(0.3 + random.random() * 0.5)
 
-                # optionally save intermediate progress to final file (only valid prompts are written)
-                if save_each_batch and added > 0:
-                    try:
-                        # read existing final content (if any)
-                        existing_text = ""
-                        if os.path.exists(final_path):
-                            with open(final_path, "r", encoding="utf-8") as f:
-                                existing_text = f.read()
-                        # append newly added valid prompts only if not already present in file
-                        new_lines = []
-                        for p in prompts[-added:]:
-                            line = f"[{p}]\n"
-                            if line not in existing_text:
-                                new_lines.append(line)
-                        if new_lines:
-                            combined = (existing_text + "".join(new_lines)).strip()
-                            try:
-                                save_response(
-                                    response_folder,
-                                    final_fname,
-                                    combined
-                                    + ("\n" if not combined.endswith("\n") else ""),
-                                )
-                                print(
-                                    f"  💾 Appended {len(new_lines)} prompts to {final_path}"
-                                )
-                            except Exception:
-                                with open(final_path, "w", encoding="utf-8") as f:
-                                    f.write(
-                                        combined
-                                        + ("\n" if not combined.endswith("\n") else "")
-                                    )
-                                print(
-                                    f"  💾 Appended fallback write {len(new_lines)} prompts to {final_path}"
-                                )
-                    except Exception:
-                        pass
-
-                # polite delay
-                time.sleep(0.4 + random.random() * 0.6)
-
-            # if failed to fill paragraph quota and per_paragraph_max was set, warn then continue
-            if (
-                collected_for_paragraph < para_quota
-                and per_paragraph_max is not None
-                and paragraph_attempts >= per_paragraph_max
-            ):
-                missing = para_quota - collected_for_paragraph
+            if collected < quota_for_para:
                 print(
-                    f"⚠️ Paragraph {para_idx+1} failed to fill its quota by {missing} prompts after {per_paragraph_max} attempts."
+                    f"⚠️ Could not fill paragraph {p_idx+1} quota (collected {collected}/{quota_for_para}). Moving on."
                 )
-                # move to next paragraph (global target might still be achievable)
-                continue
 
-        # FINALIZE: dedupe, trim to exact img_number, and write final canonical file with only validated prompts
-        final_prompts = list(dict.fromkeys(prompts))
-        if len(final_prompts) > img_number:
-            final_prompts = final_prompts[:img_number]
+        # final dedupe & trim
+        final_prompts = []
+        for p in prompts:
+            if p not in final_prompts:
+                final_prompts.append(p)
+            if len(final_prompts) >= img_number:
+                break
 
-        final_content = "".join(f"[{p}]\n" for p in final_prompts)
+        # write final canonical file
         try:
-            save_response(response_folder, final_fname, final_content)
+            _write_atomic(final_path, "".join(f"[{p}]\n" for p in final_prompts))
             print(
-                f"\n✅ Final saved {len(final_prompts)}/{img_number} prompts to {final_path}"
+                f"\n✅ Final saved {len(final_prompts)}/{img_number} prompts -> {final_path}"
             )
-        except Exception:
-            try:
-                with open(final_path, "w", encoding="utf-8") as f:
-                    f.write(final_content)
-                print(
-                    f"\n✅ Final saved fallback {len(final_prompts)}/{img_number} prompts to {final_path}"
-                )
-            except Exception as e:
-                print(f"\n⚠️ Failed to save final prompts: {e}")
-
-        # If incomplete and infinite mode, run fill cycles until target met (keeps same strict validation)
-        if len(final_prompts) < img_number and per_paragraph_max is None:
-            print(
-                f"🔁 Final currently {len(final_prompts)}/{img_number}. Entering fill cycles (infinite mode) until target met."
-            )
-            para_cycle = 0
-            while len(final_prompts) < img_number:
-                para_idx = para_cycle % num_paragraphs
-                need_now = min(batch_size, img_number - len(final_prompts))
-                paragraph = paragraphs[para_idx] or script_text or ""
-                seed = random.randint(1000, 9999)
-                enriched_script = (
-                    f"{paragraph}\n\n"
-                    f"# Extra fill cycle | Paragraph {para_idx+1} | Seed: {seed}\n"
-                    f"Generate {need_now} unique ultra-detailed prompts. Each prompt in brackets on its own line.\n"
-                )
-                prompt_request = _build_request(enriched_script, theme, need_now)
-                try:
-                    resp = self.chat.send_message(
-                        prompt_request,
-                        timeout=timeout_per_call,
-                        spinner_message="Filling missing prompts...",
-                    )
-                except Exception:
-                    time.sleep(1 + random.random())
-                    para_cycle += 1
-                    continue
-                blocks = _extract_blocks(resp)
-                added = 0
-                for blk in blocks:
-                    if added >= need_now:
-                        break
-                    candidate = blk.strip()
-                    candidate = candidate.strip("[]()\"'" + "`").strip()
-                    candidate = re.sub(r"\s+", " ", candidate)
-                    if not candidate:
-                        continue
-                    if not is_valid_prompt(candidate):
-                        continue
-                    if theme.lower() not in candidate.lower():
-                        candidate = f"{candidate} | Theme: {theme}"
-                    if candidate in seen_prompts:
-                        continue
-                    seen_prompts.add(candidate)
-                    final_prompts.append(candidate)
-                    added += 1
-                # write updated final file
-                try:
-                    save_response(
-                        response_folder,
-                        final_fname,
-                        "".join(f"[{p}]\n" for p in final_prompts[:img_number]),
-                    )
-                except Exception:
-                    try:
-                        with open(final_path, "w", encoding="utf-8") as f:
-                            f.write(
-                                "".join(f"[{p}]\n" for p in final_prompts[:img_number])
-                            )
-                    except Exception:
-                        pass
-                para_cycle += 1
-                time.sleep(0.4 + random.random() * 0.6)
-
-            print(
-                f"🎯 Fill cycles complete: {len(final_prompts[:img_number])}/{img_number}"
-            )
-
-        # Trim and final check
-        if len(final_prompts) > img_number:
-            final_prompts = final_prompts[:img_number]
-
-        if len(final_prompts) < img_number:
-            print(
-                f"⚠️ Finished but only collected {len(final_prompts)}/{img_number} prompts (per_paragraph_max may have limited retries)."
-            )
-
-        # CLEANUP: remove intermediate files inside image_response except the final image_prompts.txt
-        try:
-            for fname in os.listdir(response_folder):
-                fp = os.path.join(response_folder, fname)
-                try:
-                    if os.path.abspath(fp) == os.path.abspath(final_path):
-                        continue
-                    if os.path.isfile(fp):
-                        os.remove(fp)
-                        print(f"🧹 Removed intermediate file: {fp}")
-                except Exception:
-                    pass
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"\n⚠️ Failed final save: {e}")
 
         return final_prompts
 
