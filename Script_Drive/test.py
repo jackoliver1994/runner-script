@@ -1,56 +1,93 @@
 #!/usr/bin/env python3
 """
-robust_request.py
+full_robust_runner.py
 
-Robust POST request script with:
- - configurable timeout, retries, backoff
- - safe JSON parsing (handles empty / non-JSON bodies)
- - detailed logging to stdout and a log file (for CI)
- - proper exit codes for CI
+Self-contained runner for GitHub Actions:
+ - Robust POST requests with retry/backoff and safe JSON handling
+ - Rotating logs + console output
+ - Heartbeat file written periodically
+ - Optional repeated runs for X hours (default: single-shot)
+ - Dumps last responses and full tracebacks on errors
+ - Produces artifacts.zip containing logs, dumps, and outputs for upload by Actions
 
-Usage examples:
-  python robust_request.py --url "https://apifreellm.com/api/chat" --message "Hello"
-  API_URL=https://... python robust_request.py
+Usage (CI recommended env):
+  python full_robust_runner.py
+Or with overrides:
+  python full_robust_runner.py --url "https://example.com/api" --timeout 100 --run-hours 6
+
+Configuration via ENV (preferred in Actions) or CLI args:
+  API_URL, MESSAGE, REQUEST_TIMEOUT, REQUEST_RETRIES, REQUEST_BACKOFF,
+  HEARTBEAT_PATH, OUTPUTS_DIR, RUN_HOURS, INTERVAL_SECONDS, ARTIFACT_ZIP
 """
 
+from __future__ import annotations
 import argparse
 import json
 import logging
+import logging.handlers
 import os
 import sys
+import threading
+import time
 import traceback
-from datetime import datetime
+import zipfile
+from datetime import datetime, timedelta
+from typing import Any, Dict, Optional
 
 import requests
 from requests.adapters import HTTPAdapter
-from requests.exceptions import RequestException, HTTPError, Timeout
+from requests.exceptions import RequestException, Timeout
 from urllib3.util.retry import Retry
 
-# ---------- Defaults (override via CLI or env) ----------
-DEFAULT_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "100"))     # seconds
-DEFAULT_RETRIES = int(os.getenv("REQUEST_RETRIES", "3"))
-DEFAULT_BACKOFF = float(os.getenv("REQUEST_BACKOFF", "1"))      # base backoff factor
-DEFAULT_LOGFILE = os.getenv("REQUEST_LOGFILE", "robust_request.log")
+# ---------- Defaults (override via env) ----------
 DEFAULT_URL = os.getenv("API_URL", "https://apifreellm.com/api/chat")
+DEFAULT_MESSAGE = os.getenv("MESSAGE", "Hello from GitHub Actions")
+DEFAULT_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "100"))
+DEFAULT_RETRIES = int(os.getenv("REQUEST_RETRIES", "3"))
+DEFAULT_BACKOFF = float(os.getenv("REQUEST_BACKOFF", "1"))
+DEFAULT_LOGFILE = os.getenv("REQUEST_LOGFILE", "robust_request.log")
+LOG_MAX_BYTES = 5 * 1024 * 1024
+LOG_BACKUP_COUNT = 5
+DEFAULT_HEARTBEAT = os.getenv("HEARTBEAT_PATH", "heartbeat/heartbeat.txt")
+DEFAULT_OUTPUTS_DIR = os.getenv("OUTPUTS_DIR", "outputs")
+DEFAULT_RUN_HOURS = float(os.getenv("RUN_HOURS", "0"))  # 0 means single run
+DEFAULT_INTERVAL_SECONDS = int(os.getenv("INTERVAL_SECONDS", "60"))
+DEFAULT_ARTIFACT_ZIP = os.getenv("ARTIFACT_ZIP", "artifacts.zip")
+
+# ---------- Helpers ----------
+def ts() -> str:
+    return datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+
+def ensure_dir(path: str):
+    os.makedirs(path, exist_ok=True)
+
+def save_text(prefix: str, text: str) -> str:
+    fname = f"{prefix}_{ts()}.txt"
+    with open(fname, "w", encoding="utf-8") as f:
+        f.write(text or "")
+    return os.path.abspath(fname)
 
 # ---------- Logging ----------
-logger = logging.getLogger("robust_request")
-logger.setLevel(logging.DEBUG)
-fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+def setup_logging(logfile: str, console_level=logging.INFO, file_level=logging.DEBUG):
+    ensure_dir(os.path.dirname(os.path.abspath(logfile)) or ".")
+    logger = logging.getLogger("full_robust_runner")
+    logger.setLevel(logging.DEBUG)
+    # remove prior handlers to support re-run in same process
+    for h in list(logger.handlers):
+        logger.removeHandler(h)
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setLevel(console_level)
+    ch.setFormatter(fmt)
+    logger.addHandler(ch)
+    fh = logging.handlers.RotatingFileHandler(logfile, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT, encoding="utf-8")
+    fh.setLevel(file_level)
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+    logger.debug("Logging to console and %s", os.path.abspath(logfile))
+    return logger
 
-# Console handler
-ch = logging.StreamHandler(sys.stdout)
-ch.setLevel(logging.INFO)
-ch.setFormatter(fmt)
-logger.addHandler(ch)
-
-# File handler
-fh = logging.FileHandler(DEFAULT_LOGFILE)
-fh.setLevel(logging.DEBUG)
-fh.setFormatter(fmt)
-logger.addHandler(fh)
-
-
+# ---------- HTTP session builder ----------
 def build_session(retries: int, backoff: float) -> requests.Session:
     session = requests.Session()
     retry_strategy = Retry(
@@ -65,12 +102,8 @@ def build_session(retries: int, backoff: float) -> requests.Session:
     session.mount("http://", adapter)
     return session
 
-
-def safe_parse_json(text: str):
-    """
-    Try to parse JSON. Return parsed object or None if not JSON.
-    """
-    if text is None:
+def safe_parse_json(text: Optional[str]):
+    if not text:
         return None
     text = text.strip()
     if text == "":
@@ -80,216 +113,256 @@ def safe_parse_json(text: str):
     except Exception:
         return None
 
-
-def send_post(
-    session: requests.Session,
-    url: str,
-    json_data,
-    headers: dict,
-    timeout: float,
-    attempt_num: int = 1,
-):
-    """
-    Send a POST and return a structured result dict with:
-      - ok (bool)
-      - status_code (int or None)
-      - json (object or None)
-      - text (str)
-      - headers (dict)
-      - elapsed (float seconds)
-      - error (str or None)
-    """
-    result = {
+# ---------- POST and result handling ----------
+def send_post(session: requests.Session, url: str, payload: Dict[str, Any], headers: Dict[str, str], timeout: float, logger: logging.Logger, attempt: int = 1) -> Dict[str, Any]:
+    info = {
         "ok": False,
-        "status_code": None,
+        "status": None,
+        "elapsed": None,
         "json": None,
         "text": None,
         "headers": None,
-        "elapsed": None,
+        "dump_file": None,
         "error": None,
     }
     try:
-        logger.info(f"Attempt #{attempt_num} -> POST {url} (timeout={timeout}s)")
-        resp = session.post(url, json=json_data, headers=headers or {}, timeout=timeout)
-        result["status_code"] = resp.status_code
-        result["headers"] = dict(resp.headers)
-        result["elapsed"] = float(resp.elapsed.total_seconds()) if resp.elapsed else None
-        # get text safely (but limit length in logs)
+        logger.info("Attempt %d: POST %s (timeout=%ss)", attempt, url, timeout)
+        resp = session.post(url, json=payload, headers=headers or {}, timeout=timeout)
+        info["status"] = resp.status_code
+        info["headers"] = dict(resp.headers) if resp.headers else {}
+        info["elapsed"] = float(resp.elapsed.total_seconds()) if getattr(resp, "elapsed", None) else None
         text = resp.text or ""
-        result["text"] = text
-
-        # Try to parse JSON in a robust way
+        info["text"] = text
         parsed = None
         try:
             parsed = resp.json()
-        except Exception:
+        except Exception as e:
+            logger.debug("resp.json() failed: %s", str(e))
             parsed = safe_parse_json(text)
-
-        result["json"] = parsed
-
-        # Treat 2xx as success (allow API-specific error field to handle logic later)
+        info["json"] = parsed
         if 200 <= resp.status_code < 300:
-            result["ok"] = True
+            info["ok"] = True
+            logger.info("Received %s in %.3fs", resp.status_code, info["elapsed"] or 0.0)
         else:
-            result["error"] = f"HTTP {resp.status_code}"
-            result["ok"] = False
-
-        return result
-
+            info["error"] = f"HTTP {resp.status_code}"
+            logger.warning("Non-2xx status: %s", resp.status_code)
+        if text and parsed is None:
+            dump_path = save_text("last_response", text)
+            info["dump_file"] = dump_path
+            logger.warning("Non-JSON response body saved to %s", dump_path)
+        return info
     except Timeout as e:
         tb = traceback.format_exc()
-        result["error"] = f"Timeout after {timeout}s: {e}"
-        logger.debug(tb)
-        return result
+        info["error"] = f"Timeout: {e}"
+        dump = save_text("last_response", f"Timeout\n\n{tb}")
+        info["dump_file"] = dump
+        logger.warning("Timeout: %s; dump -> %s", e, dump)
+        return info
     except RequestException as e:
         tb = traceback.format_exc()
-        result["error"] = f"RequestException: {e}"
-        logger.debug(tb)
-        return result
+        info["error"] = f"RequestException: {e}"
+        dump = save_text("last_response", f"RequestException\n\n{tb}")
+        info["dump_file"] = dump
+        logger.warning("RequestException: %s; dump -> %s", e, dump)
+        return info
     except Exception as e:
         tb = traceback.format_exc()
-        result["error"] = f"Unexpected error: {e}"
-        logger.debug(tb)
-        return result
+        info["error"] = f"Unexpected: {e}"
+        dump = save_text("last_response", f"Unexpected\n\n{tb}")
+        info["dump_file"] = dump
+        logger.error("Unexpected exception: %s; dump -> %s", e, dump)
+        return info
 
+# ---------- Heartbeat thread ----------
+class HeartbeatThread(threading.Thread):
+    def __init__(self, path: str, interval: int, logger: logging.Logger):
+        super().__init__(daemon=True)
+        self.path = path
+        self.interval = interval
+        self.running = threading.Event()
+        self.running.set()
+        self.logger = logger
+
+    def run(self):
+        ensure_dir(os.path.dirname(self.path) or ".")
+        self.logger.info("Heartbeat started -> %s (every %ds)", self.path, self.interval)
+        while self.running.is_set():
+            try:
+                with open(self.path, "w", encoding="utf-8") as f:
+                    f.write("heartbeat: " + datetime.utcnow().isoformat() + "Z\n")
+                # also touch a timestamped file for easier artifact debugging
+                with open(f"{self.path}.last", "w", encoding="utf-8") as f2:
+                    f2.write(datetime.utcnow().isoformat() + "Z\n")
+            except Exception as e:
+                self.logger.warning("Heartbeat write failed: %s", e)
+            for _ in range(self.interval):
+                if not self.running.is_set():
+                    break
+                time.sleep(1)
+        self.logger.info("Heartbeat stopped")
+
+    def stop(self):
+        self.running.clear()
+
+# ---------- Artifact collection ----------
+def make_artifact_zip(zip_name: str, logfile: str, outputs_dir: str, logger: logging.Logger) -> str:
+    logger.info("Creating artifact zip: %s", zip_name)
+    with zipfile.ZipFile(zip_name, "w", zipfile.ZIP_DEFLATED) as z:
+        # include logfile and rotating backups
+        if os.path.exists(logfile):
+            z.write(logfile, arcname=os.path.basename(logfile))
+        # include rotated backups in same dir
+        base = os.path.splitext(logfile)[0]
+        for candidate in sorted(os.listdir(".")):
+            if candidate.startswith(os.path.basename(base)):
+                if os.path.isfile(candidate):
+                    try:
+                        z.write(candidate, arcname=candidate)
+                    except Exception:
+                        logger.debug("Could not add %s", candidate)
+        # include last_response_*.txt and error_trace_*.txt
+        for f in sorted([f for f in os.listdir(".") if f.startswith("last_response_") or f.startswith("error_trace_") or f.startswith("run_summary_")]):
+            try:
+                z.write(f, arcname=f)
+            except Exception:
+                logger.debug("Could not add %s", f)
+        # include outputs (videos)
+        if os.path.isdir(outputs_dir):
+            for root, _, files in os.walk(outputs_dir):
+                for fn in files:
+                    path = os.path.join(root, fn)
+                    arc = os.path.relpath(path, ".")
+                    try:
+                        z.write(path, arcname=arc)
+                    except Exception:
+                        logger.debug("Could not add %s", path)
+    logger.info("Artifact zip created: %s", os.path.abspath(zip_name))
+    return os.path.abspath(zip_name)
+
+# ---------- CLI / Main ----------
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--url", "-u", default=DEFAULT_URL)
+    p.add_argument("--message", "-m", default=DEFAULT_MESSAGE)
+    p.add_argument("--timeout", "-t", type=float, default=DEFAULT_TIMEOUT)
+    p.add_argument("--retries", "-r", type=int, default=DEFAULT_RETRIES)
+    p.add_argument("--backoff", "-b", type=float, default=DEFAULT_BACKOFF)
+    p.add_argument("--logfile", "-l", default=DEFAULT_LOGFILE)
+    p.add_argument("--heartbeat", default=DEFAULT_HEARTBEAT)
+    p.add_argument("--outputs", default=DEFAULT_OUTPUTS_DIR)
+    p.add_argument("--run-hours", type=float, default=DEFAULT_RUN_HOURS, help="0=single run, >0 run this many hours retrying every interval")
+    p.add_argument("--interval-seconds", type=int, default=DEFAULT_INTERVAL_SECONDS)
+    p.add_argument("--artifact-zip", default=DEFAULT_ARTIFACT_ZIP)
+    p.add_argument("--raw-json", help="raw JSON payload string (overrides --message)")
+    return p.parse_args()
 
 def main():
-    parser = argparse.ArgumentParser(description="Robust POST to an API (with retries & logging).")
-    parser.add_argument("--url", "-u", default=DEFAULT_URL, help="API URL")
-    parser.add_argument("--message", "-m", default=None, help="Message to send (JSON payload will be {message: ...})")
-    parser.add_argument("--timeout", "-t", type=float, default=DEFAULT_TIMEOUT, help="Request timeout in seconds")
-    parser.add_argument("--retries", "-r", type=int, default=DEFAULT_RETRIES, help="Number of retries for transient errors")
-    parser.add_argument("--backoff", "-b", type=float, default=DEFAULT_BACKOFF, help="Backoff factor for retries")
-    parser.add_argument("--logfile", "-l", default=DEFAULT_LOGFILE, help="Log file path")
-    parser.add_argument("--raw-json", help="Send this raw JSON string as request body (instead of --message)")
-    parser.add_argument("--header", action="append", help="Extra headers in Key:Value form (can be passed multiple times)")
+    args = parse_args()
+    logger = setup_logging(args.logfile)
+    logger.info("full_robust_runner starting; args=%s", vars(args))
 
-    args = parser.parse_args()
+    ensure_dir(args.outputs)
+    # heartbeat
+    hb = HeartbeatThread(path=args.heartbeat, interval=max(10, args.interval_seconds), logger=logger)
+    hb.start()
 
-    # Allow changing logfile after parser (reconfigure file handler)
-    global fh
-    if args.logfile and args.logfile != DEFAULT_LOGFILE:
-        # remove old file handler and add new
-        logger.removeHandler(fh)
-        fh = logging.FileHandler(args.logfile)
-        fh.setLevel(logging.DEBUG)
-        fh.setFormatter(fmt)
-        logger.addHandler(fh)
-
-    url = args.url
-    timeout = args.timeout
-    retries = args.retries
-    backoff = args.backoff
-
-    # Build headers
+    session = build_session(retries=args.retries, backoff=args.backoff)
     headers = {"Content-Type": "application/json"}
-    if args.header:
-        for h in args.header:
-            if ":" in h:
-                k, v = h.split(":", 1)
-                headers[k.strip()] = v.strip()
-            else:
-                logger.warning("Ignored header entry (invalid format): %s", h)
 
-    # Build payload
     if args.raw_json:
         try:
             payload = json.loads(args.raw_json)
-        except Exception:
-            logger.error("Invalid JSON passed to --raw-json")
+        except Exception as e:
+            logger.critical("Invalid --raw-json: %s", e)
+            hb.stop()
+            hb.join(timeout=2)
             sys.exit(2)
-    elif args.message is not None:
+    else:
         payload = {"message": args.message}
-    else:
-        # If no message provided, try reading MESSAGE env var or default example payload
-        env_msg = os.getenv("MESSAGE")
-        if env_msg:
-            payload = {"message": env_msg}
-        else:
-            payload = {"message": "Hello, how are you?"}
 
-    logger.debug("Final payload: %s", json.dumps(payload))
-    logger.debug("Headers: %s", headers)
-    logger.info(f"Posting to {url} with retries={retries} timeout={timeout}s backoff={backoff}")
+    start_time = datetime.utcnow()
+    end_time = start_time + timedelta(hours=args.run_hours) if args.run_hours > 0 else start_time
+    iteration = 0
+    any_failure = False
+    last_info = None
 
-    session = build_session(retries=retries, backoff=backoff)
+    try:
+        while True:
+            iteration += 1
+            attempt_info = None
+            # make a single call with top-level retry loop (session also has low-level retries)
+            for attempt in range(1, args.retries + 1):
+                attempt_info = send_post(session=session, url=args.url, payload=payload, headers=headers, timeout=args.timeout, logger=logger, attempt=attempt)
+                logger.debug("Attempt %d info: %s", attempt, {k: attempt_info.get(k) for k in ("ok","status","error","dump_file")})
+                if attempt_info.get("ok"):
+                    break
+                wait = args.backoff * (2 ** (attempt - 1))
+                logger.info("Waiting %.1fs before next attempt", wait)
+                time.sleep(wait)
+            last_info = attempt_info
+            if not attempt_info.get("ok"):
+                any_failure = True
+                logger.error("Iteration %d: request failed after %d retries. Last error: %s", iteration, args.retries, attempt_info.get("error"))
+            else:
+                logger.info("Iteration %d: request succeeded status=%s", iteration, attempt_info.get("status"))
 
-    # Attempt loop: session's Retry will do lower-level retries for some failures, but
-    # we also perform higher-level attempts to capture structured logs between attempts.
-    final_result = None
-    for attempt in range(1, retries + 1):
-        result = send_post(session=session, url=url, json_data=payload, headers=headers, timeout=timeout, attempt_num=attempt)
+            # If run_hours == 0 => single-shot; break after first iteration
+            if args.run_hours <= 0:
+                break
 
-        # Log details (truncate long bodies to keep CI logs readable)
-        truncated_text = (result["text"][:10000] + "...(truncated)") if result["text"] and len(result["text"]) > 10000 else (result["text"] or "")
-        logger.info(f"Attempt {attempt} result: status={result['status_code']} elapsed={result['elapsed']}s ok={result['ok']}")
-        logger.debug("Response headers: %s", json.dumps(result["headers"]) if result["headers"] else {})
-        logger.debug("Response body (truncated 10k):\n%s", truncated_text)
-        if result["error"]:
-            logger.warning("Attempt %d error: %s", attempt, result["error"])
+            # if time is up, stop
+            now = datetime.utcnow()
+            if now >= end_time:
+                logger.info("Run-hours elapsed; stopping main loop")
+                break
 
-        # If ok and valid JSON or non-empty body -> accept
-        if result["ok"]:
-            final_result = result
-            break
+            # wait until next iteration but keep heartbeat running (sleep in small chunks)
+            secs = args.interval_seconds
+            logger.info("Sleeping %ds until next iteration (heartbeat will continue)", secs)
+            for _ in range(secs):
+                time.sleep(1)
+                # early exit if no more time
+                if datetime.utcnow() >= end_time:
+                    break
 
-        # else, wait a bit before next attempt (exponential backoff)
-        wait_seconds = backoff * (2 ** (attempt - 1))
-        logger.info("Waiting %.1fs before next attempt (backoff)...", wait_seconds)
+    except KeyboardInterrupt:
+        logger.warning("Interrupted by user")
+        any_failure = True
+    except Exception as exc:
+        any_failure = True
+        trace = traceback.format_exc()
+        trace_file = save_text("error_trace", trace)
+        logger.critical("Unhandled exception: %s; trace saved to %s", exc, trace_file)
+    finally:
+        # stop heartbeat thread gently
+        hb.stop()
+        hb.join(timeout=5)
+        # write run summary
+        summary = {
+            "started_at": start_time.isoformat() + "Z",
+            "ended_at": datetime.utcnow().isoformat() + "Z",
+            "iterations": iteration,
+            "last_status": last_info.get("status") if last_info else None,
+            "last_error": last_info.get("error") if last_info else None,
+            "any_failure": any_failure,
+        }
+        summary_path = save_text("run_summary", json.dumps(summary, indent=2))
+        logger.info("Wrote run summary to %s", summary_path)
+
+        # create artifact zip
         try:
-            # Be careful: in CI you may want to avoid very long sleeps; this is mild.
-            import time
-            time.sleep(wait_seconds)
-        except KeyboardInterrupt:
-            logger.error("Interrupted during backoff wait")
-            break
+            artifact = make_artifact_zip(args.artifact_zip, args.logfile, args.outputs, logger)
+            print("ARTIFACT_ZIP=" + artifact)
+        except Exception as e:
+            logger.warning("Failed to create artifact zip: %s", e)
 
-    # Final evaluation
-    if final_result is None:
-        # All attempts failed
-        logger.error("All %d attempts failed. See logs: %s", retries, args.logfile)
-        # optionally dump last response text to separate file for debugging
-        if result and result.get("text"):
-            dump_file = f"last_response_{datetime.utcnow():%Y%m%dT%H%M%SZ}.txt"
-            with open(dump_file, "w", encoding="utf-8") as f:
-                f.write(result["text"])
-            logger.info("Wrote last response body to %s", dump_file)
-        sys.exit(1)
-
-    # We have a final_result (2xx). Try to interpret JSON payload
-    parsed = final_result.get("json")
-    if parsed:
-        # Example API semantics from your original script:
-        # if parsed.get("status") == "success": print response
-        status_field = parsed.get("status") if isinstance(parsed, dict) else None
-        if status_field == "success":
-            logger.info("API reported success.")
-            # print the "response" field if present
-            api_response = parsed.get("response") if isinstance(parsed, dict) else parsed
-            print("AI Response:", api_response)
-            sys.exit(0)
-        else:
-            # Not a success according to API — still print parsed JSON for debugging
-            logger.warning("API did not return success status. Full JSON: %s", json.dumps(parsed, indent=2) if isinstance(parsed, dict) else str(parsed))
-            # If API included an error field, surface it
-            api_error = parsed.get("error") if isinstance(parsed, dict) else None
-            if api_error:
-                logger.error("API error: %s", api_error)
-            print("API result (non-success):", parsed)
+        # final exit
+        if any_failure:
+            logger.info("Completed with failures; exit code 1")
             sys.exit(1)
-    else:
-        # No JSON returned — but request succeeded (2xx). Print raw text for debugging.
-        logger.warning("Response had no JSON body. Raw text printed (may be empty).")
-        print("Raw response text:")
-        print(final_result.get("text") or "")
-        # treat as failure for CI (change this behavior if your API sometimes returns non-JSON successes)
-        sys.exit(1)
-
+        else:
+            logger.info("Completed successfully; exit code 0")
+            sys.exit(0)
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as exc:
-        logger.critical("Unhandled exception: %s", exc)
-        logger.critical(traceback.format_exc())
-        sys.exit(2)
+    main()
