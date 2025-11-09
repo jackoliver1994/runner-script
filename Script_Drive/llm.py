@@ -1948,7 +1948,7 @@ class StoryPipeline:
             "   - Includes time-stamped highlights if applicable.\n"
             "   - Encourages watch time, comments, likes, and subscriptions.\n"
             "   - Includes relevant affiliate links or placeholders (e.g., '👇 Check this out: [link]').\n"
-            "   - Adds social links and CTAs to subscribe or follow.\n"
+            "   - Adds CTAs to subscribe or follow.\n"
             "   - Ends with keyword-rich hashtags and key phrases.\n"
             "3. **TAGS (comma-separated)** — Generate 20–30 high-ranking SEO tags (mix of short-tail and long-tail keywords relevant to the video topic).\n"
             "4. **HASHTAGS** — Include 10–20 trending, niche-relevant hashtags formatted like #ExampleTag.\n"
@@ -1967,7 +1967,7 @@ class StoryPipeline:
             "The script that will consume this output will parse these bracketed fields. Be careful: keep the labels exactly as shown (case-insensitive allowed) and place only one matching pair of square brackets per field.\n\n"
             "Required bracketed fields (the content inside brackets can be multi-line for DESCRIPTION):\n"
             "title [the title of the video]\n"
-            "description [the description of video with all des, SEO tags, time stamps, CTAs, social links... (can be multi-line)]\n"
+            "description [the description of video with all des, SEO tags, time stamps, CTAs... (can be multi-line)]\n"
             'tags ["tag1", "tag2", "long tail tag 3", ...]  # Provide as a Python/JSON-style list OR comma separated list\n'
             "hashtags [#tag1, #tag2, #tag3, ...]\n"
             "categoryId [any id]  # Use a numeric ID (e.g., 22) from the list: \n"
@@ -2031,20 +2031,20 @@ if __name__ == "__main__":
 
     # --- Example 2: Generate image prompts in batches (helps with timeouts) ---
     # If your API frequently times out, reduce batch_size (e.g., 2 or 3)
-    image_prompts = pipeline.generate_image_prompts(
-        script_text=script,
-        theme="water color illustrations, children's book, whimsical, vibrant colors Creativity + sharing + emotional regulation",
-        img_number=150,  # set smaller for testing; set 50 in production
-        batch_size=30,  # reduce if timeouts happen frequently
-        timeout_per_call=1000,
-    )
-    print(f"\nGenerated {len(image_prompts)} image prompts (sample):")
-    for p in image_prompts[:5]:
-        print(f"[{p}]")
+    # image_prompts = pipeline.generate_image_prompts(
+    #     script_text=script,
+    #     theme="water color illustrations, children's book, whimsical, vibrant colors Creativity + sharing + emotional regulation",
+    #     img_number=150,  # set smaller for testing; set 50 in production
+    #     batch_size=30,  # reduce if timeouts happen frequently
+    #     timeout_per_call=1000,
+    # )
+    # print(f"\nGenerated {len(image_prompts)} image prompts (sample):")
+    # for p in image_prompts[:5]:
+    #     print(f"[{p}]")
 
     # --- Example 3: Only generate narration (suitable for Coqui) ---
-    narration_text = pipeline.generate_narration(script, timing_minutes=10)
-    print("\nNarration saved and ready for TTS")
+    # narration_text = pipeline.generate_narration(script, timing_minutes=10)
+    # print("\nNarration saved and ready for TTS")
 
     # # --- Example 4: Generate youtube metadata ---
     yt_meta = pipeline.generate_youtube_metadata(script, timing_minutes=10)

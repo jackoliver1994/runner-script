@@ -3,18 +3,15 @@
 remove_logo_from_video.py
 
 - Preserves all existing functionality (frame inpainting, ffmpeg checks/download, audio merge).
-- Replaces the previous upload method with a YouTube uploader that reads metadata dynamically
-  from a machine-readable file (default: youtube_metadata.txt). The file should be the AI-generated
-  output from the prompt above (the MACHINE-READABLE BLOCK).
+- Adds a method to decrypt `user.json.enc` using `user_key.txt`. Supports:
+    * Fernet (base64 key -> cryptography.Fernet)
+    * OpenSSL salted format (header "Salted__") using password in user_key.txt (EVP_BytesToKey MD5 derivation)
+    * Raw hex key with IV prepended in the encrypted file (16-byte IV + ciphertext)
+- After decrypting, writes `user.json` to current directory (overwrites if exists).
+- Uses client_secrets.json for YouTube OAuth as before.
 
-How to use:
-1. Generate metadata using the improved prompt above and save the entire LLM output to youtube_metadata.txt
-   (or change `METADATA_FILE` below).
-2. Ensure you have client_secrets.json for YouTube OAuth in the same folder (or change path).
-3. Run the script: python remove_logo_from_video.py
-
-Requirements:
-pip install opencv-python numpy requests google-auth google-auth-oauthlib google-auth-httplib2 google-api-python-client
+Requirements (pip):
+pip install opencv-python numpy requests google-auth google-auth-oauthlib google-auth-httplib2 google-api-python-client cryptography pycryptodome
 """
 
 import sys
@@ -32,12 +29,24 @@ import urllib.request
 import re
 import ast
 import json
+import base64
+import hashlib
 
 # Optional dependency — many systems have requests; used earlier for ffmpeg download attempts
 try:
     import requests
 except Exception:
     requests = None
+
+# Crypto libs for decryption fallback
+try:
+    from cryptography.fernet import Fernet
+    from Crypto.Cipher import AES
+    from Crypto.Util.Padding import unpad
+
+    CRYPTO_LIBS_AVAILABLE = True
+except Exception:
+    CRYPTO_LIBS_AVAILABLE = False
 
 # Google API imports (for YouTube upload)
 try:
@@ -61,6 +70,11 @@ METADATA_FILE = os.path.join(
 )  # AI output saved here
 client_secrets_file = os.path.join(current_directory, "client_secrets.json")
 token_file = os.path.join(current_directory, "token.pickle")
+
+# encrypted user json and key
+encrypted_user_json = os.path.join(current_directory, "user.json.enc")
+user_key_file = os.path.join(current_directory, "user_key.txt")
+decrypted_user_json = os.path.join(current_directory, "user.json")
 
 ffmpeg_root_path = os.path.join(current_directory, "ffmpeg")
 if sys.platform.startswith("win"):
@@ -120,6 +134,155 @@ def set_executable(path):
         os.chmod(path, st.st_mode | stat.S_IEXEC)
     except Exception:
         pass
+
+
+# -------------------------------------------------------------
+# Decrypt user.json.enc (new)
+# -------------------------------------------------------------
+def _evp_bytes_to_key(password: bytes, salt: bytes, key_len: int, iv_len: int):
+    """
+    EVP_BytesToKey using MD5 — compatible with OpenSSL `enc` salted format.
+    Returns (key, iv)
+    """
+    dtot = b""
+    prev = b""
+    while len(dtot) < (key_len + iv_len):
+        m = hashlib.md5(prev + password + salt).digest()
+        dtot += m
+        prev = m
+    key = dtot[:key_len]
+    iv = dtot[key_len : key_len + iv_len]
+    return key, iv
+
+
+def decrypt_user_json_enc(
+    enc_path=encrypted_user_json, key_path=user_key_file, out_path=decrypted_user_json
+):
+    """
+    Attempts to decrypt enc_path using key in key_path.
+    Supports:
+      - Fernet (key is base64 urlsafe and file is Fernet ciphertext)
+      - OpenSSL salted format (header "Salted__" + 8 byte salt) with password in key_path
+      - Raw hex key where enc file is: IV (16 bytes) + ciphertext => AES-256-CBC
+    Writes plaintext to out_path on success and returns True.
+    Raises RuntimeError on failure or if required crypto libs are missing.
+    """
+    if not os.path.exists(enc_path):
+        print(f"ℹ️ Encrypted file not found at {enc_path}; skipping decryption.")
+        return False
+
+    if not os.path.exists(key_path):
+        raise FileNotFoundError(f"user key file not found at {key_path}")
+
+    if not CRYPTO_LIBS_AVAILABLE:
+        raise RuntimeError(
+            "Required crypto libraries are not available. Install with:\n"
+            "  pip install cryptography pycryptodome"
+        )
+
+    with open(key_path, "r", encoding="utf-8") as f:
+        key_text = f.read().strip()
+
+    with open(enc_path, "rb") as f:
+        enc_bytes = f.read()
+
+    # 1) Try Fernet
+    try:
+        # Fernet keys are 32 urlsafe-base64 bytes -> length 44 characters when encoded
+        # attempt to base64-decode and use as fernet key
+        maybe_b = key_text.encode("utf-8")
+        # Accept raw base64 or URL-safe
+        try:
+            # If key contains whitespace/newlines, strip them
+            bkey = base64.urlsafe_b64decode(maybe_b + b"===")
+        except Exception:
+            bkey = None
+
+        if bkey and len(bkey) == 32:
+            # reconstruct URL-safe base64 for Fernet constructor
+            fernet_key = base64.urlsafe_b64encode(bkey)
+            try:
+                f = Fernet(fernet_key)
+                plaintext = f.decrypt(enc_bytes)
+                with open(out_path, "wb") as outf:
+                    outf.write(plaintext)
+                print(
+                    f"✅ Decrypted {enc_path} using Fernet key -> saved to {out_path}"
+                )
+                return True
+            except Exception:
+                # fallthrough to other attempts
+                pass
+    except Exception:
+        pass
+
+    # 2) Try OpenSSL salted format (header "Salted__")
+    try:
+        if enc_bytes.startswith(b"Salted__"):
+            salt = enc_bytes[8:16]
+            ciphertext = enc_bytes[16:]
+            password = key_text.encode("utf-8")
+            key, iv = _evp_bytes_to_key(password, salt, 32, 16)  # AES-256-CBC
+            cipher = AES.new(key, AES.MODE_CBC, iv)
+            plaintext = cipher.decrypt(ciphertext)
+            try:
+                plaintext = unpad(plaintext, AES.block_size)
+            except ValueError:
+                # padding error -> try to still write raw
+                raise
+            with open(out_path, "wb") as outf:
+                outf.write(plaintext)
+            print(
+                f"✅ Decrypted {enc_path} using OpenSSL-salted format password -> saved to {out_path}"
+            )
+            return True
+    except Exception as e:
+        # continue to other attempts
+        pass
+
+    # 3) Try raw hex key with IV prepended in file (IV=first 16 bytes)
+    try:
+        # if key_text looks like hex
+        hex_clean = key_text.strip().lower()
+        if all(c in "0123456789abcdef" for c in hex_clean) and len(hex_clean) in (
+            32,
+            64,
+        ):
+            key_bytes = bytes.fromhex(hex_clean)
+            # ensure key length of 16 or 32
+            if len(key_bytes) not in (16, 32):
+                # attempt to zero-pad/truncate
+                if len(key_bytes) < 32:
+                    key_bytes = key_bytes.ljust(32, b"\0")
+                else:
+                    key_bytes = key_bytes[:32]
+            if len(enc_bytes) > 16:
+                iv = enc_bytes[:16]
+                ciphertext = enc_bytes[16:]
+                cipher = AES.new(key_bytes, AES.MODE_CBC, iv)
+                plaintext = cipher.decrypt(ciphertext)
+                try:
+                    plaintext = unpad(plaintext, AES.block_size)
+                except ValueError:
+                    # padding error -> still write raw plaintext attempt
+                    raise
+                with open(out_path, "wb") as outf:
+                    outf.write(plaintext)
+                print(
+                    f"✅ Decrypted {enc_path} using raw hex key + IV (IV taken from file) -> saved to {out_path}"
+                )
+                return True
+    except Exception:
+        pass
+
+    # If we reach here, decryption attempts failed
+    raise RuntimeError(
+        "Failed to decrypt the file. Supported key formats:\n"
+        " - Fernet base64 key (cryptography.Fernet)\n"
+        " - OpenSSL salted format (file starts with 'Salted__') using the key file as password\n"
+        " - Raw hex key (16 or 32 byte hex) where file contains IV(16 bytes) + ciphertext\n\n"
+        "Ensure the correct format and key are present in user_key.txt."
+    )
 
 
 # -------------------------------------------------------------
@@ -619,8 +782,30 @@ if __name__ == "__main__":
     video_path = os.path.join(current_directory, "image_response", "final_output.mp4")
     logo_regions = [{"x": 1139, "y": 1010, "w": 359, "h": 60}]
     final_output = os.path.join(
-        current_directory, "image_response", "final_video_medium.mp4"
+        current_directory, "image_response", "final_video_medium_mp4.mp4"
     )
+
+    # 0) Attempt to decrypt encrypted user.json.enc if present
+    try:
+        if os.path.exists(encrypted_user_json) and os.path.exists(user_key_file):
+            print("🔐 Found encrypted user JSON and key — attempting decryption...")
+            success = decrypt_user_json_enc(
+                encrypted_user_json, user_key_file, decrypted_user_json
+            )
+            if success:
+                print(f"ℹ️ Decrypted user JSON available at: {decrypted_user_json}")
+                # Optionally load it if you need to use any keys from it
+                try:
+                    with open(decrypted_user_json, "r", encoding="utf-8") as uj:
+                        user_json_content = json.load(uj)
+                        # You can use user_json_content if needed (e.g., alternative client secrets)
+                except Exception:
+                    pass
+        else:
+            print("ℹ️ No encrypted user JSON/key pair found — skipping decryption.")
+    except Exception as e:
+        print("❌ Decryption step failed:", e)
+        # Do not exit; continue — user may still have client_secrets.json present
 
     # Read metadata from file (AI output saved here)
     metadata = read_metadata_from_file(METADATA_FILE)
