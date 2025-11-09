@@ -1,10 +1,20 @@
 #!/usr/bin/env python3
 """
-Improved remove_logo_from_video.py
-- Keeps _all original features_ (inpainting with OpenCV, scaling, audio merge with ffmpeg).
-- Adds: ffmpeg presence check + best-effort static download, retries/exponential backoff for external calls,
-        upload to transfer.sh (no API key; commonly used for large files).
-- Usage: python remove_logo_from_video.py
+remove_logo_from_video.py
+
+- Preserves all existing functionality (frame inpainting, ffmpeg checks/download, audio merge).
+- Replaces the previous upload method with a YouTube uploader that reads metadata dynamically
+  from a machine-readable file (default: youtube_metadata.txt). The file should be the AI-generated
+  output from the prompt above (the MACHINE-READABLE BLOCK).
+
+How to use:
+1. Generate metadata using the improved prompt above and save the entire LLM output to youtube_metadata.txt
+   (or change `METADATA_FILE` below).
+2. Ensure you have client_secrets.json for YouTube OAuth in the same folder (or change path).
+3. Run the script: python remove_logo_from_video.py
+
+Requirements:
+pip install opencv-python numpy requests google-auth google-auth-oauthlib google-auth-httplib2 google-api-python-client
 """
 
 import sys
@@ -19,16 +29,40 @@ import stat
 import tarfile
 import zipfile
 import urllib.request
-import requests  # pip install requests
+import re
+import ast
+import json
+
+# Optional dependency — many systems have requests; used earlier for ffmpeg download attempts
+try:
+    import requests
+except Exception:
+    requests = None
+
+# Google API imports (for YouTube upload)
+try:
+    from google_auth_oauthlib.flow import InstalledAppFlow
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaFileUpload
+    from google.auth.transport.requests import Request
+    import google.oauth2.credentials
+    import pickle
+
+    GOOGLE_LIBS_AVAILABLE = True
+except Exception:
+    GOOGLE_LIBS_AVAILABLE = False
 
 # -------------------------------------------------------------
-# Configuration / globals (kept names similar to original)
+# Config / defaults
 # -------------------------------------------------------------
 current_directory = os.getcwd()
+METADATA_FILE = os.path.join(
+    current_directory, "youtube_metadata.txt"
+)  # AI output saved here
+client_secrets_file = os.path.join(current_directory, "client_secrets.json")
+token_file = os.path.join(current_directory, "token.pickle")
 
-# ---------- FFmpeg paths (user-provided) ----------
 ffmpeg_root_path = os.path.join(current_directory, "ffmpeg")
-# cross-platform: default expected paths (may be updated by ensure_ffmpeg)
 if sys.platform.startswith("win"):
     ffmpeg_path = os.path.join(ffmpeg_root_path, "bin", "ffmpeg.exe")
     ffprobe_path = os.path.join(ffmpeg_root_path, "bin", "ffprobe.exe")
@@ -36,16 +70,16 @@ else:
     ffmpeg_path = os.path.join(ffmpeg_root_path, "bin", "ffmpeg")
     ffprobe_path = os.path.join(ffmpeg_root_path, "bin", "ffprobe")
 
-# Retry / backoff configuration
 DEFAULT_RETRIES = 4
-BACKOFF_FACTOR = 1.5  # exponential backoff multiplier
+BACKOFF_FACTOR = 1.5
+
+YOUTUBE_SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 
 
 # -------------------------------------------------------------
-# Helpers
+# Helper functions
 # -------------------------------------------------------------
 def run_cmd(cmd, retries=DEFAULT_RETRIES, check_returncode=True):
-    """Run a subprocess command with retries and exponential backoff. Returns CompletedProcess."""
     attempt = 0
     while True:
         attempt += 1
@@ -62,7 +96,6 @@ def run_cmd(cmd, retries=DEFAULT_RETRIES, check_returncode=True):
         except Exception as e:
             if attempt >= retries:
                 print(f"❌ Command failed after {attempt} attempts: {' '.join(cmd)}")
-                # raise last error or return result if present
                 if isinstance(e, subprocess.CalledProcessError):
                     return e
                 raise
@@ -90,19 +123,11 @@ def set_executable(path):
 
 
 # -------------------------------------------------------------
-# FFmpeg presence / best-effort install
+# FFmpeg presence / best-effort install (unchanged)
 # -------------------------------------------------------------
 def ensure_ffmpeg(verbose=True):
-    """
-    Ensure ffmpeg and ffprobe exist.
-    1) Prefer system ffmpeg if on PATH.
-    2) Otherwise, try to download static builds into ./ffmpeg/bin (best-effort).
-    3) If automated download fails, print clear manual instructions.
-    NOTE: Automatic download is best-effort because build URLs change over time.
-    """
     global ffmpeg_path, ffprobe_path
 
-    # 1) Prefer system binaries
     system_ffmpeg = shutil.which("ffmpeg")
     system_ffprobe = shutil.which("ffprobe")
     if system_ffmpeg and system_ffprobe:
@@ -112,21 +137,16 @@ def ensure_ffmpeg(verbose=True):
         ffprobe_path = system_ffprobe
         return True
 
-    # 2) Check if bundled/previously downloaded binaries exist already
     if is_executable(ffmpeg_path) and is_executable(ffprobe_path):
         if verbose:
             print(f"✅ Found bundled ffmpeg: {ffmpeg_path}")
         return True
 
-    # 3) Try to download a static build depending on platform (best-effort)
     system = platform.system().lower()
     ensure_dir(os.path.join(ffmpeg_root_path, "bin"))
 
     try:
         if system == "linux":
-            # John Van Sickle static builds are a commonly used choice for Linux.
-            # We attempt to fetch his amd64 static tar.xz and extract ffmpeg/ffprobe.
-            # Source: https://johnvansickle.com/ffmpeg/
             url = (
                 "https://johnvansickle.com/ffmpeg/builds/ffmpeg-git-amd64-static.tar.xz"
             )
@@ -138,20 +158,16 @@ def ensure_ffmpeg(verbose=True):
                 ffmpeg_root_path, "ffmpeg-git-amd64-static.tar.xz"
             )
             urllib.request.urlretrieve(url, archive_path)
-            # extract ffmpeg and ffprobe from tar.xz
             with tarfile.open(archive_path, "r:xz") as tar:
-                # look for the ffmpeg* bins and extract them
                 members = tar.getmembers()
                 for m in members:
                     if m.name.endswith("/ffmpeg") or m.name.endswith("/ffprobe"):
-                        # extract and save into ./ffmpeg/bin/
                         target = os.path.join(
                             ffmpeg_root_path, "bin", os.path.basename(m.name)
                         )
                         with open(target, "wb") as out_f:
                             out_f.write(tar.extractfile(m).read())
                         set_executable(target)
-            # cleanup archive
             try:
                 os.remove(archive_path)
             except Exception:
@@ -163,15 +179,12 @@ def ensure_ffmpeg(verbose=True):
             return True
 
         elif system == "windows":
-            # Try an easy-to-download build from gyan.dev (windows builds).
-            # Note: gyan.dev often hosts builds at predictable names (ffmpeg-release-essentials.zip)
             url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
             if verbose:
                 print("ℹ️ Attempting to download static ffmpeg (windows)...")
             archive_path = os.path.join(ffmpeg_root_path, "ffmpeg-windows.zip")
             urllib.request.urlretrieve(url, archive_path)
             with zipfile.ZipFile(archive_path, "r") as zf:
-                # extract ffmpeg.exe and ffprobe.exe to ./ffmpeg/bin/
                 for name in zf.namelist():
                     base = os.path.basename(name)
                     if base.lower() in ("ffmpeg.exe", "ffprobe.exe"):
@@ -191,8 +204,6 @@ def ensure_ffmpeg(verbose=True):
             return True
 
         elif system == "darwin":
-            # macOS: static builds exist but URLs/packaging vary; try ffmpeg.org downloads page as a hint.
-            # Fallback to instructing user to install via brew or download manually.
             if verbose:
                 print(
                     "⚠️ Automatic macOS download not implemented. Please install ffmpeg via Homebrew:"
@@ -219,51 +230,272 @@ def ensure_ffmpeg(verbose=True):
 
 
 # -------------------------------------------------------------
-# Uploading: transfer.sh (no API key; supports large files)
+# Metadata parsing (reads bracketed fields from file)
 # -------------------------------------------------------------
-def upload_to_transfersh(file_path, retries=DEFAULT_RETRIES):
+def parse_bracket_field(text, label):
     """
-    Upload a file to transfer.sh (no API key). Returns the file URL on success.
-    Uses an HTTP PUT to https://transfer.sh/{filename}
-    Common public instance: https://transfer.sh
-    Note: Transfer.sh endpoints are community-run; availability/limits may change.
-    See: the project repo and docs. :contentReference[oaicite:1]{index=1}
+    Finds the first occurrence of: label [ ... ]  (case-insensitive)
+    Returns inner text or None. DOTALL allowed.
     """
-    filename = os.path.basename(file_path)
-    endpoint = f"https://transfer.sh/{filename}"
+    # allow label with optional whitespace and a bracket
+    pattern = rf"(?i){re.escape(label)}\s*\[\s*(.*?)\s*\]"
+    m = re.search(pattern, text, flags=re.DOTALL)
+    if not m:
+        return None
+    return m.group(1).strip()
+
+
+def read_metadata_from_file(path=METADATA_FILE):
+    """
+    Parses youtube metadata from the file. Expected fields (case-insensitive):
+      title [ ... ]
+      description [ ... ]    <- can be multi-line
+      tags [ ... ]           <- JSON-like list OR comma-separated
+      hashtags [ ... ]       <- comma-separated or JSON list
+      categoryId [ ... ]     <- number
+      CTA [ ... ]            <- multi-line or '||' separated
+      thumbnail_texts [ ... ]<- JSON-like list
+    Returns a dict with fields (strings / lists) and defaults if not found.
+    """
+    defaults = {
+        "title": None,
+        "description": None,
+        "tags": [],
+        "hashtags": [],
+        "categoryId": None,
+        "CTA": [],
+        "thumbnail_texts": [],
+    }
+
+    if not os.path.exists(path):
+        print(f"⚠️ Metadata file not found at: {path}. Using defaults / manual values.")
+        return defaults
+
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    # Parse each field
+    title = parse_bracket_field(content, "title")
+    description = parse_bracket_field(content, "description")
+    tags_raw = parse_bracket_field(content, "tags")
+    hashtags_raw = parse_bracket_field(content, "hashtags")
+    category_raw = parse_bracket_field(content, "categoryId")
+    cta_raw = parse_bracket_field(content, "CTA")
+    thumb_raw = parse_bracket_field(content, "thumbnail_texts")
+
+    meta = {}
+
+    meta["title"] = title if title else None
+    meta["description"] = description if description else None
+
+    # parse tags: try ast.literal_eval -> list, else comma-split
+    meta["tags"] = []
+    if tags_raw:
+        try:
+            parsed = ast.literal_eval(tags_raw)
+            if isinstance(parsed, (list, tuple)):
+                meta["tags"] = [str(x).strip() for x in parsed]
+            else:
+                # fallback to comma split
+                meta["tags"] = [
+                    t.strip() for t in str(tags_raw).split(",") if t.strip()
+                ]
+        except Exception:
+            meta["tags"] = [t.strip() for t in str(tags_raw).split(",") if t.strip()]
+
+    # hashtags
+    meta["hashtags"] = []
+    if hashtags_raw:
+        try:
+            parsed = ast.literal_eval(hashtags_raw)
+            if isinstance(parsed, (list, tuple)):
+                meta["hashtags"] = [h.strip() for h in parsed]
+            else:
+                meta["hashtags"] = [
+                    h.strip() for h in re.split(r"[,\n]+", hashtags_raw) if h.strip()
+                ]
+        except Exception:
+            meta["hashtags"] = [
+                h.strip() for h in re.split(r"[,\n]+", hashtags_raw) if h.strip()
+            ]
+
+    # categoryId
+    meta["categoryId"] = None
+    if category_raw:
+        category_raw_clean = category_raw.strip()
+        # try to extract integer
+        m = re.search(r"(\d+)", category_raw_clean)
+        if m:
+            meta["categoryId"] = m.group(1)
+        else:
+            meta["categoryId"] = None
+
+    # CTA
+    meta["CTA"] = []
+    if cta_raw:
+        # split by '||' or newlines
+        if "||" in cta_raw:
+            meta["CTA"] = [c.strip() for c in cta_raw.split("||") if c.strip()]
+        else:
+            meta["CTA"] = [c.strip() for c in cta_raw.splitlines() if c.strip()]
+
+    # thumbnails
+    meta["thumbnail_texts"] = []
+    if thumb_raw:
+        try:
+            parsed = ast.literal_eval(thumb_raw)
+            if isinstance(parsed, (list, tuple)):
+                meta["thumbnail_texts"] = [str(x).strip() for x in parsed]
+            else:
+                meta["thumbnail_texts"] = [
+                    t.strip() for t in str(thumb_raw).split(",") if t.strip()
+                ]
+        except Exception:
+            meta["thumbnail_texts"] = [
+                t.strip() for t in str(thumb_raw).split(",") if t.strip()
+            ]
+
+    # apply defaults if None
+    for k, v in defaults.items():
+        if meta.get(k) is None:
+            meta[k] = v
+
+    return meta
+
+
+# -------------------------------------------------------------
+# YouTube upload (unchanged logic from previous script)
+# -------------------------------------------------------------
+def get_authenticated_service(
+    client_secrets_file=client_secrets_file, token_file=token_file
+):
+    if not GOOGLE_LIBS_AVAILABLE:
+        raise RuntimeError(
+            "Google client libraries are not available. Install with:\n"
+            "  pip install google-auth google-auth-oauthlib google-auth-httplib2 google-api-python-client"
+        )
+
+    creds = None
+    if os.path.exists(token_file):
+        try:
+            with open(token_file, "rb") as f:
+                creds = pickle.load(f)
+        except Exception:
+            creds = None
+
+    if not creds or not getattr(creds, "valid", False):
+        if (
+            creds
+            and getattr(creds, "expired", False)
+            and getattr(creds, "refresh_token", None)
+        ):
+            try:
+                creds.refresh(Request())
+            except Exception as e:
+                print("⚠️ Failed to refresh credentials:", e)
+                creds = None
+        else:
+            if not os.path.exists(client_secrets_file):
+                raise FileNotFoundError(
+                    f"OAuth client secrets file '{client_secrets_file}' not found. "
+                    "Create OAuth credentials in Google Cloud Console and download as JSON."
+                )
+            flow = InstalledAppFlow.from_client_secrets_file(
+                client_secrets_file, YOUTUBE_SCOPES
+            )
+            creds = flow.run_local_server(port=0)
+
+        with open(token_file, "wb") as f:
+            pickle.dump(creds, f)
+
+    service = build("youtube", "v3", credentials=creds, cache_discovery=False)
+    return service
+
+
+def upload_to_youtube_resumable(
+    service,
+    file_path,
+    title="Uploaded video",
+    description="Uploaded via script",
+    tags=None,
+    categoryId="22",
+    privacyStatus="unlisted",
+    resumable_chunk_size=256 * 1024,
+):
+    if tags is None:
+        tags = []
+
+    body = {
+        "snippet": {
+            "title": title,
+            "description": description,
+            "tags": tags,
+            "categoryId": categoryId,
+        },
+        "status": {
+            "privacyStatus": privacyStatus,
+        },
+    }
+
+    media = MediaFileUpload(file_path, chunksize=resumable_chunk_size, resumable=True)
+    request = service.videos().insert(
+        part="snippet,status", body=body, media_body=media
+    )
+
+    response = None
+    while response is None:
+        try:
+            status, response = request.next_chunk()
+            if status:
+                progress = int(status.progress() * 100)
+                print(f"⏫ Upload progress: {progress}%")
+        except Exception as e:
+            raise
+
+    return response.get("id"), response
+
+
+def upload_to_youtube_with_infinite_retries(
+    file_path,
+    metadata,
+    client_secrets_file=client_secrets_file,
+    token_file=token_file,
+    sleep_between_retries=10,
+):
     attempt = 0
-    while attempt < retries:
+    while True:
         attempt += 1
         try:
-            with open(file_path, "rb") as fh:
-                resp = requests.put(endpoint, data=fh, timeout=120)
-            if resp.status_code in (200, 201):
-                return resp.text.strip()
-            else:
-                print(
-                    f"⚠️ transfer.sh upload failed (status {resp.status_code}): {resp.text}"
-                )
+            print(
+                f"🔁 YouTube upload attempt #{attempt} — obtaining authenticated service..."
+            )
+            service = get_authenticated_service(
+                client_secrets_file=client_secrets_file, token_file=token_file
+            )
+            print("🔐 Authenticated with YouTube API. Starting resumable upload...")
+            vid_id, response = upload_to_youtube_resumable(
+                service,
+                file_path,
+                title=metadata.get("title") or "Uploaded video",
+                description=metadata.get("description") or "",
+                tags=metadata.get("tags") or [],
+                categoryId=metadata.get("categoryId") or "22",
+                privacyStatus=metadata.get("privacyStatus") or "unlisted",
+            )
+            print(f"✅ Upload successful! Video ID: {vid_id}")
+            watch_url = f"https://youtu.be/{vid_id}"
+            return vid_id, watch_url, response
         except Exception as e:
-            print(f"⚠️ transfer.sh upload attempt {attempt} failed: {e}")
-        # backoff
-        time.sleep(BACKOFF_FACTOR ** (attempt - 1))
-    # fallback: try temp.sh (another transfer service inspired by transfer.sh)
-    try:
-        print("ℹ️ Falling back to temp.sh for upload...")
-        endpoint2 = f"https://temp.sh/{filename}"
-        with open(file_path, "rb") as fh:
-            resp2 = requests.put(endpoint2, data=fh, timeout=120)
-        if resp2.status_code in (200, 201):
-            return resp2.text.strip()
-        else:
-            print("⚠️ temp.sh fallback failed:", resp2.status_code, resp2.text)
-    except Exception as e:
-        print("⚠️ temp.sh fallback exception:", e)
-    return None
+            print(f"⚠️ YouTube upload attempt #{attempt} failed with error: {e}")
+            sleep_time = sleep_between_retries * min(60, 1 + attempt * 0.5)
+            print(
+                f"⏳ Sleeping for {sleep_time:.1f}s before retrying (will retry forever until success)..."
+            )
+            time.sleep(sleep_time)
 
 
 # -------------------------------------------------------------
-# Main processing function (original logic preserved & improved)
+# Main video processing (unchanged)
 # -------------------------------------------------------------
 def remove_logo_with_audio(
     video_path,
@@ -274,14 +506,6 @@ def remove_logo_with_audio(
     inpaint_radius=3,
     ffmpeg_check_first=True,
 ):
-    """
-    Removes a logo from the video while keeping audio (original script behavior).
-    Improvements:
-     - calls ensure_ffmpeg at start (if ffmpeg_check_first)
-     - uses run_cmd for ffmpeg merge with retries
-     - attempts to upload final file to transfer.sh (no API key) and returns the URL (if requested separately)
-    """
-    # Optionally ensure ffmpeg is installed / available
     if ffmpeg_check_first:
         ensure_ffmpeg()
 
@@ -300,13 +524,11 @@ def remove_logo_with_audio(
     scaled_width = int(width * scale_factor)
     scaled_height = int(height * scale_factor)
 
-    # Use mp4v (less CPU heavy than x264) for initial output (preserves your original choice)
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     out = cv2.VideoWriter(temp_path, fourcc, fps, (scaled_width, scaled_height))
 
     print(f"⚙️ Processing frames at {scaled_width}x{scaled_height}...")
 
-    # Precompute mask once (original behavior preserved)
     mask = np.zeros((height, width), dtype=np.uint8)
     for r in logo_coords:
         mask[r["y"] : r["y"] + r["h"], r["x"] : r["x"] + r["w"]] = 255
@@ -317,7 +539,6 @@ def remove_logo_with_audio(
         if not ret:
             break
 
-        # Resize for speed
         if scale_factor != 1.0:
             frame = cv2.resize(
                 frame, (scaled_width, scaled_height), interpolation=cv2.INTER_LINEAR
@@ -328,7 +549,6 @@ def remove_logo_with_audio(
         else:
             scaled_mask = mask
 
-        # Inpaint to remove logo (keeps the same INPAINT_TELEA method)
         inpainted = cv2.inpaint(frame, scaled_mask, inpaint_radius, cv2.INPAINT_TELEA)
         out.write(inpainted)
 
@@ -340,16 +560,15 @@ def remove_logo_with_audio(
     out.release()
     print("✅ Video frames processed successfully.")
 
-    # Merge back original audio with medium-quality video compression (preserved from original)
     print("🎧 Merging audio (medium quality)...")
 
     merge_cmd = [
         ffmpeg_path,
         "-y",
         "-i",
-        temp_path,  # inpainted video
+        temp_path,
         "-i",
-        video_path,  # original for audio
+        video_path,
         "-c:v",
         "libx264",
         "-preset",
@@ -374,17 +593,14 @@ def remove_logo_with_audio(
         isinstance(result, subprocess.CalledProcessError)
         or getattr(result, "returncode", 1) != 0
     ):
-        # show ffmpeg stderr for debugging
         if hasattr(result, "stderr"):
             print("⚠️ FFmpeg merge failed:", result.stderr)
         else:
             print("⚠️ FFmpeg merge likely failed. See above.")
-        # keep temp files for debugging
         return None
     else:
         print(f"🎬 Done! Output saved as: {output_path}")
 
-    # Remove temp video safely
     if os.path.exists(temp_path):
         try:
             os.remove(temp_path)
@@ -396,18 +612,36 @@ def remove_logo_with_audio(
 
 
 # -------------------------------------------------------------
-# Example usage / CLI-style main
+# CLI / __main__
 # -------------------------------------------------------------
 if __name__ == "__main__":
-    # Paths (preserve your earlier example usage)
+    # INPUTS you can edit if needed:
     video_path = os.path.join(current_directory, "image_response", "final_output.mp4")
     logo_regions = [{"x": 1139, "y": 1010, "w": 359, "h": 60}]
     final_output = os.path.join(
         current_directory, "image_response", "final_video_medium.mp4"
     )
 
+    # Read metadata from file (AI output saved here)
+    metadata = read_metadata_from_file(METADATA_FILE)
+
+    # If key fields missing, allow manual fallback
+    youtube_title = metadata.get("title") or "My Processed Video"
+    youtube_description = (
+        metadata.get("description")
+        or "Video processed by remove_logo_from_video.py — uploaded automatically."
+    )
+    youtube_tags = metadata.get("tags") or ["processed", "inpainting", "auto-upload"]
+    youtube_categoryId = metadata.get("categoryId") or "22"
+    youtube_hashtags = metadata.get("hashtags") or []
+    youtube_ctas = metadata.get("CTA") or []
+    youtube_thumbnail_texts = metadata.get("thumbnail_texts") or []
+    youtube_privacy = (
+        "private"  # keep default unless you add privacy inside metadata and parse it
+    )
+
     print(
-        "ℹ️ Starting processing (will ensure ffmpeg and upload result to transfer.sh)..."
+        "ℹ️ Starting processing (will ensure ffmpeg and then attempt YouTube upload with infinite retries)..."
     )
     out = remove_logo_with_audio(
         video_path, logo_regions, final_output, scale_factor=0.85
@@ -415,11 +649,42 @@ if __name__ == "__main__":
 
     if out:
         print(
-            "ℹ️ Attempting to upload the result to transfer.sh (no API key required)..."
+            "ℹ️ Processed video ready. Beginning YouTube upload (infinite retries until success)..."
         )
-        url = upload_to_transfersh(out)
-        if url:
-            print("🔗 Upload successful. Link:")
-            print(url)
-        else:
-            print("⚠️ Upload failed. You can manually upload the file located at:", out)
+        # Compose metadata dict for uploader
+        uploader_metadata = {
+            "title": youtube_title,
+            "description": youtube_description,
+            "tags": youtube_tags,
+            "categoryId": youtube_categoryId,
+            "privacyStatus": youtube_privacy,
+            "hashtags": youtube_hashtags,
+            "CTA": youtube_ctas,
+            "thumbnail_texts": youtube_thumbnail_texts,
+        }
+
+        # Attempt upload (will retry indefinitely until success)
+        try:
+            vid_id, watch_url, full_response = upload_to_youtube_with_infinite_retries(
+                out,
+                uploader_metadata,
+                client_secrets_file=client_secrets_file,
+                token_file=token_file,
+                sleep_between_retries=10,
+            )
+            print("✅ Upload complete. Watch URL:", watch_url)
+            # Optional: print CTAs and thumbnails recommendation
+            if youtube_ctas:
+                print("📌 Suggested CTAs (pin or comment):")
+                for c in youtube_ctas:
+                    print("-", c)
+            if youtube_thumbnail_texts:
+                print("🖼️ Thumbnail text ideas:")
+                for t in youtube_thumbnail_texts:
+                    print("-", t)
+        except Exception as e:
+            # Shouldn't be reached because upload wrapper never stops; defensive log
+            print("❌ Unexpected error in YouTube upload wrapper:", e)
+            print("The script will now exit.")
+    else:
+        print("❌ Processing failed — skipping YouTube upload.")
