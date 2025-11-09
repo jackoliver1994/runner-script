@@ -143,22 +143,217 @@ class ChatAPI:
             spinner = None
 
         def looks_like_html_challenge(status_code, text, headers):
+            """
+            Broader HTML-challenge detector:
+            - Treats explicit 403 HTML pages as challenges (as before)
+            - Also treats common edge-statuses like 522 (connection/timeouts reported in HTML)
+            - Uses content-type and snippet heuristics.
+            """
             try:
-                if status_code == 403:
-                    t = (text or "").lower()
-                    if (
-                        "just a moment" in t
-                        or "attention required" in t
-                        or "please enable javascript" in t
-                        or "cloudflare" in t
-                    ):
-                        return True
+                # direct status checks (403 and similar edge codes)
+                if status_code in (403, 522):
+                    return True
+                t = (text or "").lower()
+                # heuristics for Cloudflare-like messages or "just a moment"
+                if (
+                    "just a moment" in t
+                    or "attention required" in t
+                    or "please enable javascript" in t
+                    or "cloudflare" in t
+                    or "connection timed out" in t
+                ):
+                    return True
                 ct = (headers or {}).get("Content-Type", "") or ""
                 if status_code == 403 and "text/html" in ct.lower():
                     return True
             except Exception:
                 pass
             return False
+
+        def try_cloudscraper_once():
+            """
+            Enhanced cloudscraper attempt:
+            - Does an initial GET to the site root to seed cookies and JS challenges.
+            - Attempts POST; if HTML is returned, tries to find embedded JSON blobs.
+            - If still HTML, retries a POST with a fallback User-Agent + Accept headers once.
+            - Saves an HTML snippet for offline debugging when non-JSON is returned.
+            - Respects last_solver_time to avoid hammering solver libraries.
+            """
+            if not cloudscraper:
+                print("→ cloudscraper not installed; skipping cloudscraper solver.")
+                return None
+
+            now = time.time()
+            if now - last_solver_time["cloudscraper"] < SOLVER_MIN_INTERVAL:
+                print(
+                    "→ cloudscraper attempted recently; skipping immediate re-attempt."
+                )
+                return None
+            last_solver_time["cloudscraper"] = now
+
+            root_url = self.url.split("/api")[0]
+            try:
+                print(
+                    "→ Trying cloudscraper to solve challenge (GET seed + POST attempt)..."
+                )
+                # create a scraper instance
+                s = cloudscraper.create_scraper()
+                proxies = {"http": proxy, "https": proxy} if proxy else None
+
+                # 1) seed cookies by GET to the root (helps many CF flows)
+                try:
+                    g = s.get(
+                        root_url,
+                        timeout=min(30, max(10, configured_timeout // 4)),
+                        proxies=proxies,
+                    )
+                    print(
+                        "→ cloudscraper GET seed status:",
+                        getattr(g, "status_code", None),
+                    )
+                except Exception as ge:
+                    print("→ cloudscraper GET seed failed (continuing to POST):", ge)
+
+                # 2) POST with configured timeout
+                try:
+                    r = s.post(
+                        self.url,
+                        json={"message": message},
+                        timeout=configured_timeout,
+                        proxies=proxies,
+                    )
+                except Exception as e:
+                    print("→ cloudscraper POST attempt exception:", e)
+                    # try a slightly longer POST attempt as fallback
+                    try:
+                        r = s.post(
+                            self.url,
+                            json={"message": message},
+                            timeout=max(60, configured_timeout),
+                            proxies=proxies,
+                        )
+                    except Exception as e2:
+                        print("→ cloudscraper fallback POST exception:", e2)
+                        return None
+
+                print("→ cloudscraper status:", getattr(r, "status_code", None))
+                ct = (r.headers.get("Content-Type") or "").lower()
+                body = r.text or ""
+
+                # 3) If JSON content-type -> parse and return
+                if "application/json" in ct:
+                    try:
+                        data = r.json()
+                        return data
+                    except Exception:
+                        print("→ cloudscraper returned invalid JSON; snippet:")
+                        print(body[:1000])
+                        # continue to attempts to extract any embedded JSON below
+
+                # 4) If non-JSON HTML, attempt to extract embedded JSON (Next.js, __NEXT_DATA__, or window.* JSON blobs)
+                # try common patterns
+                try:
+                    # __NEXT_DATA__ JSON (common for Next.js SPA)
+                    m = re.search(
+                        r'<script[^>]*id=["\']__NEXT_DATA__["\'][^>]*>([\s\S]+?)</script>',
+                        body,
+                        flags=re.I,
+                    )
+                    if not m:
+                        # window.__INITIAL_STATE__ or window.__DATA__ = {...}
+                        m = re.search(
+                            r"window\.__[A-Z0-9_]+__\s*=\s*({[\s\S]+?});", body
+                        )
+                    if m:
+                        candidate = m.group(1)
+                        try:
+                            data = json.loads(candidate)
+                            print(
+                                "→ cloudscraper extracted JSON from HTML and parsed it."
+                            )
+                            return data
+                        except Exception:
+                            # try lenient JSON extraction (strip trailing ;)
+                            try:
+                                data = json.loads(candidate.rstrip(" ;\n\r\t"))
+                                return data
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+
+                # 5) If no JSON found, try a second targeted POST with adjusted headers (UA + Accept JSON)
+                try:
+                    fallback_headers = dict(
+                        getattr(self, "headers", {"Content-Type": "application/json"})
+                    )
+                    fallback_headers.update(
+                        {
+                            "Accept": "application/json, text/plain, */*",
+                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+                        }
+                    )
+                    print("→ cloudscraper retrying POST with fallback headers...")
+                    r2 = s.post(
+                        self.url,
+                        json={"message": message},
+                        headers=fallback_headers,
+                        timeout=max(60, configured_timeout),
+                        proxies=proxies,
+                    )
+                    print(
+                        "→ cloudscraper fallback POST status:",
+                        getattr(r2, "status_code", None),
+                    )
+                    ct2 = (r2.headers.get("Content-Type") or "").lower()
+                    if "application/json" in ct2:
+                        try:
+                            return r2.json()
+                        except Exception:
+                            print(
+                                "→ cloudscraper fallback returned invalid JSON; snippet:"
+                            )
+                            print((r2.text or "")[:1000])
+                    # try extract JSON again from fallback HTML
+                    body2 = r2.text or ""
+                    m2 = re.search(
+                        r'<script[^>]*id=["\']__NEXT_DATA__["\'][^>]*>([\s\S]+?)</script>',
+                        body2,
+                        flags=re.I,
+                    )
+                    if m2:
+                        try:
+                            return json.loads(m2.group(1))
+                        except Exception:
+                            pass
+                except Exception as e:
+                    print("→ cloudscraper fallback POST exception:", e)
+                    traceback.print_exc()
+
+                # 6) didn't produce parseable JSON — save an HTML snippet for offline debugging and return None
+                try:
+                    snippet_path = os.path.join(
+                        "debug_cloudscraper",
+                        f"cloudscraper_html_{int(time.time())}.html",
+                    )
+                    os.makedirs(os.path.dirname(snippet_path), exist_ok=True)
+                    with open(snippet_path, "w", encoding="utf-8") as fh:
+                        fh.write(body[:100000])
+                    print(
+                        f"→ cloudscraper returned non-JSON HTML; saved snippet -> {snippet_path}"
+                    )
+                except Exception as e_save:
+                    print("→ Failed to save cloudscraper HTML snippet:", e_save)
+
+                print(
+                    "→ cloudscraper did not solve the challenge or returned non-JSON."
+                )
+                return None
+
+            except Exception as e:
+                print("→ cloudscraper attempt exception:", e)
+                traceback.print_exc()
+                return None
 
         def single_request(sess, req_timeout):
             """Perform a single POST using provided session; returns dict with ok/status/headers/text or ok=False and exc."""
@@ -187,46 +382,6 @@ class ChatAPI:
                 }
             except Exception as e:
                 return {"ok": False, "exc": e, "trace": traceback.format_exc()}
-
-        def try_cloudscraper_once():
-            if not cloudscraper:
-                print("→ cloudscraper not installed; skipping cloudscraper solver.")
-                return None
-            now = time.time()
-            if now - last_solver_time["cloudscraper"] < SOLVER_MIN_INTERVAL:
-                print(
-                    "→ cloudscraper attempted recently; skipping immediate re-attempt."
-                )
-                return None
-            last_solver_time["cloudscraper"] = now
-            try:
-                print("→ Trying cloudscraper to solve challenge...")
-                s = cloudscraper.create_scraper()
-                proxies = {"http": proxy, "https": proxy} if proxy else None
-                r = s.post(
-                    self.url,
-                    json={"message": message},
-                    timeout=configured_timeout,
-                    proxies=proxies,
-                )
-                print("→ cloudscraper status:", r.status_code)
-                ct = (r.headers.get("Content-Type") or "").lower()
-                if "application/json" in ct:
-                    try:
-                        data = r.json()
-                        return data
-                    except Exception:
-                        print("→ cloudscraper returned invalid JSON; snippet:")
-                        print((r.text or "")[:1000])
-                        return None
-                else:
-                    print("→ cloudscraper returned non-JSON snippet:")
-                    print((r.text or "")[:1000])
-                    return None
-            except Exception as e:
-                print("→ cloudscraper attempt exception:", e)
-                traceback.print_exc()
-                return None
 
         def try_playwright_once():
             if not PLAYWRIGHT_AVAILABLE:
