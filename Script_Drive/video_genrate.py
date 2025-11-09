@@ -21,6 +21,12 @@ import shutil
 import glob
 import sys
 import logging
+import platform
+import urllib.request
+import tarfile
+import zipfile
+import stat
+import io
 from typing import Optional, List
 
 # -------------------- Configuration / Defaults --------------------
@@ -65,16 +71,14 @@ def ensure_ffmpeg_binaries() -> None:
     """
     Ensure ffmpeg and ffprobe executables are available and set global ffmpeg_path / ffprobe_path.
 
-    Resolution order:
+    Resolution order (preserves earlier behavior):
       1) Already-configured default ffmpeg_path / ffprobe_path (local ffmpeg/ directory)
       2) Look in PATH via shutil.which
       3) Try to use imageio-ffmpeg if installed
-      4) If not in CI (GitHub Actions), attempt pip install imageio-ffmpeg and re-check
-      5) Last-resort: pip install ffmpeg package (may not yield usable binary)
-      6) Check common system locations
-
-    NOTE: If running in CI (GITHUB_ACTIONS=true) we avoid auto pip-installs and instead raise
-    an actionable error so CI workflow can install ffmpeg via package manager or setup actions.
+      4) If running in CI (GITHUB_ACTIONS=true) and not found, try to download a static ffmpeg build
+         appropriate for the runner OS, extract into ./ffmpeg and use that.
+      5) If not in CI, attempt pip install imageio-ffmpeg as before (unchanged).
+      6) Fallback checks and final helpful error message.
     """
     global ffmpeg_path, ffprobe_path
 
@@ -96,7 +100,7 @@ def ensure_ffmpeg_binaries() -> None:
         logger.info("Found ffmpeg/ffprobe on PATH: %s / %s", ffmpeg_path, ffprobe_path)
         return
 
-    # 2) Try to import imageio_ffmpeg if already available
+    # 2) Try imageio-ffmpeg if available
     imageio_ffmpeg_mod = None
     try:
         import importlib
@@ -110,7 +114,6 @@ def ensure_ffmpeg_binaries() -> None:
             exe = imageio_ffmpeg_mod.get_ffmpeg_exe()
             if exe and _is_exec(exe):
                 ffmpeg_path = exe
-                # try to find ffprobe next to ffmpeg
                 probe_candidate = os.path.join(os.path.dirname(exe), "ffprobe")
                 if sys.platform.startswith("win"):
                     probe_candidate += ".exe"
@@ -122,26 +125,99 @@ def ensure_ffmpeg_binaries() -> None:
                     logger.info("Using ffmpeg from imageio-ffmpeg: %s", ffmpeg_path)
                     return
         except Exception:
-            # fall through to installation attempts
             imageio_ffmpeg_mod = None
 
-    # If running inside CI (GitHub Actions) avoid attempting interactive installs:
+    # If running inside CI (GitHub Actions) — try to download static ffmpeg builds into ./ffmpeg
     in_github_actions = os.environ.get("GITHUB_ACTIONS", "").lower() == "true"
     if in_github_actions:
-        # give actionable guidance rather than attempting to pip-install inside CI
+        logger.info(
+            "Running in CI (GITHUB_ACTIONS=true). Attempting to fetch a static ffmpeg build for the runner."
+        )
+        # Decide OS-specific candidate URLs (common, public static builds)
+        sys_plat = platform.system().lower()
+        candidate_urls = []
+        if "linux" in sys_plat:
+            # johnvansickle static builds for amd64 Linux (commonly used on ubuntu-latest)
+            candidate_urls = [
+                "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"
+            ]
+        elif "windows" in sys_plat or sys_plat.startswith("mingw"):
+            # gyan.dev provides windows builds (essentials zip)
+            candidate_urls = [
+                "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+            ]
+        elif "darwin" in sys_plat or "mac" in sys_plat:
+            # evermeet builds for macOS
+            candidate_urls = [
+                "https://evermeet.cx/ffmpeg/ffmpeg-6.0.zip",  # best-effort; version may change
+            ]
+        else:
+            candidate_urls = []
+
+        if candidate_urls:
+            try:
+                _download_and_extract_ffmpeg(candidate_urls, ffmpeg_root_path)
+                # After extraction, search for binaries under ffmpeg_root_path
+                possible_ff = []
+                for root, dirs, files in os.walk(ffmpeg_root_path):
+                    for fname in files:
+                        if fname.lower() in ("ffmpeg", "ffmpeg.exe"):
+                            possible_ff.append(os.path.join(root, fname))
+                # pick first executable candidate
+                for exe in possible_ff:
+                    if _is_exec(exe):
+                        ffmpeg_path = exe
+                        probe_candidate = os.path.join(os.path.dirname(exe), "ffprobe")
+                        if sys.platform.startswith("win"):
+                            probe_candidate += ".exe"
+                        if _is_exec(probe_candidate):
+                            ffprobe_path = probe_candidate
+                        elif shutil.which("ffprobe"):
+                            ffprobe_path = shutil.which("ffprobe")
+                        if _is_exec(ffmpeg_path) and _is_exec(ffprobe_path):
+                            logger.info(
+                                "Successfully installed and found ffmpeg/ffprobe in %s",
+                                ffmpeg_root_path,
+                            )
+                            return
+                logger.warning(
+                    "Downloaded ffmpeg but could not locate usable ffmpeg/ffprobe executables under %s",
+                    ffmpeg_root_path,
+                )
+            except Exception as exc:
+                logger.warning("Automatic download/extract attempt failed: %s", exc)
+
+        # If we reach here, try PATH and common locations once more before error
+        path_ffmpeg = shutil.which("ffmpeg")
+        path_ffprobe = shutil.which("ffprobe")
+        if path_ffmpeg:
+            ffmpeg_path = path_ffmpeg
+        if path_ffprobe:
+            ffprobe_path = path_ffprobe
+        if _is_exec(ffmpeg_path) and _is_exec(ffprobe_path):
+            logger.info(
+                "Found ffmpeg/ffprobe on PATH after attempted download: %s / %s",
+                ffmpeg_path,
+                ffprobe_path,
+            )
+            return
+
+        # Still not found — give CI-specific actionable guidance (but mention we tried to auto-download)
         msg = (
             "ffmpeg/ffprobe not found in CI environment (GITHUB_ACTIONS=true). "
-            "Do NOT attempt to pip-install in CI — instead add a step to your workflow to "
-            "install ffmpeg. Example (Ubuntu runner):\n\n"
-            "  - name: Install ffmpeg\n"
-            "    run: sudo apt-get update && sudo apt-get install -y ffmpeg\n\n"
-            "Or use an action that provides ffmpeg. Ensure ffmpeg and ffprobe are available on PATH "
-            "or provide a local ./ffmpeg/bin/ directory in the repo.\n"
-            f"Tried default location: {ffmpeg_root_path} and PATH."
+            "Attempted to download static ffmpeg builds for the runner but could not locate usable binaries.\n\n"
+            "Recommended fixes (pick one):\n"
+            "  1) Add a step to your workflow to install ffmpeg (Ubuntu example):\n\n"
+            "     - name: Install ffmpeg\n"
+            "       run: sudo apt-get update && sudo apt-get install -y ffmpeg\n\n"
+            "  2) Ensure your repo includes a ./ffmpeg/bin/ directory with ffmpeg and ffprobe checked in,\n"
+            "     or provide prebuilt binaries at that path.\n\n"
+            "  3) Use an action that provides ffmpeg (e.g. a community action) before running this script.\n\n"
+            f"Tried default location: {ffmpeg_root_path} and PATH and attempted automatic download."
         )
         raise FileNotFoundError(msg)
 
-    # Not in CI: attempt to install imageio-ffmpeg via pip (safe fallback)
+    # Not in CI: attempt to pip install imageio-ffmpeg via pip (safe fallback)
     installed_imageio = False
     try:
         logger.warning(
@@ -182,7 +258,7 @@ def ensure_ffmpeg_binaries() -> None:
         except Exception:
             pass
 
-    # Try pip install ffmpeg (may not provide a usable platform binary, but it's a fallback)
+    # Try pip install ffmpeg (may not provide platform binary)
     try:
         logger.warning("Attempting 'pip install ffmpeg' as a last-ditch fallback...")
         subprocess.check_call(
@@ -227,6 +303,78 @@ def ensure_ffmpeg_binaries() -> None:
         "Please install ffmpeg on your system (e.g. apt/yum/brew/choco) or provide a local 'ffmpeg' directory "
         "with bin/ffmpeg and bin/ffprobe, or ensure ffmpeg/ffprobe are on PATH."
     )
+
+
+def _download_and_extract_ffmpeg(
+    urls: List[str], dest_root: str, timeout: int = 300
+) -> None:
+    """
+    Try a list of candidate URLs; download first that succeeds and extract into dest_root.
+    Supports .tar.xz, .tar.gz, .zip. Ensures extracted ffmpeg/ffprobe have executable bit set.
+    Raises on total failure.
+    """
+    os.makedirs(dest_root, exist_ok=True)
+    last_exc = None
+    for url in urls:
+        logger.info("Attempting to download ffmpeg from: %s", url)
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as resp:
+                if resp.status not in (200,):
+                    raise RuntimeError(f"HTTP status {resp.status} for {url}")
+                data = resp.read()
+            # Determine archive type
+            buf = io.BytesIO(data)
+            # tar.xz or tar.gz
+            try:
+                if url.endswith(".tar.xz") or url.endswith(".tar"):
+                    buf.seek(0)
+                    with tarfile.open(fileobj=buf, mode="r:*") as t:
+                        t.extractall(path=dest_root)
+                elif url.endswith(".tar.gz") or url.endswith(".tgz"):
+                    buf.seek(0)
+                    with tarfile.open(fileobj=buf, mode="r:gz") as t:
+                        t.extractall(path=dest_root)
+                elif url.endswith(".zip") or url.endswith(".ZIP"):
+                    buf.seek(0)
+                    with zipfile.ZipFile(buf) as z:
+                        z.extractall(path=dest_root)
+                else:
+                    # try both tar and zip attempts if extension is unknown
+                    buf.seek(0)
+                    try:
+                        with tarfile.open(fileobj=buf, mode="r:*") as t:
+                            t.extractall(path=dest_root)
+                    except tarfile.ReadError:
+                        buf.seek(0)
+                        with zipfile.ZipFile(buf) as z:
+                            z.extractall(path=dest_root)
+            except Exception as e:
+                raise RuntimeError(f"Failed to extract archive from {url}: {e}")
+
+            # After extraction, make any ffmpeg/ffprobe under dest_root executable
+            for root, dirs, files in os.walk(dest_root):
+                for fname in files:
+                    if fname.lower() in (
+                        "ffmpeg",
+                        "ffmpeg.exe",
+                        "ffprobe",
+                        "ffprobe.exe",
+                    ):
+                        p = os.path.join(root, fname)
+                        try:
+                            st = os.stat(p)
+                            os.chmod(p, st.st_mode | stat.S_IEXEC)
+                        except Exception:
+                            logger.debug("Could not set executable bit on %s", p)
+            logger.info(
+                "Downloaded and extracted ffmpeg from %s into %s", url, dest_root
+            )
+            return
+        except Exception as e:
+            last_exc = e
+            logger.warning("Failed to download/extract from %s: %s", url, e)
+            # try next URL
+    raise RuntimeError(f"All download attempts failed. Last error: {last_exc}")
 
 
 def run(cmd: List[str], check: bool = True) -> subprocess.CompletedProcess:
