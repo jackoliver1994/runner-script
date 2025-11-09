@@ -2,12 +2,16 @@
 """
 Ultimate Image-to-Video composer using FFmpeg + FFprobe.
 
-- Always selects the best audio file from narration_folder (no explicit audio_file option).
-- Keeps previous features: serial-first image ordering (supports 'promt' typo), natural sorting fallback,
-  high-quality H.264 (CRF + preset), letterbox/pad to target resolution, even dimensions, per-image segment creation,
-  concat demuxer, final audio encoding (AAC, resampled), robust ffprobe/ffmpeg error handling, temp cleanup.
-- FIXED: safer final merge (no copy conflict), ensures compatible audio/video streams.
+Improvements:
+ - No side effects at import time (wraps runtime logic in main()) — friendly for GitHub Actions/tests.
+ - Robust ensure_ffmpeg_binaries(): checks user-provided path, PATH, imageio-ffmpeg, and pip fallback.
+ - Detects GitHub Actions / CI and avoids attempting interactive installs there; gives actionable guidance.
+ - Uses logging instead of bare prints for clearer CI logs.
+ - Preserves all original features (serial-first ordering including 'promt' typo, per-image segments,
+   concat demuxer, final safe re-encode merge, temp cleanup).
 """
+
+from __future__ import annotations
 
 import os
 import re
@@ -16,22 +20,27 @@ import tempfile
 import shutil
 import glob
 import sys
-import imageio_ffmpeg
+import logging
+from typing import Optional, List
 
+# -------------------- Configuration / Defaults --------------------
 current_directory = os.getcwd()
-# ---------- FFmpeg paths (user-provided) ----------
 ffmpeg_root_path = os.path.join(current_directory, "ffmpeg")
-# cross-platform: use .exe on Windows if present
+
+# cross-platform default paths (user may override by placing ffmpeg/ffprobe under ffmpeg/bin)
 if sys.platform.startswith("win"):
-    ffmpeg_path = os.path.join(ffmpeg_root_path, "bin", "ffmpeg.exe")
-    ffprobe_path = os.path.join(ffmpeg_root_path, "bin", "ffprobe.exe")
+    default_ffmpeg_path = os.path.join(ffmpeg_root_path, "bin", "ffmpeg.exe")
+    default_ffprobe_path = os.path.join(ffmpeg_root_path, "bin", "ffprobe.exe")
 else:
-    ffmpeg_path = os.path.join(ffmpeg_root_path, "bin", "ffmpeg")
-    ffprobe_path = os.path.join(ffmpeg_root_path, "bin", "ffprobe")
+    default_ffmpeg_path = os.path.join(ffmpeg_root_path, "bin", "ffmpeg")
+    default_ffprobe_path = os.path.join(ffmpeg_root_path, "bin", "ffprobe")
+
+# These globals will be updated by ensure_ffmpeg_binaries()
+ffmpeg_path = default_ffmpeg_path
+ffprobe_path = default_ffprobe_path
 
 image_folder = os.path.join(current_directory, "image_response")
 narration_folder = os.path.join(current_directory, "narration_response")
-
 output_video = os.path.join(current_directory, "image_response", "final_output.mp4")
 
 frame_rate = 24
@@ -41,31 +50,42 @@ video_preset = "slow"
 pix_fmt = "yuv420p"
 audio_bitrate = "192k"
 audio_sample_rate = 48000
-# -------------------------------------------------------------
+
+# -------------------- Logging --------------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+logger = logging.getLogger("img2vid")
 
 
-def ensure_ffmpeg_binaries():
+# -------------------- Helpers --------------------
+def _is_exec(path: Optional[str]) -> bool:
+    return bool(path and os.path.exists(path) and os.access(path, os.X_OK))
+
+
+def ensure_ffmpeg_binaries() -> None:
     """
-    Ensure ffmpeg and ffprobe executables are available.
-    Resolution order:
-     1. Already-configured ffmpeg_path / ffprobe_path (user-provided ffmpeg root)
-     2. Look in PATH via shutil.which()
-     3. Try installing imageio-ffmpeg via pip and use its bundled ffmpeg
-     4. Try pip install ffmpeg (user request) as a last-ditch fallback and re-check PATH/common locations
+    Ensure ffmpeg and ffprobe executables are available and set global ffmpeg_path / ffprobe_path.
 
-    On success this updates the module-global ffmpeg_path and ffprobe_path.
-    On failure it raises FileNotFoundError with instructions.
+    Resolution order:
+      1) Already-configured default ffmpeg_path / ffprobe_path (local ffmpeg/ directory)
+      2) Look in PATH via shutil.which
+      3) Try to use imageio-ffmpeg if installed
+      4) If not in CI (GitHub Actions), attempt pip install imageio-ffmpeg and re-check
+      5) Last-resort: pip install ffmpeg package (may not yield usable binary)
+      6) Check common system locations
+
+    NOTE: If running in CI (GITHUB_ACTIONS=true) we avoid auto pip-installs and instead raise
+    an actionable error so CI workflow can install ffmpeg via package manager or setup actions.
     """
     global ffmpeg_path, ffprobe_path
 
-    def _is_exec(p):
-        return bool(p and os.path.exists(p) and os.access(p, os.X_OK))
-
-    # 1) user-provided paths (already set at module top)
+    # 0) quick success if already valid
     if _is_exec(ffmpeg_path) and _is_exec(ffprobe_path):
+        logger.debug(
+            "Using preconfigured ffmpeg/ffprobe at %s / %s", ffmpeg_path, ffprobe_path
+        )
         return
 
-    # 2) look in PATH
+    # 1) PATH lookup
     path_ffmpeg = shutil.which("ffmpeg")
     path_ffprobe = shutil.which("ffprobe")
     if path_ffmpeg:
@@ -73,63 +93,109 @@ def ensure_ffmpeg_binaries():
     if path_ffprobe:
         ffprobe_path = path_ffprobe
     if _is_exec(ffmpeg_path) and _is_exec(ffprobe_path):
+        logger.info("Found ffmpeg/ffprobe on PATH: %s / %s", ffmpeg_path, ffprobe_path)
         return
 
-    # 3) try imageio-ffmpeg (it bundles a ffmpeg binary that's usable)
-    imageio_ffmpeg = None
+    # 2) Try to import imageio_ffmpeg if already available
+    imageio_ffmpeg_mod = None
     try:
-        import imageio_ffmpeg  # try import first
+        import importlib
+
+        imageio_ffmpeg_mod = importlib.import_module("imageio_ffmpeg")
     except Exception:
-        try:
-            print(
-                "⚠ ffmpeg/ffprobe not found — attempting to install imageio-ffmpeg via pip..."
-            )
-            subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", "--upgrade", "imageio-ffmpeg"]
-            )
-            import importlib
+        imageio_ffmpeg_mod = None
 
-            imageio_ffmpeg = importlib.import_module("imageio_ffmpeg")
-        except Exception as e:
-            print("  pip install imageio-ffmpeg failed:", e)
-            imageio_ffmpeg = None
-    else:
-        imageio_ffmpeg = imageio_ffmpeg  # already imported
-
-    if imageio_ffmpeg:
+    if imageio_ffmpeg_mod:
         try:
-            exe = imageio_ffmpeg.get_ffmpeg_exe()
-            if exe and os.path.exists(exe) and os.access(exe, os.X_OK):
+            exe = imageio_ffmpeg_mod.get_ffmpeg_exe()
+            if exe and _is_exec(exe):
                 ffmpeg_path = exe
-                # ffprobe often sits next to ffmpeg; try to find/provide it
-                candidate_probe = os.path.join(os.path.dirname(exe), "ffprobe")
+                # try to find ffprobe next to ffmpeg
+                probe_candidate = os.path.join(os.path.dirname(exe), "ffprobe")
                 if sys.platform.startswith("win"):
-                    candidate_probe += ".exe"
-                if os.path.exists(candidate_probe) and os.access(
-                    candidate_probe, os.X_OK
-                ):
-                    ffprobe_path = candidate_probe
-                else:
-                    # fallback to PATH probe if available
-                    if shutil.which("ffprobe"):
-                        ffprobe_path = shutil.which("ffprobe")
+                    probe_candidate += ".exe"
+                if _is_exec(probe_candidate):
+                    ffprobe_path = probe_candidate
+                elif shutil.which("ffprobe"):
+                    ffprobe_path = shutil.which("ffprobe")
                 if _is_exec(ffmpeg_path) and _is_exec(ffprobe_path):
+                    logger.info("Using ffmpeg from imageio-ffmpeg: %s", ffmpeg_path)
+                    return
+        except Exception:
+            # fall through to installation attempts
+            imageio_ffmpeg_mod = None
+
+    # If running inside CI (GitHub Actions) avoid attempting interactive installs:
+    in_github_actions = os.environ.get("GITHUB_ACTIONS", "").lower() == "true"
+    if in_github_actions:
+        # give actionable guidance rather than attempting to pip-install inside CI
+        msg = (
+            "ffmpeg/ffprobe not found in CI environment (GITHUB_ACTIONS=true). "
+            "Do NOT attempt to pip-install in CI — instead add a step to your workflow to "
+            "install ffmpeg. Example (Ubuntu runner):\n\n"
+            "  - name: Install ffmpeg\n"
+            "    run: sudo apt-get update && sudo apt-get install -y ffmpeg\n\n"
+            "Or use an action that provides ffmpeg. Ensure ffmpeg and ffprobe are available on PATH "
+            "or provide a local ./ffmpeg/bin/ directory in the repo.\n"
+            f"Tried default location: {ffmpeg_root_path} and PATH."
+        )
+        raise FileNotFoundError(msg)
+
+    # Not in CI: attempt to install imageio-ffmpeg via pip (safe fallback)
+    installed_imageio = False
+    try:
+        logger.warning(
+            "ffmpeg/ffprobe not found — attempting to install imageio-ffmpeg via pip..."
+        )
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "--upgrade", "imageio-ffmpeg"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        import importlib
+
+        imageio_ffmpeg_mod = importlib.import_module("imageio_ffmpeg")
+        installed_imageio = True
+    except Exception as e:
+        logger.warning(
+            "pip install imageio-ffmpeg failed (will try other fallbacks): %s", e
+        )
+        imageio_ffmpeg_mod = None
+
+    if imageio_ffmpeg_mod:
+        try:
+            exe = imageio_ffmpeg_mod.get_ffmpeg_exe()
+            if exe and _is_exec(exe):
+                ffmpeg_path = exe
+                probe_candidate = os.path.join(os.path.dirname(exe), "ffprobe")
+                if sys.platform.startswith("win"):
+                    probe_candidate += ".exe"
+                if _is_exec(probe_candidate):
+                    ffprobe_path = probe_candidate
+                elif shutil.which("ffprobe"):
+                    ffprobe_path = shutil.which("ffprobe")
+                if _is_exec(ffmpeg_path) and _is_exec(ffprobe_path):
+                    logger.info(
+                        "Using ffmpeg provided by imageio-ffmpeg: %s", ffmpeg_path
+                    )
                     return
         except Exception:
             pass
 
-    # 4) As user requested: try `pip install ffmpeg` as an additional fallback (may or may not provide a binary)
+    # Try pip install ffmpeg (may not provide a usable platform binary, but it's a fallback)
     try:
-        print(
-            "⚠ attempting pip install ffmpeg as a fallback (may or may not install binaries)..."
-        )
+        logger.warning("Attempting 'pip install ffmpeg' as a last-ditch fallback...")
         subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", "--upgrade", "ffmpeg"]
+            [sys.executable, "-m", "pip", "install", "--upgrade", "ffmpeg"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
     except Exception as e:
-        print("  pip install ffmpeg failed (or produced no binary):", e)
+        logger.debug(
+            "pip install ffmpeg attempt failed or produced no usable binaries: %s", e
+        )
 
-    # Re-check PATH and several common locations
+    # Re-check PATH and common locations
     path_ffmpeg = shutil.which("ffmpeg")
     path_ffprobe = shutil.which("ffprobe")
     if path_ffmpeg:
@@ -147,64 +213,48 @@ def ensure_ffmpeg_binaries():
             break
 
     if _is_exec(ffmpeg_path) and _is_exec(ffprobe_path):
+        logger.info(
+            "Found ffmpeg/ffprobe after fallback attempts: %s / %s",
+            ffmpeg_path,
+            ffprobe_path,
+        )
         return
 
-    # Final helpful error
+    # Final error with clear instructions
     raise FileNotFoundError(
         "ffmpeg/ffprobe executables could not be found.\n"
-        f"Tried: user path ({ffmpeg_root_path}), shutil.which, imageio-ffmpeg, pip 'ffmpeg'.\n"
+        f"Tried: default local ({ffmpeg_root_path}), PATH, imageio-ffmpeg, pip 'ffmpeg'.\n"
         "Please install ffmpeg on your system (e.g. apt/yum/brew/choco) or provide a local 'ffmpeg' directory "
         "with bin/ffmpeg and bin/ffprobe, or ensure ffmpeg/ffprobe are on PATH."
     )
 
 
-# ---------- Basic validation ----------
-try:
-    ensure_ffmpeg_binaries()
-except FileNotFoundError as e:
-    # Keep behaviour explicit — you can change this to handle differently in your app
-    print("ERROR: ", e)
-    raise
-
-if not os.path.isdir(image_folder):
-    raise FileNotFoundError(f"Image folder not found: {image_folder}")
-
-if not os.path.isdir(narration_folder):
-    raise FileNotFoundError(f"Narration folder not found: {narration_folder}")
-
-
-# ---------- Helpers ----------
-def run(cmd, check=True):
+def run(cmd: List[str], check: bool = True) -> subprocess.CompletedProcess:
     """
-    Run subprocess command and return CompletedProcess.
-    Prints debug info and stderr/stdout on failure for easier troubleshooting.
+    Run subprocess command and return CompletedProcess. Raises SystemExit for failures like before,
+    but logs more context for CI-friendly debugging.
     """
+    logger.debug("Running command: %s", " ".join(cmd))
     try:
-        print("\n▶ Running:", " ".join(cmd))
         res = subprocess.run(cmd, capture_output=True, text=True, check=check)
-        # show ffmpeg warnings that might be important (do not flood on success)
         if res.stderr:
-            print("STDERR (truncated 800 chars):", res.stderr[:800])
+            # truncate to avoid massive logs but keep useful info
+            logger.debug("STDERR (truncated 800 chars): %s", (res.stderr or "")[:800])
         return res
     except subprocess.CalledProcessError as e:
-        # Print full diagnostics to make failure actionable.
-        print("\n❌ FFmpeg command failed:")
-        print("COMMAND:", " ".join(e.cmd))
-        print("RETURN CODE:", e.returncode)
-        print("STDOUT:", e.stdout)
-        print("STDERR:", e.stderr)
-        # keep original behavior of aborting with SystemExit for clarity in script runs
-        raise SystemExit("FFmpeg execution failed. See above for details.")
+        logger.error("Command failed: %s", " ".join(e.cmd))
+        logger.error("Return code: %s", e.returncode)
+        logger.error("STDOUT: %s", e.stdout)
+        logger.error("STDERR: %s", e.stderr)
+        raise SystemExit("FFmpeg execution failed. See logs above for details.")
 
 
-def probe_duration(path):
+def probe_duration(path: str) -> Optional[float]:
     """
-    Return duration in seconds (float) for media file.
-    Preferred: use ffprobe. If ffprobe is unavailable or fails, fall back to
-    parsing ffmpeg -i stderr for 'Duration: HH:MM:SS.xx'.
+    Return duration in seconds for media file. Prefer ffprobe, fallback to ffmpeg stderr parsing.
+    Returns None if duration could not be determined.
     """
-    # Try ffprobe first if available
-    if ffprobe_path and os.path.exists(ffprobe_path):
+    if _is_exec(ffprobe_path):
         cmd = [
             ffprobe_path,
             "-v",
@@ -221,11 +271,10 @@ def probe_duration(path):
             if out:
                 return float(out)
         except Exception:
-            # fall through to ffmpeg parsing
             pass
 
-    # Fallback: use ffmpeg -i and parse STDERR (Duration: HH:MM:SS.ms)
-    if ffmpeg_path and os.path.exists(ffmpeg_path):
+    # fallback: ffmpeg -i
+    if _is_exec(ffmpeg_path):
         try:
             res = subprocess.run(
                 [ffmpeg_path, "-i", path], capture_output=True, text=True
@@ -242,33 +291,36 @@ def probe_duration(path):
     return None
 
 
-def find_best_audio(folder):
+def find_best_audio(folder: str) -> Optional[str]:
     """Find best audio (longest duration, prefer .wav)."""
     candidates = []
     for ext in ("*.wav", "*.mp3", "*.m4a", "*.flac"):
         candidates.extend(glob.glob(os.path.join(folder, ext)))
     if not candidates:
         return None
-    best, best_dur = None, -1
+    best, best_dur = None, -1.0
     for path in candidates:
         dur = probe_duration(path)
         if dur is None:
-            print(f"⚠ Skipping (unreadable): {os.path.basename(path)}")
+            logger.warning("Skipping unreadable audio: %s", os.path.basename(path))
             continue
-        score = dur + (0.1 if path.lower().endswith(".wav") else 0)
-        print(
-            f"Audio candidate: {os.path.basename(path)} — {dur:.2f}s (score {score:.2f})"
+        score = dur + (0.1 if path.lower().endswith(".wav") else 0.0)
+        logger.info(
+            "Audio candidate: %s — %.2fs (score %.2f)",
+            os.path.basename(path),
+            dur,
+            score,
         )
         if score > best_dur:
             best, best_dur = path, score
     return best
 
 
-def natural_sort_key(s):
+def natural_sort_key(s: str):
     return [int(t) if t.isdigit() else t.lower() for t in re.split("(\d+)", s)]
 
 
-def collect_images_serial_first(folder):
+def collect_images_serial_first(folder: str) -> List[str]:
     """Collect images with serial order first (supports 'promt' typo)."""
     files = [
         f for f in os.listdir(folder) if f.lower().endswith((".jpg", ".jpeg", ".png"))
@@ -294,7 +346,7 @@ def collect_images_serial_first(folder):
     return [os.path.join(folder, f) for f in files]
 
 
-def ensure_even_dimensions_filter(width, height):
+def ensure_even_dimensions_filter(width: int, height: int) -> str:
     return (
         "scale='trunc(iw*min({W}/iw\\,{H}/ih)/2)*2':"
         "'trunc(ih*min({W}/iw\\,{H}/ih)/2)*2',"
@@ -302,140 +354,166 @@ def ensure_even_dimensions_filter(width, height):
     ).format(W=width, H=height)
 
 
-# ---------- Main flow ----------
-image_files = collect_images_serial_first(image_folder)
-if not image_files:
-    raise SystemExit("No images found.")
+# -------------------- Main Flow --------------------
+def main() -> None:
+    # Validate folders (fail early)
+    if not os.path.isdir(image_folder):
+        logger.error("Image folder not found: %s", image_folder)
+        raise SystemExit(2)
+    if not os.path.isdir(narration_folder):
+        logger.error("Narration folder not found: %s", narration_folder)
+        raise SystemExit(2)
 
-num_images = len(image_files)
-print(f"🖼 Found {num_images} images (serial-first).")
-for i, p in enumerate(image_files[:10], 1):
-    print(f"  {i:2d}. {os.path.basename(p)}")
+    # Ensure ffmpeg binaries available; will raise FileNotFoundError with guidance if not
+    try:
+        ensure_ffmpeg_binaries()
+    except FileNotFoundError as e:
+        logger.error("ERROR: %s", e)
+        raise SystemExit(3)
 
-chosen_audio = find_best_audio(narration_folder)
-if not chosen_audio:
-    raise SystemExit("No audio found in narration_folder (.wav/.mp3).")
+    # Collect images
+    image_files = collect_images_serial_first(image_folder)
+    if not image_files:
+        logger.error("No images found in %s", image_folder)
+        raise SystemExit(4)
 
-print(f"\n🎵 Using audio: {chosen_audio}")
-audio_duration = probe_duration(chosen_audio)
-if audio_duration is None:
-    raise SystemExit("Could not parse audio duration.")
-print(f"Audio duration: {audio_duration:.3f}s")
+    num_images = len(image_files)
+    logger.info("Found %d images (serial-first). Showing up to 10:", num_images)
+    for i, p in enumerate(image_files[:10], 1):
+        logger.info("  %2d. %s", i, os.path.basename(p))
 
-per_image_dur = audio_duration / num_images
-print(f"Each image duration: {per_image_dur:.3f}s")
+    # Choose audio
+    chosen_audio = find_best_audio(narration_folder)
+    if not chosen_audio:
+        logger.error("No audio found in narration_folder (.wav/.mp3/.m4a/.flac).")
+        raise SystemExit(5)
 
-tmpdir = tempfile.mkdtemp(prefix="img_vid_segments_")
-segment_files = []
+    logger.info("Using audio: %s", chosen_audio)
+    audio_duration = probe_duration(chosen_audio)
+    if audio_duration is None:
+        logger.error("Could not parse audio duration for %s", chosen_audio)
+        raise SystemExit(6)
+    logger.info("Audio duration: %.3fs", audio_duration)
 
-try:
-    vf_filter = ensure_even_dimensions_filter(*target_resolution)
-    print("\n🎞 Creating segments...")
+    per_image_dur = audio_duration / num_images
+    logger.info("Each image duration: %.3fs", per_image_dur)
 
-    for idx, img in enumerate(image_files):
-        seg_path = os.path.join(tmpdir, f"seg_{idx:03d}.mp4")
-        cmd = [
+    tmpdir = tempfile.mkdtemp(prefix="img_vid_segments_")
+    segment_files: List[str] = []
+
+    try:
+        vf_filter = ensure_even_dimensions_filter(*target_resolution)
+        logger.info(
+            "Creating %d video segments in temporary dir: %s", num_images, tmpdir
+        )
+
+        for idx, img in enumerate(image_files):
+            seg_path = os.path.join(tmpdir, f"seg_{idx:03d}.mp4")
+            cmd = [
+                ffmpeg_path,
+                "-y",
+                "-loop",
+                "1",
+                "-i",
+                img,
+                "-t",
+                f"{per_image_dur:.6f}",
+                "-r",
+                str(frame_rate),
+                "-vf",
+                vf_filter + ",format=" + pix_fmt,
+                "-c:v",
+                "libx264",
+                "-preset",
+                video_preset,
+                "-crf",
+                str(video_crf),
+                "-pix_fmt",
+                pix_fmt,
+                "-movflags",
+                "+faststart",
+                seg_path,
+            ]
+            logger.info(
+                "Segment %d/%d: %s", idx + 1, num_images, os.path.basename(seg_path)
+            )
+            run(cmd)
+            segment_files.append(seg_path)
+
+        # Write concat list
+        concat_list = os.path.join(tmpdir, "segments.txt")
+        with open(concat_list, "w", encoding="utf-8") as f:
+            for seg in segment_files:
+                f.write(f"file '{seg}'\n")
+
+        temp_concat = os.path.join(tmpdir, "temp_video.mp4")
+        logger.info("Concatenating segments into %s", temp_concat)
+        concat_cmd = [
             ffmpeg_path,
             "-y",
-            "-loop",
-            "1",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
             "-i",
-            img,
-            "-t",
-            f"{per_image_dur:.6f}",
-            "-r",
-            str(frame_rate),
-            "-vf",
-            vf_filter + ",format=" + pix_fmt,
+            concat_list,
+            "-c",
+            "copy",
+            temp_concat,
+        ]
+        run(concat_cmd)
+
+        concat_duration = probe_duration(temp_concat)
+        if concat_duration:
+            logger.info("Concat video duration: %.3fs", concat_duration)
+
+        # Safe merge (re-encode) — ensures compatible audio/video streams
+        logger.info("Merging audio + video (safe re-encode)...")
+        merge_cmd = [
+            ffmpeg_path,
+            "-y",
+            "-i",
+            temp_concat,
+            "-i",
+            chosen_audio,
             "-c:v",
-            "libx264",
+            "libx264",  # safe re-encode for guaranteed container compatibility
             "-preset",
-            video_preset,
+            "veryfast",
             "-crf",
-            str(video_crf),
+            str(18),
+            "-c:a",
+            "aac",
+            "-b:a",
+            audio_bitrate,
+            "-ar",
+            str(audio_sample_rate),
             "-pix_fmt",
             pix_fmt,
-            "-movflags",
-            "+faststart",
-            seg_path,
+            "-shortest",
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            output_video,
         ]
-        print(f"Segment {idx+1}/{num_images}: {os.path.basename(seg_path)}")
-        run(cmd)
-        segment_files.append(seg_path)
+        run(merge_cmd)
 
-    # concat list
-    concat_list = os.path.join(tmpdir, "segments.txt")
-    with open(concat_list, "w", encoding="utf-8") as f:
-        for seg in segment_files:
-            f.write(f"file '{seg}'\n")
+        logger.info("Success! Output video created: %s", output_video)
+        logger.info("Expected duration (≈ audio): %.2fs", audio_duration)
+        try:
+            size_mb = os.path.getsize(output_video) / (1024**2)
+            logger.info("Output size: %.2f MB", size_mb)
+        except Exception:
+            logger.debug("Could not determine output file size.")
 
-    temp_concat = os.path.join(tmpdir, "temp_video.mp4")
-    print("\n🔗 Concatenating segments...")
-    concat_cmd = [
-        ffmpeg_path,
-        "-y",
-        "-f",
-        "concat",
-        "-safe",
-        "0",
-        "-i",
-        concat_list,
-        "-c",
-        "copy",
-        temp_concat,
-    ]
-    run(concat_cmd)
+    finally:
+        try:
+            shutil.rmtree(tmpdir)
+            logger.info("Cleaned temporary directory: %s", tmpdir)
+        except Exception:
+            logger.warning("Could not remove temporary directory: %s", tmpdir)
 
-    concat_duration = probe_duration(temp_concat)
-    if concat_duration:
-        print(f"Concat video duration: {concat_duration:.3f}s")
 
-    # --- FIXED MERGE SECTION ---
-    print("\n🎧 Merging audio + video (re-encode safe mode)...")
-    merge_cmd = [
-        ffmpeg_path,
-        "-y",
-        "-i",
-        temp_concat,
-        "-i",
-        chosen_audio,
-        "-c:v",
-        "libx264",  # safe re-encode for guaranteed container compatibility
-        "-preset",
-        "veryfast",
-        "-crf",
-        "18",
-        "-c:a",
-        "aac",
-        "-b:a",
-        audio_bitrate,
-        "-ar",
-        str(audio_sample_rate),
-        "-pix_fmt",
-        pix_fmt,
-        "-shortest",
-        "-map",
-        "0:v:0",
-        "-map",
-        "1:a:0",
-        output_video,
-    ]
-    run(merge_cmd)
-
-    print(f"\n✅ Success! Output video created:\n{output_video}")
-    print(f"Expected duration (≈ audio): {audio_duration:.2f}s")
-    try:
-        print(
-            "Output size: {:.2f} MB".format(os.path.getsize(output_video) / (1024**2))
-        )
-    except Exception:
-        pass
-
-finally:
-    try:
-        shutil.rmtree(tmpdir)
-        print(f"\n🧹 Cleaned temporary directory: {tmpdir}")
-    except Exception:
-        print(f"\n⚠ Could not remove temporary directory: {tmpdir}")
-
-# End of script
+if __name__ == "__main__":
+    main()

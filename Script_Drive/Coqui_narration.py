@@ -424,20 +424,6 @@ def smart_sentence_split(text: str, max_chunk_words: int = 110) -> List[str]:
     return final
 
 
-# ---------- PROGRESS / LOADER HELPERS ----------
-def _create_progress_bar(frac: float, width: int = 30) -> str:
-    frac = max(0.0, min(1.0, frac))
-    filled = int(round(frac * width))
-    bar = "[" + "#" * filled + "-" * (width - filled) + "]"
-    pct = int(frac * 100)
-    return f"{bar} {pct:3d}%"
-
-
-def _print_inline(msg: str, end: str = "\r") -> None:
-    sys.stdout.write(msg + end)
-    sys.stdout.flush()
-
-
 # ---------- GPU CHECK helpers ----------
 def is_torch_cuda_available() -> bool:
     try:
@@ -466,22 +452,6 @@ def child_local_cuda_hint() -> bool:
 
 
 # ---------- FILE STATUS HELPERS ----------
-def _atomic_write_json(path: str, data: Dict[str, Any]) -> None:
-    tmp = path + ".tmp"
-    try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
-    except Exception:
-        try:
-            if os.path.exists(tmp):
-                os.remove(tmp)
-        except Exception:
-            pass
-
-
 def _read_json_safe(path: str) -> Dict[str, Any]:
     try:
         with open(path, "r", encoding="utf-8") as f:
