@@ -8,6 +8,17 @@ Changes/fixes:
  - Coerces TimeoutExpired stdout/stderr to strings safely (handles bytes).
  - Keeps all features: SCRIPTS array, infinite retries until success, console-only logging,
    --timeout, --env-file, --tail-output, --no-backoff, --dry-run, tqdm progress, and friendly timing.
+
+Patch summary (fix for your reported error):
+ - Removed the top-level `from mega import Mega` that caused immediate import-time errors
+   when `mega` (or its dependency `tenacity`) was incompatible with the runtime.
+ - Added a small compatibility shim that restores a minimal `asyncio.coroutine` symbol
+   when missing (some older libraries call `asyncio.coroutine` and in Python 3.11+ it's absent).
+ - Deferred / lazy-import of `mega.Mega` inside the upload helper so the rest of the script
+   runs even if the MEGA client package isn't installed or is incompatible; when upload is attempted
+   we try to import with the compatibility shim and give a clear ImportError message if it still fails.
+
+This preserves every feature and leaves the upload logic (including infinite retries) unchanged.
 """
 
 from __future__ import annotations
@@ -25,7 +36,6 @@ import uuid
 import os
 import json
 from base64 import b64decode
-from mega import Mega
 from cryptography.fernet import Fernet, InvalidToken
 
 # ---------- USER SCRIPTS: set by you ----------
@@ -59,6 +69,52 @@ try:
     TQDM_AVAILABLE = True
 except Exception:
     TQDM_AVAILABLE = False
+
+
+# -------------------------
+# Small compatibility helper for environments (fixes: AttributeError: module 'asyncio' has no attribute 'coroutine')
+# -------------------------
+def _ensure_asyncio_coroutine_compat():
+    """Some older libraries expect asyncio.coroutine to exist. On Python 3.11+ it may be absent.
+    Provide a no-op compatibility symbol so import-time code that checks for or decorates with
+    asyncio.coroutine won't raise AttributeError.
+
+    This is intentionally minimal (a no-op decorator) — it only restores the symbol so legacy
+    import-time code can proceed; it doesn't attempt to reimplement generator-based coroutines.
+    """
+    try:
+        import asyncio
+
+        if not hasattr(asyncio, "coroutine"):
+            # no-op decorator — acceptable for import-time compatibility in many libraries
+            def _coroutine_noop(fn):
+                return fn
+
+            asyncio.coroutine = _coroutine_noop
+    except Exception:
+        # don't fail hard here; importing mega will fail later with a clearer error if needed
+        pass
+
+
+def _import_mega_with_compat():
+    """Attempt to import Mega while applying compatibility shim for asyncio.coroutine.
+
+    Returns the Mega class if successful, otherwise raises ImportError with a helpful message.
+    """
+    try:
+        # Apply shim BEFORE importing packages that may expect asyncio.coroutine
+        _ensure_asyncio_coroutine_compat()
+        from mega import Mega
+
+        return Mega
+    except Exception as e:
+        # Re-raise as ImportError with clearer guidance
+        raise ImportError(
+            "Failed to import 'mega.Mega'. This can happen when the installed 'mega.py' or its "
+            "dependency 'tenacity' is incompatible with your Python version (e.g. Python 3.11). "
+            "Please try upgrading the packages: `pip install -U mega.py tenacity`, or run without MEGA upload. "
+            f"Original error: {e}"
+        )
 
 
 # -------------------------
@@ -408,6 +464,9 @@ def upload_youtube_response_to_mega(
     date_part = datetime.now().strftime("%Y%m%d")
     uniq_part = uuid.uuid4().hex[:8]
     mega_folder_name = f"{date_part}_workflow{workflow_number}_{uniq_part}"
+
+    # Import Mega lazily with compatibility shim
+    Mega = _import_mega_with_compat()
 
     # Init MEGA client
     mega_opts = {"verbose": True} if verbose else {}
