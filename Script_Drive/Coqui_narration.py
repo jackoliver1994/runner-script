@@ -48,7 +48,7 @@ retry_delay = 1  # seconds between retries / loops
 TARGET_MINUTES = 10  # set to None to use base speed without scaling
 
 # Concurrency (child-process workers for chunk-level management). Keep conservative on low-RAM systems.
-MAX_WORKERS = 1
+MAX_WORKERS = 2
 
 # Preferred TTS models (jenny prioritized)
 preferred_models = [
