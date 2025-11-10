@@ -1,4 +1,4 @@
-name: Run single script and upload artifacts
+name: Run single script
 
 on:
   workflow_dispatch:
