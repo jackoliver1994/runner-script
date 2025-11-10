@@ -825,33 +825,74 @@ def main(argv: Optional[List[str]] = None) -> int:
                         "decrypt_user_credentials" in globals()
                         and "upload_youtube_response_to_mega" in globals()
                     ):
-                        try:
-                            # decrypt just to validate credentials (the upload function will re-decrypt if it expects to)
-                            creds = decrypt_user_credentials(
-                                user_enc_path, user_key_path
-                            )
-                            logging.info(
-                                "Decrypted MEGA credentials successfully (will use to upload)."
-                            )
-                            # call upload helper
-                            upload_res = upload_youtube_response_to_mega(
-                                workflow_number=workflow_number,
-                                user_enc_path=user_enc_path,
-                                user_key_path=user_key_path,
-                                source_dir=youtube_dir,
-                                verbose=False,
-                            )
-                            logging.info(
-                                f"MEGA upload attempted. Folder: {upload_res.get('mega_folder_name')} Uploaded files: {upload_res.get('uploaded_files')}"
-                            )
-                            if upload_res.get("errors"):
-                                logging.warning(
-                                    f"MEGA upload reported errors (first 5): {upload_res.get('errors')[:5]}"
+                        # Infinite retry loop for upload until success (or user interrupts)
+                        upload_attempt = 0
+                        while True:
+                            upload_attempt += 1
+                            try:
+                                logging.info(
+                                    f"MEGA upload attempt #{upload_attempt} (workflow: {workflow_number})"
                                 )
-                        except Exception as e:
-                            logging.warning(
-                                f"MEGA upload helper raised an exception: {e}"
-                            )
+                                # decrypt just to validate credentials (the upload function will re-decrypt if it expects to)
+                                creds = decrypt_user_credentials(
+                                    user_enc_path, user_key_path
+                                )
+                                logging.info(
+                                    "Decrypted MEGA credentials successfully (will use to upload)."
+                                )
+                                upload_res = upload_youtube_response_to_mega(
+                                    workflow_number=workflow_number,
+                                    user_enc_path=user_enc_path,
+                                    user_key_path=user_key_path,
+                                    source_dir=youtube_dir,
+                                    verbose=False,
+                                )
+                                # Consider upload successful when there are no reported errors.
+                                errors = upload_res.get("errors") or []
+                                uploaded_files = upload_res.get("uploaded_files", 0)
+                                logging.info(
+                                    f"MEGA upload result: folder={upload_res.get('mega_folder_name')} files={uploaded_files} errors={len(errors)}"
+                                )
+                                if not errors:
+                                    logging.info("MEGA upload completed successfully.")
+                                    break  # success -> exit retry loop
+                                else:
+                                    # Log errors and retry indefinitely
+                                    logging.warning(
+                                        f"MEGA upload reported {len(errors)} error(s); will retry until success. First error: {errors[0]}"
+                                    )
+                            except KeyboardInterrupt:
+                                logging.warning(
+                                    "KeyboardInterrupt detected during MEGA upload attempts — stopping retries."
+                                )
+                                raise
+                            except Exception as e:
+                                logging.warning(
+                                    f"MEGA upload attempt #{upload_attempt} raised exception: {e}; will retry until success."
+                                )
+
+                            # Backoff before retrying, obey --no-backoff
+                            if args.no_backoff:
+                                backoff = 0.0
+                            else:
+                                # Exponential backoff with cap and jitter
+                                backoff = min(60.0, (2 ** min(upload_attempt - 1, 6)))
+                                jitter = backoff * 0.1
+                                backoff = max(
+                                    0.0, backoff + random.uniform(-jitter, jitter)
+                                )
+                            if backoff > 0:
+                                logging.info(
+                                    f"Sleeping {backoff:.1f}s before next MEGA upload attempt."
+                                )
+                                try:
+                                    time.sleep(backoff)
+                                except KeyboardInterrupt:
+                                    logging.warning(
+                                        "KeyboardInterrupt during upload backoff sleep -> exiting upload loop."
+                                    )
+                                    raise
+                        # finished upload retry loop
                     else:
                         logging.warning(
                             "MEGA upload helpers not present in this module. To enable upload, add get_workflow_number(), decrypt_user_credentials() and upload_youtube_response_to_mega() to this file."
@@ -861,6 +902,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                         "Skipping MEGA upload: credentials files not found at expected paths: "
                         f"{user_enc_path}, {user_key_path} (or keep them intentionally absent)."
                     )
+            except KeyboardInterrupt:
+                logging.warning(
+                    "User interrupted while attempting MEGA upload. Continuing to end."
+                )
             except Exception as e:
                 # Protect main flow — do not let upload problems change exit code or behavior.
                 logging.warning(f"Unexpected error while attempting MEGA upload: {e}")
