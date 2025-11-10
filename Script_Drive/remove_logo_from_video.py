@@ -66,7 +66,7 @@ except Exception:
 # -------------------------------------------------------------
 current_directory = os.getcwd()
 METADATA_FILE = os.path.join(
-    current_directory, "youtube_metadata.txt"
+    current_directory, "youtube_response", "youtube_metadata.txt"
 )  # AI output saved here
 client_secrets_file = os.path.join(current_directory, "client_secrets.json")
 token_file = os.path.join(current_directory, "token.pickle")
@@ -74,7 +74,7 @@ token_file = os.path.join(current_directory, "token.pickle")
 # encrypted user json and key
 encrypted_user_json = os.path.join(current_directory, "user.json.enc")
 user_key_file = os.path.join(current_directory, "user_key.txt")
-decrypted_user_json = os.path.join(current_directory, "user.json")
+decrypted_user_json = os.path.join(current_directory, "client_secrets.json")
 
 ffmpeg_root_path = os.path.join(current_directory, "ffmpeg")
 if sys.platform.startswith("win"):
