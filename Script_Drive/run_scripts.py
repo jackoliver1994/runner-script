@@ -16,11 +16,17 @@ import sys
 import time
 import subprocess
 import logging
-from typing import List, Optional, Dict, Tuple
+from typing import List, Optional, Dict, Tuple, Any
 from datetime import datetime
 import glob
 import argparse
 import random
+import uuid
+import os
+import json
+from base64 import b64decode
+from mega import Mega
+from cryptography.fernet import Fernet, InvalidToken
 
 # ---------- USER SCRIPTS: set by you ----------
 SCRIPTS: List[str] = [
@@ -271,6 +277,239 @@ def write_stderr_bytes(text: str) -> None:
 
 
 # -------------------------
+# MEGA upload helpers
+# -------------------------
+def decrypt_user_credentials(
+    user_enc_path: str = "user.json.enc", key_path: str = "user_key.txt"
+) -> Dict[str, str]:
+    """
+    Decrypt user.json.enc using a Fernet key found in user_key.txt.
+    Returns a dict: {"email": "...", "password": "..."}
+
+    Assumptions:
+    - user_key.txt contains the base64 Fernet key (as produced by Fernet.generate_key()) on one line.
+    - user.json.enc was produced by Fernet.encrypt(b'...json bytes...').
+
+    Raises:
+      - FileNotFoundError if files missing
+      - ValueError for parsing errors or wrong format
+      - InvalidToken if decryption fails (bad key / corrupted)
+    """
+    if not os.path.exists(user_enc_path):
+        raise FileNotFoundError(
+            f"Encrypted credentials file not found: {user_enc_path}"
+        )
+    if not os.path.exists(key_path):
+        raise FileNotFoundError(f"Key file not found: {key_path}")
+
+    # Load key (strip whitespace/newline)
+    with open(key_path, "rb") as kf:
+        key_data = kf.read().strip()
+
+    # If key file contains a readable base64 string, use it directly.
+    # Some users store the key as text; ensure it's bytes.
+    try:
+        # Validate by attempting to create a Fernet instance
+        f = Fernet(key_data)
+    except Exception as e:
+        # Helpful error explaining expectation
+        raise ValueError(
+            "Failed to initialise Fernet. Ensure user_key.txt contains the base64 Fernet key "
+            "(what you get from Fernet.generate_key()). Original error: " + str(e)
+        )
+
+    # Read encrypted file bytes
+    with open(user_enc_path, "rb") as ef:
+        encrypted = ef.read()
+
+    try:
+        decrypted_bytes = f.decrypt(encrypted)
+    except InvalidToken as e:
+        raise InvalidToken(
+            "Decryption failed. The key may be wrong or the encrypted file corrupted. "
+            + str(e)
+        )
+
+    try:
+        creds = json.loads(decrypted_bytes.decode("utf-8"))
+    except Exception as e:
+        raise ValueError("Decrypted data is not valid JSON: " + str(e))
+
+    if not isinstance(creds, dict) or "email" not in creds or "password" not in creds:
+        raise ValueError(
+            "Decrypted JSON must be an object containing 'email' and 'password' keys."
+        )
+
+    return {"email": creds["email"], "password": creds["password"]}
+
+
+def get_workflow_number() -> str:
+    """
+    Get GitHub workflow number dynamically when running inside GitHub Actions.
+    Checks environment variables:
+      - GITHUB_RUN_NUMBER (preferred)
+      - GITHUB_RUN_ID
+    If none found (e.g., running locally), returns a deterministic fallback string:
+      '{YYYYMMDD}-{shortuuid8}'.
+    """
+    # GitHub Actions exposes GITHUB_RUN_NUMBER and GITHUB_RUN_ID
+    wf = os.environ.get("GITHUB_RUN_NUMBER") or os.environ.get("GITHUB_RUN_ID")
+    if wf:
+        return str(wf)
+
+    # Not in GitHub Actions — fallback to date + short uuid
+    date_part = datetime.utcnow().strftime("%Y%m%d")
+    uniq8 = uuid.uuid4().hex[:8]
+    return f"{date_part}-{uniq8}"
+
+
+def upload_youtube_response_to_mega(
+    workflow_number: Optional[str] = None,
+    user_enc_path: str = "user.json.enc",
+    user_key_path: str = "user_key.txt",
+    source_dir: Optional[str] = None,
+    verbose: bool = False,
+) -> Dict[str, Any]:
+    """
+    Upload the local folder "<cwd>/youtube_response" to MEGA into a folder named:
+      YYYYMMDD_workflow{workflow_number}_{uniq8}
+
+    - workflow_number: supplied or retrieved from get_workflow_number()
+    - credentials: read by decrypt_user_credentials(user_enc_path, user_key_path)
+      (this uses Fernet decryption as described in decrypt_user_credentials)
+    - source_dir: optional path to the 'youtube_response' folder. Defaults to os.path.join(os.getcwd(), "youtube_response")
+    - verbose: if True, pass verbose option to Mega client construction (where supported)
+
+    Returns:
+      { "mega_folder_name": str, "uploaded_files": int, "errors": [...], "details": [...] }
+    """
+    # Resolve workflow number
+    if workflow_number is None:
+        workflow_number = get_workflow_number()
+
+    # Resolve source directory
+    if source_dir is None:
+        source_dir = os.path.join(os.getcwd(), "youtube_response")
+    source_dir = os.path.abspath(source_dir)
+
+    if not os.path.isdir(source_dir):
+        raise ValueError(f"Source directory not found or not a directory: {source_dir}")
+
+    # Decrypt credentials
+    creds = decrypt_user_credentials(user_enc_path, user_key_path)
+    email = creds.get("email")
+    password = creds.get("password")
+    if not email or not password:
+        raise ValueError(
+            "Decrypted credentials must contain non-empty 'email' and 'password'"
+        )
+
+    # Prepare MEGA folder name
+    date_part = datetime.now().strftime("%Y%m%d")
+    uniq_part = uuid.uuid4().hex[:8]
+    mega_folder_name = f"{date_part}_workflow{workflow_number}_{uniq_part}"
+
+    # Init MEGA client
+    mega_opts = {"verbose": True} if verbose else {}
+    # mega.py accepts dict or nothing; handle both ways for compatibility
+    try:
+        mega = Mega(mega_opts) if mega_opts else Mega()
+    except TypeError:
+        # In case Mega() does not accept options, call without args
+        mega = Mega()
+
+    # Login
+    try:
+        m = mega.login(email, password)
+    except Exception as e:
+        raise RuntimeError(f"Failed to login to MEGA with provided credentials: {e}")
+
+    uploaded_count = 0
+    errors = []
+    details = []
+
+    # Create top-level folder
+    top_folder_id = None
+    try:
+        created = m.create_folder(mega_folder_name)
+        if isinstance(created, dict) and created:
+            top_folder_id = created.get(mega_folder_name) or list(created.values())[-1]
+        else:
+            # attempt to find the folder
+            found = m.find(mega_folder_name)
+            if found:
+                top_folder_id = found[0]
+    except Exception as e:
+        # try to find if creation failed but folder exists
+        try:
+            found = m.find(mega_folder_name)
+            if found:
+                top_folder_id = found[0]
+            else:
+                raise RuntimeError(
+                    f"Failed creating MEGA folder '{mega_folder_name}': {e}"
+                )
+        except Exception as e2:
+            raise RuntimeError(
+                f"Failed creating/finding MEGA folder '{mega_folder_name}': {e2}"
+            )
+
+    # Walk and upload
+    for dirpath, dirnames, filenames in os.walk(source_dir):
+        rel_dir = os.path.relpath(dirpath, source_dir)
+        try:
+            if rel_dir == ".":
+                dest_node_id = top_folder_id
+            else:
+                # create nested path under the top folder
+                remote_subpath = "/".join(
+                    [mega_folder_name, rel_dir.replace(os.sep, "/")]
+                )
+                created = m.create_folder(remote_subpath)
+                if isinstance(created, dict) and created:
+                    # last value is the folder id
+                    dest_node_id = list(created.values())[-1]
+                else:
+                    # fallback
+                    last_segment = os.path.basename(rel_dir)
+                    found = m.find(last_segment)
+                    dest_node_id = found[0] if found else top_folder_id
+        except Exception as e:
+            errors.append(f"Error creating/finding remote folder for '{rel_dir}': {e}")
+            dest_node_id = top_folder_id
+
+        for fname in filenames:
+            local_path = os.path.join(dirpath, fname)
+            try:
+                uploaded_node = m.upload(local_path, dest_node_id)
+                uploaded_count += 1
+                public_link = None
+                try:
+                    public_link = m.get_upload_link(uploaded_node)
+                except Exception:
+                    public_link = None
+
+                details.append(
+                    {
+                        "local_path": local_path,
+                        "remote_parent_node": dest_node_id,
+                        "uploaded_node": uploaded_node,
+                        "public_link": public_link,
+                    }
+                )
+            except Exception as e:
+                errors.append(f"Failed to upload '{local_path}': {e}")
+
+    result = {
+        "mega_folder_name": mega_folder_name,
+        "uploaded_files": uploaded_count,
+        "errors": errors,
+        "details": details,
+    }
+    return result
+
+
+# -------------------------
 # Main orchestration
 # -------------------------
 def main(argv: Optional[List[str]] = None) -> int:
@@ -459,7 +698,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                             )
                         if backoff > 0:
                             logging.info(
-                                f"[{script_name}] sleeping {backoff:.1f}s before next attempt..."
+                                f"[{script_name}] sleeping {backoff:.1f}s before next attempt."
                             )
                             try:
                                 time.sleep(backoff)
@@ -544,6 +783,95 @@ def main(argv: Optional[List[str]] = None) -> int:
     any_fail = any(
         (s.get("status") != "OK" and s.get("status") != "DRY-RUN") for s in summary
     )
+
+    # -----------------------------
+    # Optional: upload youtube_response to MEGA (safe, non-destructive add-on)
+    # -----------------------------
+    try:
+        youtube_dir = os.path.abspath(os.path.join(os.getcwd(), "youtube_response"))
+        user_enc_path = os.path.abspath(os.path.join(os.getcwd(), "user.json.enc"))
+        user_key_path = os.path.abspath(os.path.join(os.getcwd(), "user_key.txt"))
+
+        if os.path.isdir(youtube_dir):
+            logging.info(
+                "Detected ./youtube_response folder — attempting optional MEGA upload."
+            )
+            # Prefer calling helper functions if defined; otherwise skip upload gracefully.
+            try:
+                # get_workflow_number() should be implemented as discussed earlier
+                workflow_number = None
+                if "get_workflow_number" in globals():
+                    try:
+                        workflow_number = get_workflow_number()
+                    except Exception as e:
+                        logging.warning(
+                            f"get_workflow_number() failed: {e}; falling back to env/ts."
+                        )
+                        workflow_number = (
+                            os.environ.get("GITHUB_RUN_NUMBER")
+                            or os.environ.get("GITHUB_RUN_ID")
+                            or f"local-{datetime.utcnow().strftime('%Y%m%d')}-{uuid.uuid4().hex[:8]}"
+                        )
+                else:
+                    workflow_number = (
+                        os.environ.get("GITHUB_RUN_NUMBER")
+                        or os.environ.get("GITHUB_RUN_ID")
+                        or f"local-{datetime.utcnow().strftime('%Y%m%d')}-{uuid.uuid4().hex[:8]}"
+                    )
+
+                # Only attempt encrypted-credentials path if both files exist
+                if os.path.exists(user_enc_path) and os.path.exists(user_key_path):
+                    if (
+                        "decrypt_user_credentials" in globals()
+                        and "upload_youtube_response_to_mega" in globals()
+                    ):
+                        try:
+                            # decrypt just to validate credentials (the upload function will re-decrypt if it expects to)
+                            creds = decrypt_user_credentials(
+                                user_enc_path, user_key_path
+                            )
+                            logging.info(
+                                "Decrypted MEGA credentials successfully (will use to upload)."
+                            )
+                            # call upload helper
+                            upload_res = upload_youtube_response_to_mega(
+                                workflow_number=workflow_number,
+                                user_enc_path=user_enc_path,
+                                user_key_path=user_key_path,
+                                source_dir=youtube_dir,
+                                verbose=False,
+                            )
+                            logging.info(
+                                f"MEGA upload attempted. Folder: {upload_res.get('mega_folder_name')} Uploaded files: {upload_res.get('uploaded_files')}"
+                            )
+                            if upload_res.get("errors"):
+                                logging.warning(
+                                    f"MEGA upload reported errors (first 5): {upload_res.get('errors')[:5]}"
+                                )
+                        except Exception as e:
+                            logging.warning(
+                                f"MEGA upload helper raised an exception: {e}"
+                            )
+                    else:
+                        logging.warning(
+                            "MEGA upload helpers not present in this module. To enable upload, add get_workflow_number(), decrypt_user_credentials() and upload_youtube_response_to_mega() to this file."
+                        )
+                else:
+                    logging.info(
+                        "Skipping MEGA upload: credentials files not found at expected paths: "
+                        f"{user_enc_path}, {user_key_path} (or keep them intentionally absent)."
+                    )
+            except Exception as e:
+                # Protect main flow — do not let upload problems change exit code or behavior.
+                logging.warning(f"Unexpected error while attempting MEGA upload: {e}")
+        else:
+            logging.info(
+                "No ./youtube_response folder detected — skipping optional MEGA upload."
+            )
+    except Exception as e:
+        # super-defensive - ensure main still returns the original result even if our upload code breaks
+        logging.warning(f"Upload-checking logic encountered an unexpected error: {e}")
+
     return 0 if not any_fail else 3
 
 

@@ -18,9 +18,9 @@ from pathlib import Path
 from cryptography.fernet import Fernet
 
 # ---------- CONFIG: change only if needed ----------
-INPUT_FILE = "client_secrets.json"
-OUTPUT_FILE = "client_secrets.json.enc"
-KEY_FILE = "client_secrets_key.txt"
+INPUT_FILE = "user.json"
+OUTPUT_FILE = "user.json.enc"
+KEY_FILE = "user_key.txt"
 # --------------------------------------------------
 
 

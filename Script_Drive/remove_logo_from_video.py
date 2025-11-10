@@ -257,5 +257,5 @@ if __name__ == "__main__":
     remove_logo_with_audio(
         video_path,
         logo_regions,
-        os.path.join(current_directory, "image_response", "final_video_medium.mp4"),
+        os.path.join(current_directory, "youtube_response", "final_video_medium.mp4"),
     )
