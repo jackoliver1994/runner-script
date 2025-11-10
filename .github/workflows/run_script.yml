@@ -25,38 +25,9 @@ jobs:
       - name: Install Playwright browsers
         run: playwright install --with-deps
 
-      - name: Run your script (llm)
+      - name: Run your script (all)
         env:
           R_HOURS: "6"
         run: |
           cd Script_Drive
-          python llm.py
-
-      - name: Run your script (pollinations_image_genrate)
-        env:
-          R_HOURS: "6"
-        run: |
-          cd Script_Drive
-          python pollinations_image_genrate.py
-
-      - name: Run your script (Coqui_narration)
-        env:
-          R_HOURS: "6"
-        run: |
-          cd Script_Drive
-          python Coqui_narration.py
-
-      - name: Run your script (video_genrate)
-        env:
-          R_HOURS: "6"
-        run: |
-          cd Script_Drive
-          python video_genrate.py
-
-      - name: Run your script (remove_logo_from_video)
-        env:
-          R_HOURS: "6"
-        run: |
-          cd Script_Drive
-          python remove_logo_from_video.py
-
+          python run_scripts.py
