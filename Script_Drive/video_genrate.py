@@ -502,6 +502,136 @@ def ensure_even_dimensions_filter(width: int, height: int) -> str:
     ).format(W=width, H=height)
 
 
+# -------------------- Subtitle burning helper --------------------
+def _guess_color_hex(color: str) -> str:
+    """
+    Convert color names or hex '#RRGGBB' or 'RRGGBB' into ASS color bytes order AABBGGRR
+    (we use AA=00 for fully opaque). Returns string like '00BBGGRR' suitable for &H... in force_style.
+    Supports simple names 'white' and 'black' otherwise accepts 6-hex RGB.
+    """
+    if not color:
+        color = "FFFFFF"
+    color = color.strip().lower()
+    name_map = {
+        "white": "ffffff",
+        "black": "000000",
+        "red": "ff0000",
+        "green": "00ff00",
+        "blue": "0000ff",
+    }
+    if color in name_map:
+        color = name_map[color]
+    if color.startswith("#"):
+        color = color[1:]
+    if len(color) != 6 or not all(c in "0123456789abcdef" for c in color):
+        # fallback white
+        color = "ffffff"
+    # ASS uses AABBGGRR; use AA=00 (opaque)
+    rr = color[0:2]
+    gg = color[2:4]
+    bb = color[4:6]
+    return f"00{bb}{gg}{rr}"  # string of 8 hex chars
+
+
+def burn_in_subtitles_with_ffmpeg(
+    ffmpeg_exe: str,
+    input_video: str,
+    srt_path: str,
+    output_video: str,
+    font: str = "Arial",
+    fontsize: int = 48,
+    fontcolor: str = "white",
+    outline_color: str = "black",
+    outline: int = 2,
+    y_offset_px: int = 80,
+    preserve_audio: bool = True,
+) -> str:
+    """
+    Burn an SRT into a video using ffmpeg subtitles filter with a readable style.
+    - ffmpeg_exe: path to ffmpeg binary
+    - input_video: path to source video
+    - srt_path: path to SRT file
+    - output_video: final path to write (will be written to a temp file then moved)
+    - font / fontsize / fontcolor / outline_color / outline: visual style
+    - y_offset_px: vertical offset from bottom (in pixels)
+    Returns the path to the written output_video (same as output_video param) on success.
+    Raises RuntimeError on ffmpeg failure.
+    """
+    assert os.path.exists(input_video), f"Input video not found: {input_video}"
+    assert os.path.exists(srt_path), f"SRT file not found: {srt_path}"
+
+    # Build force_style argument (ASS style string). BorderStyle=1 uses outline+shadow per ASS.
+    primary = _guess_color_hex(fontcolor)
+    outline_c = _guess_color_hex(outline_color)
+    # Escape single quotes in font name for ffmpeg filter argument
+    font_escaped = font.replace("'", "\\'")
+    force_style = (
+        f"FontName={font_escaped},Fontsize={fontsize},"
+        f"PrimaryColour=&H{primary}&,OutlineColour=&H{outline_c}&,"
+        f"BorderStyle=1,Outline={outline},Shadow=0"
+    )
+
+    # Build subtitles filter carefully — for Windows paths we must escape backslashes and colons inside the filter.
+    # ffmpeg expects the path as file path (it will internally hand over to libavfilter). We will quote the srt path.
+    # To be safe, use the subtitles filter with the full path quoted.
+    # On some platforms, ffmpeg requires utf-8 path handling — provide as-is.
+    # Construct filter expression:
+    # e.g. subtitles='/full/path/file.srt':force_style='...'
+    srt_escaped = srt_path.replace("'", r"\'")
+    vf_expr = f"subtitles='{srt_escaped}':force_style='{force_style}'"
+
+    # Prepare temp output and run ffmpeg
+    out_tmp = os.path.splitext(output_video)[0] + ".withsub.tmp.mp4"
+    cmd = [
+        ffmpeg_exe,
+        "-y",
+        "-i",
+        input_video,
+        "-vf",
+        vf_expr,
+    ]
+
+    # Preserve audio stream (copy) if requested, otherwise re-encode in default aac
+    if preserve_audio:
+        cmd += ["-c:a", "copy"]
+    else:
+        cmd += ["-c:a", "aac", "-b:a", audio_bitrate]
+
+    # Re-encode video to ensure subtitles are burned-in and compat (safe settings)
+    cmd += [
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        str(video_crf),
+        "-pix_fmt",
+        pix_fmt,
+        out_tmp,
+    ]
+
+    logger.info("Burning subtitles into video (temporary): %s", out_tmp)
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if res.returncode != 0:
+        logger.error("ffmpeg subtitles command failed. STDERR:\n%s", res.stderr)
+        # Clean partial file if created
+        try:
+            if os.path.exists(out_tmp):
+                os.remove(out_tmp)
+        except Exception:
+            pass
+        raise RuntimeError(f"ffmpeg subtitles embedding failed (rc={res.returncode})")
+
+    # Move temp over target (atomic-ish)
+    try:
+        shutil.move(out_tmp, output_video)
+        logger.info("Subtitle-burned video written: %s", output_video)
+    except Exception as e:
+        raise RuntimeError(f"Could not move subtitle output into place: {e}")
+
+    return output_video
+
+
 # -------------------- Main Flow --------------------
 def main() -> None:
     # Validate folders (fail early)
@@ -615,7 +745,7 @@ def main() -> None:
         if concat_duration:
             logger.info("Concat video duration: %.3fs", concat_duration)
 
-        # Safe merge (re-encode) — ensures compatible audio/video streams
+            # Safe merge (re-encode) — ensures compatible audio/video streams
         logger.info("Merging audio + video (safe re-encode)...")
         merge_cmd = [
             ffmpeg_path,
@@ -646,6 +776,43 @@ def main() -> None:
             output_video,
         ]
         run(merge_cmd)
+
+        # --- NEW: detect matching .srt for chosen audio and burn into the final video if present ---
+        try:
+            # Look for a .srt with the same basename as the chosen audio file
+            srt_candidate = os.path.splitext(chosen_audio)[0] + ".srt"
+            if os.path.exists(srt_candidate):
+                logger.info(
+                    "Found subtitle file for audio: %s", os.path.basename(srt_candidate)
+                )
+                # create a temp backup path (so we can replace atomically)
+                output_with_subs = (
+                    output_video  # we'll overwrite this path with subtitle-burned video
+                )
+                burn_in_subtitles_with_ffmpeg(
+                    ffmpeg_exe=ffmpeg_path,
+                    input_video=output_video,
+                    srt_path=srt_candidate,
+                    output_video=output_with_subs,
+                    font="Arial",
+                    fontsize=48,  # medium readable size for 1080p target
+                    fontcolor="white",
+                    outline_color="black",
+                    outline=2,
+                    y_offset_px=80,
+                    preserve_audio=True,
+                )
+            else:
+                logger.debug(
+                    "No matching .srt found at: %s (skipping subtitle burn-in).",
+                    srt_candidate,
+                )
+        except Exception as exc:
+            logger.warning(
+                "Subtitle burn-in step failed (continuing without burned subtitles): %s",
+                exc,
+            )
+        # --- END subtitle step ---
 
         logger.info("Success! Output video created: %s", output_video)
         logger.info("Expected duration (≈ audio): %.2fs", audio_duration)

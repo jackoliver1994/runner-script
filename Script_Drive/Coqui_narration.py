@@ -424,6 +424,202 @@ def smart_sentence_split(text: str, max_chunk_words: int = 110) -> List[str]:
     return final
 
 
+# ----------------- SUBTITLE (SRT) HELPERS -----------------
+def _wav_duration_seconds(path: str) -> float:
+    """
+    Return duration in seconds for WAV or similar audio file.
+    Tries Python wave first (works for PCM WAVs), and falls back to ffprobe
+    (if ffprobe available) for other formats.
+    """
+    try:
+        # try wave (works for standard PCM WAVs)
+        import wave as _wave
+
+        with _wave.open(path, "rb") as w:
+            frames = w.getnframes()
+            rate = w.getframerate()
+            if rate and frames >= 0:
+                return float(frames) / float(rate)
+    except Exception:
+        pass
+
+    # fallback to ffprobe if present
+    try:
+        ffprobe = (
+            ffprobe_path
+            if (ffprobe_path and os.path.exists(ffprobe_path))
+            else shutil.which("ffprobe")
+        )
+        if not ffprobe:
+            # try to detect from ffmpeg package helper (imageio-ffmpeg) if installed
+            try:
+                import imageio_ffmpeg as _iioff
+
+                ffprobe = shutil.which("ffprobe") or None
+            except Exception:
+                ffprobe = None
+
+        if ffprobe:
+            cmd = [
+                ffprobe,
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                path,
+            ]
+            out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
+            dur = out.decode().strip()
+            try:
+                return float(dur)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # last resort: return 0.0 so caller can decide
+    return 0.0
+
+
+def _format_srt_timestamp(seconds: float) -> str:
+    """
+    Format seconds -> SRT timestamp 'HH:MM:SS,mmm'
+    """
+    if seconds < 0:
+        seconds = 0.0
+    ms = int(round((seconds - int(seconds)) * 1000))
+    total = int(seconds)
+    s = total % 60
+    total //= 60
+    m = total % 60
+    total //= 60
+    h = total
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def _sanitize_for_srt(text: str) -> str:
+    """
+    Lightweight sanitize for subtitle text:
+      - collapse multiple spaces, strip
+      - remove silent markers if present
+      - replace newlines with space
+    """
+    if not text:
+        return ""
+    t = text.replace("\r", " ").replace("\n", " ").strip()
+    # remove the internal silence markers if any (defensive)
+    t = t.replace("__SILENCE__:", "")
+    t = re.sub(r"\s{2,}", " ", t)
+    return t
+
+
+def write_srt_from_chunks(
+    chunks: List[str],
+    tasks: List[Tuple[int, str, str, int]],
+    results: Dict[int, Tuple[int, bool, str, Any]],
+    base_output_path: str,
+) -> str:
+    """
+    Generate an SRT file aligned with the concatenation order built earlier.
+
+    - chunks: original chunks list (may contain "__SILENCE__:" markers)
+    - tasks: the tasks list used earlier (tuple: (i, chunk, chunk_fname, trailing_pause_ms))
+    - results: mapping of chunk index -> (idx, success_bool, path, err)
+    - base_output_path: intended output path (we create <base> .srt next to it)
+    Returns the path to the written .srt
+    """
+    srt_path = os.path.splitext(base_output_path)[0] + ".srt"
+    entries = []
+    current_time = 0.0
+    for i in range(len(chunks)):
+        # Determine path for this chunk (could be silence WAV or real TTS wav)
+        wavp = None
+        if i in results and results[i][1] and results[i][2]:
+            wavp = results[i][2]
+        else:
+            # fallback to expected tmp chunk path if available in tasks
+            try:
+                expected = tasks[i][2]
+                if os.path.exists(expected):
+                    wavp = expected
+            except Exception:
+                wavp = None
+
+        # If chunk text is silence marker, treat as silence audio (no subtitle)
+        chunk_text = chunks[i] if isinstance(chunks[i], str) else str(chunks[i])
+        is_silence_chunk = isinstance(chunk_text, str) and chunk_text.startswith(
+            "__SILENCE__:"
+        )
+
+        # duration of the produced chunk audio
+        dur = 0.0
+        if wavp and os.path.exists(wavp):
+            dur = _wav_duration_seconds(wavp)
+            # defensively clamp small durations
+            if dur <= 0:
+                # if path mentions ms, try to extract
+                m = re.search(r"_(\d+)ms\.wav$", wavp)
+                if m:
+                    try:
+                        dur = int(m.group(1)) / 1000.0
+                    except Exception:
+                        dur = 0.0
+
+        # If this chunk is speech (not silence), add a subtitle entry covering its audio duration
+        if not is_silence_chunk:
+            clean_text = _sanitize_for_srt(chunk_text)
+            if clean_text:
+                start = current_time
+                end = current_time + dur
+                # If duration missing (0), set a tiny minimal display time (0.3s)
+                if end <= start + 0.02:
+                    end = start + max(0.3, dur or 0.3)
+                entries.append((len(entries) + 1, clean_text, start, end))
+
+        # Advance timeline by this chunk duration
+        current_time += dur
+
+        # Advance timeline by trailing pause (if any) stored in tasks
+        try:
+            pause_ms = (
+                int(tasks[i][3]) if tasks and tasks[i] and len(tasks[i]) > 3 else 0
+            )
+            if pause_ms and pause_ms > 0:
+                current_time += pause_ms / 1000.0
+        except Exception:
+            pass
+
+    # Write SRT file
+    try:
+        with open(srt_path, "w", encoding="utf-8") as s:
+            for idx, text, start, end in entries:
+                s.write(f"{idx}\n")
+                s.write(
+                    f"{_format_srt_timestamp(start)} --> {_format_srt_timestamp(end)}\n"
+                )
+                # wrap text lines at ~42 chars for readability (soft)
+                # but avoid inserting markup, keep plain lines
+                maxlen = 42
+                words = text.split()
+                line = ""
+                for w in words:
+                    if len(line) + 1 + len(w) <= maxlen or line == "":
+                        line = (line + " " + w).strip()
+                    else:
+                        s.write(line + "\n")
+                        line = w
+                if line:
+                    s.write(line + "\n")
+                s.write("\n")
+        print(f"{_ts()} ✅ Wrote subtitle SRT: {srt_path} ({len(entries)} entries)")
+    except Exception as e:
+        print(f"{_ts()} ⚠️ Failed to write SRT file: {e}")
+
+    return srt_path
+
+
 # ---------- GPU CHECK helpers ----------
 def is_torch_cuda_available() -> bool:
     try:
@@ -1229,7 +1425,7 @@ def synthesize_chunks_and_concatenate(
             # small sleep to avoid busy-wait
             time.sleep(0.05)
 
-        # Compose ordered list of files for concat including silence files
+            # Compose ordered list of files for concat including silence files
         chunk_files_seq: List[str] = []
         for i in range(len(chunks)):
             if i in results and results[i][1] and os.path.exists(results[i][2]):
@@ -1256,6 +1452,14 @@ def synthesize_chunks_and_concatenate(
                     pause_ms, silence_path, sample_rate=22050, nchannels=1, sampwidth=2
                 )
                 chunk_files_seq.append(silence_path)
+
+        # --- NEW: generate subtitle (.srt) aligned with chunks ---
+        try:
+            srt_path = write_srt_from_chunks(chunks, tasks, results, base_output_path)
+            print(f"{_ts()} ℹ️ Subtitle file generated: {srt_path}")
+        except Exception:
+            print(f"{_ts()} ⚠️ Subtitle generation failed:\n{traceback.format_exc()}")
+        # --------------------------------------------------------
 
         # FFmpeg selection: prefer provided binary else fallback to PATH ffmpeg.
         # If none found, call ensure helper (which may attempt pip installs).

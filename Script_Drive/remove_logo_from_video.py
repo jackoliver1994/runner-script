@@ -150,6 +150,153 @@ def ensure_ffmpeg(verbose=True):
         return False
 
 
+# ------------------ Subtitle helpers (add to remove_logo_from_video.py) ------------------
+def _guess_color_hex(color: str) -> str:
+    """
+    Convert color names or hex '#RRGGBB' or 'RRGGBB' into ASS color bytes order AABBGGRR (AA=00 opaque).
+    """
+    if not color:
+        color = "ffffff"
+    color = color.strip().lower()
+    name_map = {
+        "white": "ffffff",
+        "black": "000000",
+        "red": "ff0000",
+        "green": "00ff00",
+        "blue": "0000ff",
+    }
+    if color in name_map:
+        color = name_map[color]
+    if color.startswith("#"):
+        color = color[1:]
+    if len(color) != 6 or not all(c in "0123456789abcdef" for c in color):
+        color = "ffffff"
+    rr = color[0:2]
+    gg = color[2:4]
+    bb = color[4:6]
+    return f"00{bb}{gg}{rr}"
+
+
+def burn_in_subtitles_with_ffmpeg(
+    ffmpeg_exe: str,
+    input_video: str,
+    srt_path: str,
+    output_video: str,
+    font: str = "Arial",
+    fontsize: int = 48,
+    fontcolor: str = "white",
+    outline_color: str = "black",
+    outline: int = 2,
+    preserve_audio: bool = True,
+):
+    """
+    Burn an SRT into input_video and write output_video (temp file used then moved).
+    Overwrites output_video on success. Raises RuntimeError on failure.
+    """
+    if not os.path.exists(input_video):
+        raise RuntimeError(f"Input video not found: {input_video}")
+    if not os.path.exists(srt_path):
+        raise RuntimeError(f"SRT not found: {srt_path}")
+
+    # Prepare style for ASS/ffmpeg subtitles filter
+    primary = _guess_color_hex(fontcolor)
+    outline_c = _guess_color_hex(outline_color)
+    font_escaped = font.replace("'", "\\'")
+    force_style = (
+        f"FontName={font_escaped},Fontsize={fontsize},"
+        f"PrimaryColour=&H{primary}&,OutlineColour=&H{outline_c}&,"
+        f"BorderStyle=1,Outline={outline},Shadow=0"
+    )
+
+    # Escape srt path for ffmpeg filter
+    srt_escaped = srt_path.replace("'", r"\'")
+    vf_expr = f"subtitles='{srt_escaped}':force_style='{force_style}'"
+
+    out_tmp = os.path.splitext(output_video)[0] + ".withsub.tmp.mp4"
+
+    cmd = [ffmpeg_exe, "-y", "-i", input_video, "-vf", vf_expr]
+
+    # preserve audio by copy, or re-encode if not desired (copy is safer)
+    if preserve_audio:
+        cmd += ["-c:a", "copy"]
+    else:
+        cmd += ["-c:a", "aac", "-b:a", "128k"]
+
+    # Re-encode video to burn subtitles (libx264 default params)
+    cmd += [
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "26",
+        "-pix_fmt",
+        "yuv420p",
+        out_tmp,
+    ]
+
+    print(
+        f"ℹ️ Burning subtitles with ffmpeg: {os.path.basename(srt_path)} -> {os.path.basename(output_video)}"
+    )
+    result = run_cmd(cmd, retries=3, check_returncode=False)
+    # run_cmd returns subprocess.CompletedProcess or raises; handle error codes
+    rc = getattr(result, "returncode", 1)
+    if rc != 0:
+        stderr = getattr(result, "stderr", "")
+        # clean tmp if created
+        try:
+            if os.path.exists(out_tmp):
+                os.remove(out_tmp)
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"ffmpeg subtitles embedding failed (rc={rc}). ffmpeg stderr:\n{stderr}"
+        )
+
+    # move tmp over final
+    try:
+        shutil.move(out_tmp, output_video)
+    except Exception as e:
+        raise RuntimeError(f"Could not move subtitle-burned file into place: {e}")
+
+    print(f"✅ Subtitles burned into video: {output_video}")
+    return output_video
+
+
+def find_candidate_srt_for_video(video_path: str):
+    """
+    Heuristic search for plausible .srt for a video.
+    Tries:
+     - same basename .srt as input video
+     - any .srt in same directory containing the basename
+    Returns path or None.
+    """
+    base_dir = os.path.dirname(video_path) or "."
+    base_name = os.path.splitext(os.path.basename(video_path))[0]
+
+    # Candidate 1: same name.srt
+    cand = os.path.join(base_dir, base_name + ".srt")
+    if os.path.exists(cand):
+        return cand
+
+    # Candidate 2: same name + .en.srt or similar variants
+    for ext in [".en.srt", ".eng.srt", ".en-US.srt"]:
+        cand2 = os.path.join(base_dir, base_name + ext)
+        if os.path.exists(cand2):
+            return cand2
+
+    # Candidate 3: look for any .srt in dir that contains the base_name substring
+    for f in os.listdir(base_dir):
+        if f.lower().endswith(".srt") and base_name.lower() in f.lower():
+            return os.path.join(base_dir, f)
+
+    # No match
+    return None
+
+
+# -------------------------------------------------------------------------------------------
+
+
 # ----------------------------
 # Video processing (unchanged)
 # ----------------------------
@@ -241,6 +388,40 @@ def remove_logo_with_audio(
         return None
     else:
         print(f"🎬 Done! Output saved as: {output_path}")
+
+    # --- NEW: attempt to find a matching .srt and burn it into the output video if present ---
+    try:
+        srt_found = find_candidate_srt_for_video(
+            output_path
+        ) or find_candidate_srt_for_video(video_path)
+        if srt_found:
+            print(f"ℹ️ Found subtitle file: {srt_found}. Burning into {output_path} ...")
+            # ensure ffmpeg exists
+            ensure_ffmpeg()
+            try:
+                burn_in_subtitles_with_ffmpeg(
+                    ffmpeg_exe=ffmpeg_path,
+                    input_video=output_path,
+                    srt_path=srt_found,
+                    output_video=output_path,
+                    font="Arial",
+                    fontsize=48,  # medium size for 1080p; change if your resolution differs
+                    fontcolor="white",
+                    outline_color="black",
+                    outline=2,
+                    preserve_audio=True,
+                )
+            except Exception as burn_err:
+                print(
+                    "⚠️ Subtitle burn-in failed (continuing with non-burned video):",
+                    burn_err,
+                )
+        else:
+            print("ℹ️ No matching .srt found (skipping subtitle burn-in).")
+    except Exception as e:
+        # defensive: do not fail the whole operation because subtitle step failed
+        print("⚠️ Subtitle detection/burning step raised an exception (ignored):", e)
+
     if os.path.exists(temp_path):
         try:
             os.remove(temp_path)
