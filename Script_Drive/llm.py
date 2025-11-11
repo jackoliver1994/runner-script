@@ -83,16 +83,12 @@ class ChatAPI:
         proxy: Optional[str] = None,
     ) -> str:
         """
-        Complete, feature-preserving send_message that:
-        - will retry indefinitely until a successful JSON {"status":"success","response":...} is received
-        - preserves spinner behavior and prints logs in the same style as your previous runs
-        - attempts Cloudflare challenge solving (cloudscraper once per challenge) and optional Playwright (once per challenge)
-        - supports proxy, session reuse, and incremental (but capped) timeout growth between attempts
-        - prints clear diagnostics (status, snippets, JSON) for debugging
+        Robust send_message — preserves original features (infinite retry, spinner, backoff, cloudscraper/playwright fallbacks),
+        but adds thorough URL validation/normalization to avoid invalid-root_url issues (e.g. 'https:/') and safer solver usage.
+
         Notes:
-        - This WILL run forever until success (or until the process is terminated).
-        - It will increase the per-attempt timeout by `timeout_growth` after each transient failure, but never above `max_timeout_cap`.
-        - Be sure to comply with the target service TOS when repeatedly attempting to access protected endpoints.
+        - If self.url is misconfigured (no host), this will raise ValueError early (helps avoid infinite loops on bad config).
+        - All original features retained.
         """
         import requests
         import time
@@ -100,6 +96,7 @@ class ChatAPI:
         import json
         import traceback
         import concurrent.futures as cf
+        from urllib.parse import urlparse, urlunparse
 
         # lazy optional imports for challenge-solving
         try:
@@ -124,6 +121,26 @@ class ChatAPI:
             self._session = requests.Session()
         session = self._session
 
+        # Validate and normalize self.url -> ensure scheme + netloc
+        parsed = urlparse(self.url or "")
+        if not parsed.scheme:
+            # default to https if not provided
+            parsed = parsed._replace(scheme="https")
+        if not parsed.netloc:
+            # If path contains host-like component (e.g. "https:/host.com"), try quick fix:
+            # attempt to re-parse a common bad-case: "https:/" or "https:////host"
+            guessed = (self.url or "").replace(":///", "://").replace(":/", "://")
+            parsed2 = urlparse(guessed)
+            if parsed2.netloc:
+                parsed = parsed2
+            else:
+                raise ValueError(
+                    f"ChatAPI.send_message: invalid url configured for ChatAPI.url -> '{self.url}'. "
+                    "No host/netloc found. Please set a valid URL like 'https://example.com/api/chat'."
+                )
+        # root_url = scheme://netloc  (no trailing slash)
+        root_url = urlunparse((parsed.scheme, parsed.netloc, "", "", "", ""))
+
         # initial timeout and backoff
         configured_timeout = int(timeout or getattr(self, "base_timeout", 60))
         configured_timeout = min(configured_timeout, max_timeout_cap)
@@ -144,17 +161,12 @@ class ChatAPI:
 
         def looks_like_html_challenge(status_code, text, headers):
             """
-            Broader HTML-challenge detector:
-            - Treats explicit 403 HTML pages as challenges (as before)
-            - Also treats common edge-statuses like 522 (connection/timeouts reported in HTML)
-            - Uses content-type and snippet heuristics.
+            Broader HTML-challenge detector (same heuristics as before).
             """
             try:
-                # direct status checks (403 and similar edge codes)
                 if status_code in (403, 522):
                     return True
                 t = (text or "").lower()
-                # heuristics for Cloudflare-like messages or "just a moment"
                 if (
                     "just a moment" in t
                     or "attention required" in t
@@ -172,12 +184,13 @@ class ChatAPI:
 
         def try_cloudscraper_once():
             """
-            Enhanced cloudscraper attempt:
-            - Does an initial GET to the site root to seed cookies and JS challenges.
-            - Attempts POST; if HTML is returned, tries to find embedded JSON blobs.
-            - If still HTML, retries a POST with a fallback User-Agent + Accept headers once.
-            - Saves an HTML snippet for offline debugging when non-JSON is returned.
-            - Respects last_solver_time to avoid hammering solver libraries.
+            Attempt to use cloudscraper once to solve a detected HTML challenge.
+            This function:
+            - honours SOLVER_MIN_INTERVAL frequency
+            - normalizes root_url and uses it for a GET seed
+            - retries a POST with safer/fallback headers if necessary
+            - extracts embedded JSON if present
+            Returns parsed JSON dict on success, None otherwise.
             """
             if not cloudscraper:
                 print("→ cloudscraper not installed; skipping cloudscraper solver.")
@@ -191,13 +204,13 @@ class ChatAPI:
                 return None
             last_solver_time["cloudscraper"] = now
 
-            root_url = self.url.split("/api")[0]
             try:
                 print(
                     "→ Trying cloudscraper to solve challenge (GET seed + POST attempt)..."
                 )
-                # create a scraper instance
-                s = cloudscraper.create_scraper()
+                s = (
+                    cloudscraper.create_scraper()
+                )  # may raise; let it surface and be caught below
                 proxies = {"http": proxy, "https": proxy} if proxy else None
 
                 # 1) seed cookies by GET to the root (helps many CF flows)
@@ -215,6 +228,7 @@ class ChatAPI:
                     print("→ cloudscraper GET seed failed (continuing to POST):", ge)
 
                 # 2) POST with configured timeout
+                r = None
                 try:
                     r = s.post(
                         self.url,
@@ -224,7 +238,7 @@ class ChatAPI:
                     )
                 except Exception as e:
                     print("→ cloudscraper POST attempt exception:", e)
-                    # try a slightly longer POST attempt as fallback
+                    # fallback: second POST with extended timeout
                     try:
                         r = s.post(
                             self.url,
@@ -235,6 +249,9 @@ class ChatAPI:
                     except Exception as e2:
                         print("→ cloudscraper fallback POST exception:", e2)
                         return None
+
+                if r is None:
+                    return None
 
                 print("→ cloudscraper status:", getattr(r, "status_code", None))
                 ct = (r.headers.get("Content-Type") or "").lower()
@@ -248,19 +265,15 @@ class ChatAPI:
                     except Exception:
                         print("→ cloudscraper returned invalid JSON; snippet:")
                         print(body[:1000])
-                        # continue to attempts to extract any embedded JSON below
 
-                # 4) If non-JSON HTML, attempt to extract embedded JSON (Next.js, __NEXT_DATA__, or window.* JSON blobs)
-                # try common patterns
+                # 4) If non-JSON HTML, attempt to extract embedded JSON (Next.js, __NEXT_DATA__, window.*)
                 try:
-                    # __NEXT_DATA__ JSON (common for Next.js SPA)
                     m = re.search(
                         r'<script[^>]*id=["\']__NEXT_DATA__["\'][^>]*>([\s\S]+?)</script>',
                         body,
                         flags=re.I,
                     )
                     if not m:
-                        # window.__INITIAL_STATE__ or window.__DATA__ = {...}
                         m = re.search(
                             r"window\.__[A-Z0-9_]+__\s*=\s*({[\s\S]+?});", body
                         )
@@ -273,7 +286,6 @@ class ChatAPI:
                             )
                             return data
                         except Exception:
-                            # try lenient JSON extraction (strip trailing ;)
                             try:
                                 data = json.loads(candidate.rstrip(" ;\n\r\t"))
                                 return data
@@ -282,7 +294,7 @@ class ChatAPI:
                 except Exception:
                     pass
 
-                # 5) If no JSON found, try a second targeted POST with adjusted headers (UA + Accept JSON)
+                # 5) Try a second targeted POST with adjusted headers (UA + Accept JSON)
                 try:
                     fallback_headers = dict(
                         getattr(self, "headers", {"Content-Type": "application/json"})
@@ -351,7 +363,7 @@ class ChatAPI:
                 return None
 
             except Exception as e:
-                print("→ cloudscraper attempt exception:", e)
+                print("→ cloudscraper attempt exception (top-level):", e)
                 traceback.print_exc()
                 return None
 
@@ -402,9 +414,9 @@ class ChatAPI:
                     page = ctx.new_page()
                     try:
                         page.goto(
-                            self.url.split("/api")[0],
+                            root_url,
                             wait_until="load",
-                            timeout=configured_timeout * 1000,
+                            timeout=max(30000, int(configured_timeout * 1000)),
                         )
                     except Exception as e:
                         print(
@@ -472,7 +484,7 @@ class ChatAPI:
         while True:
             attempt += 1
 
-            # Print log exactly like before
+            # Print log like original
             print(
                 f"\nAttempt #{attempt} — timeout={int(configured_timeout)}s — sending request..."
             )
@@ -515,7 +527,6 @@ class ChatAPI:
                         )
                         time.sleep(backoff + random.random())
                         backoff = min(backoff * 2, max_backoff)
-                        # grow attempt timeout modestly but cap it
                         configured_timeout = min(
                             configured_timeout + timeout_growth, max_timeout_cap
                         )
@@ -579,7 +590,6 @@ class ChatAPI:
                     if use_cloudscraper_on_403 and cloudscraper:
                         data = try_cloudscraper_once()
                         if isinstance(data, dict):
-                            # If solver returned success, return immediately
                             if data.get("status") == "success":
                                 resp_text = data.get("response", "")
                                 print(
@@ -621,7 +631,7 @@ class ChatAPI:
                                 "→ Playwright did not solve the challenge or returned non-JSON."
                             )
 
-                    # preserve original behavior of logging and then continuing attempts indefinitely
+                    # keep original behavior: backoff and continue infinite attempts
                     print(
                         "                                                                                 "
                     )
@@ -630,13 +640,12 @@ class ChatAPI:
                     )
                     time.sleep(backoff + random.random())
                     backoff = min(backoff * 2, max_backoff)
-                    # increase attempt timeout as before but keep it capped
                     configured_timeout = min(
                         configured_timeout + timeout_growth, max_timeout_cap
                     )
                     continue
 
-                # Handle client errors (4xx) - log snippet and keep retrying indefinitely (as requested)
+                # Handle client errors (4xx) - log snippet and keep retrying indefinitely
                 if 400 <= status < 500:
                     print(
                         "                                                                                 "
@@ -734,7 +743,6 @@ class ChatAPI:
                 continue
 
             except KeyboardInterrupt:
-                # let user abort with Ctrl+C
                 if spinner:
                     try:
                         spinner.stop()
@@ -743,7 +751,6 @@ class ChatAPI:
                 print("Interrupted by user. Aborting send_message.")
                 raise
             except Exception as e:
-                # unexpected top-level exception: log and continue infinite retries
                 if spinner:
                     try:
                         spinner.stop()
