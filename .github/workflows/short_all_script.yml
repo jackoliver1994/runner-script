@@ -1,4 +1,4 @@
-name: Run all script
+name: Run short all script
 
 on:
   workflow_dispatch:

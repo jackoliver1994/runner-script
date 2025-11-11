@@ -1,4 +1,4 @@
-name: Run single script
+name: Run short run script
 
 on:
   workflow_dispatch:
