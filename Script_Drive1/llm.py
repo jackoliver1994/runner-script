@@ -178,6 +178,8 @@ class ChatAPI:
         specific_error: list = [
             "✅ response status: 403",
             "⚠️ detected cloudflare-like anti-bot page",
+            "Response status=403 length=9245",
+            "⚠️ Detected HTML challenge / Cloudflare-like content.",
         ],
     ):
         """
