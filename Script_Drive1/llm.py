@@ -2000,7 +2000,7 @@ if __name__ == "__main__":
     script = pipeline.generate_script(
         niche="Preschool-early-elementary children",
         person="",
-        timing_minutes=10,
+        timing_minutes=2,
         timeout=100,
         topic="The Little Cloud Painter",
     )
@@ -2012,7 +2012,7 @@ if __name__ == "__main__":
     image_prompts = pipeline.generate_image_prompts(
         script_text=script,
         theme="water color illustrations, children's book, whimsical, vibrant colors Creativity + sharing + emotional regulation",
-        img_number=150,  # set smaller for testing; set 50 in production
+        img_number=30,  # set smaller for testing; set 50 in production
         batch_size=30,  # reduce if timeouts happen frequently
         timeout_per_call=100,
     )
