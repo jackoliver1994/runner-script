@@ -69,218 +69,6 @@ class ChatAPI:
         self.headers = {"Content-Type": "application/json"}
         self.base_timeout = default_timeout
 
-    def _load_proxies(self, force_refresh: bool = False) -> list:
-        """
-        Load proxies for rotation.
-
-        Behavior:
-        - If 'proxies.txt' exists and has proxies, load them.
-        - If empty or force_refresh=True, attempt to fetch a public list (ProxyScrape) as fallback.
-        - Returns a list of proxy strings like 'http://1.2.3.4:8080' or 'socks5://...'.
-        - Never raises; always returns a list (possibly empty).
-        """
-        import os
-        import requests
-        from time import time
-
-        proxies = []
-        local_path = "proxies.txt"
-
-        # Attempt to load from local file first (stable preference)
-        if os.path.exists(local_path) and not force_refresh:
-            try:
-                with open(local_path, "r", encoding="utf-8") as fh:
-                    for ln in fh:
-                        ln = ln.strip()
-                        if not ln or ln.startswith("#"):
-                            continue
-                        # simple normalization: if ip:port assume http
-                        if "://" not in ln:
-                            proxies.append("http://" + ln)
-                        else:
-                            proxies.append(ln)
-                if proxies:
-                    print(f"→ Loaded {len(proxies)} proxies from {local_path}")
-                    return proxies
-            except Exception as e:
-                print("→ Failed to read proxies.txt:", e)
-
-        # Try again to read proxies.txt if force_refresh requested (in case file was updated)
-        if os.path.exists(local_path) and force_refresh:
-            try:
-                with open(local_path, "r", encoding="utf-8") as fh:
-                    for ln in fh:
-                        ln = ln.strip()
-                        if not ln or ln.startswith("#"):
-                            continue
-                        if "://" not in ln:
-                            proxies.append("http://" + ln)
-                        else:
-                            proxies.append(ln)
-                if proxies:
-                    print(f"→ (force) Loaded {len(proxies)} proxies from {local_path}")
-                    return proxies
-            except Exception as e:
-                print("→ Failed to read proxies.txt on force_refresh:", e)
-
-        # Fallback: fetch public proxies (best-effort). If network blocked, continue with empty list.
-        try:
-            print("→ Attempting to fetch public proxies from ProxyScrape (fallback).")
-            resp = requests.get(
-                "https://api.proxyscrape.com/v2/?request=getproxies&protocol=http&timeout=10000&country=all&simplified=true",
-                timeout=12,
-            )
-            if resp.status_code == 200 and resp.text:
-                for ln in resp.text.splitlines():
-                    ln = ln.strip()
-                    if not ln:
-                        continue
-                    if ":" in ln:
-                        proxies.append("http://" + ln)
-            if proxies:
-                # Do not overwrite local file automatically, but inform user
-                print(f"→ Fetched {len(proxies)} public proxies (fallback).")
-                return proxies
-            else:
-                print("→ ProxyScrape returned empty list.")
-        except Exception as e:
-            print("→ Proxy fetch failed (ignored):", e)
-
-        # Final fallback: empty list (means no proxy rotation)
-        print("→ No proxies available (will attempt direct connections).")
-        return proxies
-
-    def _pick_proxy(self, proxies_deque) -> Optional[str]:
-        """
-        Return the next proxy from a rotating deque-like object.
-        If proxies_deque is empty or None -> return None.
-
-        Expectation:
-        - `proxies_deque` is a collections.deque or list that supports popleft/append for rotation.
-        - This function will not remove the proxy permanently; rotation is managed by caller.
-        """
-        try:
-            # If user passed a plain list, convert behaviour accordingly
-            if not proxies_deque:
-                return None
-            # If it's a deque, peek the leftmost element
-            from collections import deque
-
-            if isinstance(proxies_deque, deque):
-                return proxies_deque[0] if len(proxies_deque) else None
-            # if it's a list, return random choice only if length==1, otherwise return first to allow deterministic rotation
-            if isinstance(proxies_deque, list):
-                return proxies_deque[0] if proxies_deque else None
-            # fallback: try indexing
-            try:
-                return proxies_deque[0]
-            except Exception:
-                return None
-        except Exception:
-            return None
-
-    def _run_curl_impersonate(
-        self,
-        url: str,
-        payload_json: str,
-        headers: dict,
-        proxy: Optional[str],
-        timeout: int,
-        ua: Optional[str],
-    ) -> dict:
-        """
-        Run curl-impersonate (preferred) or plain curl (fallback) via subprocess and return dict:
-            {"ok": True, "status": int, "headers": dict, "text": str}
-        or {"ok": False, "exc": Exception}
-        This method is careful with quoting and timeouts.
-        """
-        import shutil, subprocess, json, shlex, tempfile, os, time
-
-        curl_bin = shutil.which("curl-impersonate") or shutil.which("curl")
-        if not curl_bin:
-            return {
-                "ok": False,
-                "exc": RuntimeError("curl-impersonate/curl not found on PATH"),
-            }
-
-        # build header args (ensure Content-Type and User-Agent present)
-        hdrs = dict(headers or {})
-        if ua:
-            hdrs["User-Agent"] = ua
-        if "Content-Type" not in {k.title() for k in hdrs.keys()}:
-            hdrs["Content-Type"] = "application/json"
-
-        header_args = []
-        for k, v in hdrs.items():
-            header_args += ["-H", f"{k}: {v}"]
-
-        # proxy arg
-        proxy_args = []
-        if proxy:
-            proxy_args = ["-x", proxy]
-
-        # timeout and silent flags
-        timeout_arg = ["--max-time", str(max(1, int(timeout)))]
-        # curl-impersonate may support HTTP/2; request it (best-effort)
-        curl_cmd = (
-            [curl_bin, "-sS", "--location", "--fail"]
-            + timeout_arg
-            + proxy_args
-            + ["-X", "POST"]
-            + header_args
-            + ["-d", payload_json, url]
-        )
-
-        # On some systems curl-impersonate may require specific impersonation profile flags; user requested chrome120 example,
-        # but many installations have built-in impersonation. If curl-impersonate is present, we let it pick defaults.
-        if os.path.basename(curl_bin).lower().startswith("curl-impersonate"):
-            # try to be explicit when available (safe if binary ignores unknown flag)
-            try:
-                curl_cmd.insert(
-                    1, "chrome120"
-                )  # sometimes accepted as first arg for curl-impersonate wrapper
-            except Exception:
-                pass
-
-        try:
-            proc = subprocess.run(
-                curl_cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=False,
-            )
-            out = proc.stdout.decode("utf-8", errors="replace")
-            err = proc.stderr.decode("utf-8", errors="replace")
-            rc = proc.returncode
-
-            # Heuristic: if curl returned non-zero, include stderr in response body for diagnostics.
-            if rc != 0:
-                # return as non-ok but keep stderr for logs
-                return {
-                    "ok": False,
-                    "exc": RuntimeError(f"curl returned rc={rc}: {err[:1000]}"),
-                }
-            # curl succeeded; we have raw body (likely JSON or HTML)
-            # We cannot easily extract response headers without -D to a temp file; keep simple: try parse JSON, otherwise return text.
-            try:
-                parsed = json.loads(out)
-                # if parsed contains status and response shape used by API, try to map; otherwise treat as body
-                return {
-                    "ok": True,
-                    "status": (
-                        int(parsed.get("status", 200))
-                        if isinstance(parsed, dict)
-                        else 200
-                    ),
-                    "headers": {},
-                    "text": out,
-                }
-            except Exception:
-                # fallback: return body text and assume 200
-                return {"ok": True, "status": 200, "headers": {}, "text": out}
-        except Exception as e:
-            return {"ok": False, "exc": e}
-
     def send_message(
         self,
         message: str,
@@ -293,23 +81,24 @@ class ChatAPI:
         use_cloudscraper_on_403: bool = True,
         use_playwright_on_403: bool = False,
         proxy: Optional[str] = None,
-        prefer_curl_impersonate: bool = True,
-        per_proxy_attempts: int = 10,  # NEW: how many tries to make per IP before rotating
     ) -> str:
         """
-        Enhanced send_message with per-proxy attempt-count and rotation.
+        Robust send_message — preserves original features (infinite retry, spinner, backoff, cloudscraper/playwright fallbacks),
+        but adds thorough URL validation/normalization to avoid invalid-root_url issues (e.g. 'https:/') and safer solver usage.
 
-        New behavior (per your request):
-        - Try the same proxy up to `per_proxy_attempts` times.
-        - If attempts fail, or 403/cloudflare-like challenge detected -> rotate to next proxy immediately.
-        - If proxies list is exhausted -> call _load_proxies(force_refresh=True) to refill, then continue.
-        - If 'proxy' param is provided, it will be used exclusively for all attempts (no rotation).
-        - All original features (curl-impersonate, cloudscraper, playwright, spinner, backoff, parsing) are preserved.
+        Notes:
+        - If self.url is misconfigured (no host), this will raise ValueError early (helps avoid infinite loops on bad config).
+        - All original features retained.
         """
-        import requests, time, random, json, traceback, concurrent.futures as cf, shutil
-        from collections import deque
+        import requests
+        import time
+        import random
+        import json
+        import traceback
+        import concurrent.futures as cf
+        from urllib.parse import urlparse, urlunparse
 
-        # lazy optional imports
+        # lazy optional imports for challenge-solving
         try:
             import cloudscraper
         except Exception:
@@ -327,19 +116,42 @@ class ChatAPI:
             except Exception:
                 PLAYWRIGHT_AVAILABLE = False
 
-        # session reuse for requests fallback
+        # ensure session reuse
         if not hasattr(self, "_session") or self._session is None:
             self._session = requests.Session()
         session = self._session
 
+        # Validate and normalize self.url -> ensure scheme + netloc
+        parsed = urlparse(self.url or "")
+        if not parsed.scheme:
+            # default to https if not provided
+            parsed = parsed._replace(scheme="https")
+        if not parsed.netloc:
+            # If path contains host-like component (e.g. "https:/host.com"), try quick fix:
+            # attempt to re-parse a common bad-case: "https:/" or "https:////host"
+            guessed = (self.url or "").replace(":///", "://").replace(":/", "://")
+            parsed2 = urlparse(guessed)
+            if parsed2.netloc:
+                parsed = parsed2
+            else:
+                raise ValueError(
+                    f"ChatAPI.send_message: invalid url configured for ChatAPI.url -> '{self.url}'. "
+                    "No host/netloc found. Please set a valid URL like 'https://example.com/api/chat'."
+                )
+        # root_url = scheme://netloc  (no trailing slash)
+        root_url = urlunparse((parsed.scheme, parsed.netloc, "", "", "", ""))
+
+        # initial timeout and backoff
         configured_timeout = int(timeout or getattr(self, "base_timeout", 60))
         configured_timeout = min(configured_timeout, max_timeout_cap)
         backoff = float(initial_backoff)
-        attempt_global = 0
+        attempt = 0
 
+        # track last solver times to avoid hammering them repeatedly
         last_solver_time = {"cloudscraper": 0.0, "playwright": 0.0}
-        SOLVER_MIN_INTERVAL = 30.0
+        SOLVER_MIN_INTERVAL = 30.0  # seconds between solver attempts
 
+        # spinner (if available in your codebase)
         spinner = None
         try:
             if "LoadingSpinner" in globals():
@@ -348,6 +160,9 @@ class ChatAPI:
             spinner = None
 
         def looks_like_html_challenge(status_code, text, headers):
+            """
+            Broader HTML-challenge detector (same heuristics as before).
+            """
             try:
                 if status_code in (403, 522):
                     return True
@@ -367,60 +182,20 @@ class ChatAPI:
                 pass
             return False
 
-        def _random_ua():
-            uas = [
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6091.104 Safari/537.36",
-            ]
-            return random.choice(uas)
-
-        def single_request(
-            sess, req_timeout, attempt_proxy=None, use_curl=False, ua=None
-        ):
-            try:
-                chosen_proxy = attempt_proxy
-                if not use_curl:
-                    headers = dict(
-                        getattr(self, "headers", {"Content-Type": "application/json"})
-                    ) or {"Content-Type": "application/json"}
-                    if ua:
-                        headers["User-Agent"] = ua
-                    proxies = (
-                        {"http": chosen_proxy, "https": chosen_proxy}
-                        if chosen_proxy
-                        else None
-                    )
-                    r = sess.post(
-                        self.url,
-                        headers=headers,
-                        json={"message": message},
-                        timeout=(10, req_timeout),
-                        proxies=proxies,
-                    )
-                    return {
-                        "ok": True,
-                        "status": r.status_code,
-                        "headers": dict(r.headers or {}),
-                        "text": r.text,
-                    }
-                else:
-                    headers = dict(
-                        getattr(self, "headers", {"Content-Type": "application/json"})
-                    ) or {"Content-Type": "application/json"}
-                    payload_json = json.dumps({"message": message}, ensure_ascii=False)
-                    curl_res = self._run_curl_impersonate(
-                        self.url, payload_json, headers, chosen_proxy, req_timeout, ua
-                    )
-                    return curl_res
-            except Exception as e:
-                return {"ok": False, "exc": e, "trace": traceback.format_exc()}
-
-        def try_cloudscraper_once(local_proxy=None):
-            # reuse existing logic (unchanged)
+        def try_cloudscraper_once():
+            """
+            Attempt to use cloudscraper once to solve a detected HTML challenge.
+            This function:
+            - honours SOLVER_MIN_INTERVAL frequency
+            - normalizes root_url and uses it for a GET seed
+            - retries a POST with safer/fallback headers if necessary
+            - extracts embedded JSON if present
+            Returns parsed JSON dict on success, None otherwise.
+            """
             if not cloudscraper:
                 print("→ cloudscraper not installed; skipping cloudscraper solver.")
                 return None
+
             now = time.time()
             if now - last_solver_time["cloudscraper"] < SOLVER_MIN_INTERVAL:
                 print(
@@ -428,15 +203,17 @@ class ChatAPI:
                 )
                 return None
             last_solver_time["cloudscraper"] = now
-            root_url = self.url.split("/api")[0] if "/api" in self.url else self.url
+
             try:
                 print(
                     "→ Trying cloudscraper to solve challenge (GET seed + POST attempt)..."
                 )
-                s = cloudscraper.create_scraper()
-                proxies = (
-                    {"http": local_proxy, "https": local_proxy} if local_proxy else None
-                )
+                s = (
+                    cloudscraper.create_scraper()
+                )  # may raise; let it surface and be caught below
+                proxies = {"http": proxy, "https": proxy} if proxy else None
+
+                # 1) seed cookies by GET to the root (helps many CF flows)
                 try:
                     g = s.get(
                         root_url,
@@ -449,6 +226,9 @@ class ChatAPI:
                     )
                 except Exception as ge:
                     print("→ cloudscraper GET seed failed (continuing to POST):", ge)
+
+                # 2) POST with configured timeout
+                r = None
                 try:
                     r = s.post(
                         self.url,
@@ -458,6 +238,7 @@ class ChatAPI:
                     )
                 except Exception as e:
                     print("→ cloudscraper POST attempt exception:", e)
+                    # fallback: second POST with extended timeout
                     try:
                         r = s.post(
                             self.url,
@@ -468,16 +249,24 @@ class ChatAPI:
                     except Exception as e2:
                         print("→ cloudscraper fallback POST exception:", e2)
                         return None
+
+                if r is None:
+                    return None
+
                 print("→ cloudscraper status:", getattr(r, "status_code", None))
                 ct = (r.headers.get("Content-Type") or "").lower()
                 body = r.text or ""
+
+                # 3) If JSON content-type -> parse and return
                 if "application/json" in ct:
                     try:
-                        return r.json()
+                        data = r.json()
+                        return data
                     except Exception:
                         print("→ cloudscraper returned invalid JSON; snippet:")
                         print(body[:1000])
-                # try common HTML-embedded JSON extraction (preserve original)
+
+                # 4) If non-JSON HTML, attempt to extract embedded JSON (Next.js, __NEXT_DATA__, window.*)
                 try:
                     m = re.search(
                         r'<script[^>]*id=["\']__NEXT_DATA__["\'][^>]*>([\s\S]+?)</script>',
@@ -504,7 +293,56 @@ class ChatAPI:
                                 pass
                 except Exception:
                     pass
-                # fallback save snippet then return None
+
+                # 5) Try a second targeted POST with adjusted headers (UA + Accept JSON)
+                try:
+                    fallback_headers = dict(
+                        getattr(self, "headers", {"Content-Type": "application/json"})
+                    )
+                    fallback_headers.update(
+                        {
+                            "Accept": "application/json, text/plain, */*",
+                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+                        }
+                    )
+                    print("→ cloudscraper retrying POST with fallback headers...")
+                    r2 = s.post(
+                        self.url,
+                        json={"message": message},
+                        headers=fallback_headers,
+                        timeout=max(60, configured_timeout),
+                        proxies=proxies,
+                    )
+                    print(
+                        "→ cloudscraper fallback POST status:",
+                        getattr(r2, "status_code", None),
+                    )
+                    ct2 = (r2.headers.get("Content-Type") or "").lower()
+                    if "application/json" in ct2:
+                        try:
+                            return r2.json()
+                        except Exception:
+                            print(
+                                "→ cloudscraper fallback returned invalid JSON; snippet:"
+                            )
+                            print((r2.text or "")[:1000])
+                    # try extract JSON again from fallback HTML
+                    body2 = r2.text or ""
+                    m2 = re.search(
+                        r'<script[^>]*id=["\']__NEXT_DATA__["\'][^>]*>([\s\S]+?)</script>',
+                        body2,
+                        flags=re.I,
+                    )
+                    if m2:
+                        try:
+                            return json.loads(m2.group(1))
+                        except Exception:
+                            pass
+                except Exception as e:
+                    print("→ cloudscraper fallback POST exception:", e)
+                    traceback.print_exc()
+
+                # 6) didn't produce parseable JSON — save an HTML snippet for offline debugging and return None
                 try:
                     snippet_path = os.path.join(
                         "debug_cloudscraper",
@@ -518,227 +356,193 @@ class ChatAPI:
                     )
                 except Exception as e_save:
                     print("→ Failed to save cloudscraper HTML snippet:", e_save)
+
                 print(
                     "→ cloudscraper did not solve the challenge or returned non-JSON."
                 )
                 return None
+
             except Exception as e:
-                print("→ cloudscraper attempt exception:", e)
+                print("→ cloudscraper attempt exception (top-level):", e)
                 traceback.print_exc()
                 return None
 
-        # prepare proxies deque (rotate)
-        from collections import deque
-
-        proxies_list = self._load_proxies() or []
-        proxies_deque = deque(proxies_list)
-
-        # Helper to get the next proxy and rotate
-        def _rotate_and_get_next(deq):
-            if not deq:
-                return None
-            # pop left and append to right (rotate)
-            p = deq.popleft()
-            deq.append(p)
-            return p
-
-        def _prepare_attempt_for_proxy(explicit_proxy=None):
-            # explicit proxy param supplied by caller -> use it always (no rotation)
-            chosen_proxy = (
-                explicit_proxy
-                if explicit_proxy
-                else (proxies_deque[0] if proxies_deque else None)
-            )
-            ua = _random_ua()
-            curl_available = bool(
-                shutil.which("curl-impersonate") or shutil.which("curl")
-            )
-            use_curl = prefer_curl_impersonate and curl_available
-            return chosen_proxy, ua, use_curl
-
-        print(
-            "send_message starting infinite retry+rotate loop (new per-proxy attempt flow)."
-        )
-        while True:
-            attempt_global += 1
-
-            # if explicit proxy provided, use it as single-proxy mode
-            if proxy:
-                current_proxy = proxy
-                proxy_queue_mode = False
-            else:
-                # if deque is empty -> refresh proxies (force)
-                if not proxies_deque:
-                    print("→ Proxy list exhausted. Attempting to refresh proxy list...")
-                    new_list = self._load_proxies(force_refresh=True)
-                    proxies_deque = deque(new_list or [])
-                    if not proxies_deque:
-                        print(
-                            "→ No proxies available after refresh; will attempt direct connections (proxy=None)."
-                        )
-                        current_proxy = None
-                        proxy_queue_mode = False
-                    else:
-                        current_proxy = proxies_deque[0]
-                        proxy_queue_mode = True
-                else:
-                    current_proxy = proxies_deque[0]
-                    proxy_queue_mode = True
-
-            # Try up to `per_proxy_attempts` on current_proxy before rotating
-            per_proxy_try = 0
-            while per_proxy_try < max(1, int(per_proxy_attempts)):
-                per_proxy_try += 1
-                print(
-                    f"\nGlobal attempt #{attempt_global} — Proxy try {per_proxy_try}/{per_proxy_attempts} — proxy={current_proxy or 'DIRECT'}"
+        def single_request(sess, req_timeout):
+            """Perform a single POST using provided session; returns dict with ok/status/headers/text or ok=False and exc."""
+            try:
+                headers = getattr(
+                    self, "headers", getattr(self, "default_headers", None)
                 )
-                if spinner:
+                if headers is None:
+                    headers = {
+                        "Content-Type": "application/json",
+                        "Accept": "application/json",
+                    }
+                proxies = {"http": proxy, "https": proxy} if proxy else None
+                r = sess.post(
+                    self.url,
+                    headers=headers,
+                    json={"message": message},
+                    timeout=(10, req_timeout),
+                    proxies=proxies,
+                )
+                return {
+                    "ok": True,
+                    "status": r.status_code,
+                    "headers": dict(r.headers or {}),
+                    "text": r.text,
+                }
+            except Exception as e:
+                return {"ok": False, "exc": e, "trace": traceback.format_exc()}
+
+        def try_playwright_once():
+            if not PLAYWRIGHT_AVAILABLE:
+                print("→ Playwright not available; skipping Playwright solver.")
+                return None
+            now = time.time()
+            if now - last_solver_time["playwright"] < SOLVER_MIN_INTERVAL:
+                print("→ Playwright attempted recently; skipping immediate re-attempt.")
+                return None
+            last_solver_time["playwright"] = now
+            try:
+                print("→ Trying Playwright (headless) to solve challenge...")
+                from playwright.sync_api import sync_playwright
+
+                with sync_playwright() as p:
+                    browser = p.chromium.launch(headless=True)
+                    ctx = browser.new_context()
+                    page = ctx.new_page()
                     try:
-                        spinner.start()
+                        page.goto(
+                            root_url,
+                            wait_until="load",
+                            timeout=max(30000, int(configured_timeout * 1000)),
+                        )
+                    except Exception as e:
+                        print(
+                            "→ Playwright navigation exception (may still set cookies):",
+                            e,
+                        )
+                    time.sleep(2)
+                    cookies = ctx.cookies()
+                    ua = page.evaluate("() => navigator.userAgent")
+                    browser.close()
+                # use requests session with cookies & ua
+                s = requests.Session()
+                for c in cookies:
+                    try:
+                        s.cookies.set(
+                            c.get("name"),
+                            c.get("value"),
+                            domain=c.get("domain"),
+                            path=c.get("path", "/"),
+                        )
                     except Exception:
                         pass
+                headers = dict(
+                    getattr(
+                        self,
+                        "headers",
+                        getattr(
+                            self,
+                            "default_headers",
+                            {"Content-Type": "application/json"},
+                        ),
+                    )
+                )
+                headers["User-Agent"] = ua
+                proxies = {"http": proxy, "https": proxy} if proxy else None
+                r = s.post(
+                    self.url,
+                    json={"message": message},
+                    headers=headers,
+                    timeout=configured_timeout,
+                    proxies=proxies,
+                )
+                print("→ Playwright-backed request status:", r.status_code)
+                ct = (r.headers.get("Content-Type") or "").lower()
+                if "application/json" in ct:
+                    try:
+                        return r.json()
+                    except Exception:
+                        print("→ Playwright returned invalid JSON; snippet:")
+                        print((r.text or "")[:1000])
+                        return None
+                else:
+                    print("→ Playwright returned non-JSON snippet:")
+                    print((r.text or "")[:1000])
+                    return None
+            except Exception as e:
+                print("→ Playwright attempt exception:", e)
+                traceback.print_exc()
+                return None
 
+        print(
+            "send_message starting infinite retry loop (preserving original log style)."
+        )
+        # infinite retry loop until success
+        while True:
+            attempt += 1
+
+            # Print log like original
+            print(
+                f"\nAttempt #{attempt} — timeout={int(configured_timeout)}s — sending request..."
+            )
+
+            # start spinner if available
+            if spinner:
                 try:
-                    # prepare UA/curl flag for this attempt
-                    attempt_ua = _random_ua()
-                    attempt_use_curl = bool(
-                        prefer_curl_impersonate
-                        and (shutil.which("curl-impersonate") or shutil.which("curl"))
-                    )
-                    # run request in ThreadPool (keeps original behavior)
-                    with cf.ThreadPoolExecutor(max_workers=1) as ex:
-                        fut = ex.submit(
-                            single_request,
-                            session,
-                            configured_timeout,
-                            current_proxy,
-                            attempt_use_curl,
-                            attempt_ua,
-                        )
-                        try:
-                            wrapper = fut.result(timeout=configured_timeout + 5)
-                        except cf.TimeoutError:
-                            try:
-                                fut.cancel()
-                            except Exception:
-                                pass
-                            try:
-                                session.close()
-                            except Exception:
-                                pass
-                            self._session = requests.Session()
-                            session = self._session
-                            if spinner:
-                                try:
-                                    spinner.stop()
-                                except Exception:
-                                    pass
-                            print(
-                                f"⚠️ Attempt timed out after {configured_timeout}s (proxy={current_proxy or 'DIRECT'})."
-                            )
-                            # immediate rotate proxy on timeout (user asked "try try try then change ip")
-                            per_proxy_try = per_proxy_attempts  # force rotation after this inner loop
-                            break
-                        except Exception as e:
-                            if spinner:
-                                try:
-                                    spinner.stop()
-                                except Exception:
-                                    pass
-                            print("⚠️ Exception while waiting for request future:", e)
-                            traceback.print_exc()
-                            # treat as a failure for this proxy attempt; try again until per_proxy_attempts
-                            time.sleep(backoff + random.random())
-                            continue
+                    spinner.start()
+                except Exception:
+                    pass
 
-                    if spinner:
+            try:
+                # run request in thread to enforce attempt-level timeout and avoid blocking
+                with cf.ThreadPoolExecutor(max_workers=1) as ex:
+                    fut = ex.submit(single_request, session, configured_timeout)
+                    try:
+                        wrapper = fut.result(timeout=configured_timeout + 5)
+                    except cf.TimeoutError:
+                        # attempt timed out - best-effort cleanup and retry after backoff
                         try:
-                            spinner.stop()
+                            fut.cancel()
                         except Exception:
                             pass
-
-                    if not wrapper.get("ok"):
-                        exc = wrapper.get("exc")
-                        print(f"⚠️ Network/worker exception: {exc!r}")
                         try:
-                            print(wrapper.get("trace"))
+                            session.close()
                         except Exception:
                             pass
-                        # on network-level exception -> rotate immediately (user wants change IP when fails)
-                        per_proxy_try = (
-                            per_proxy_attempts  # force rotation after this inner loop
-                        )
-                        break
-
-                    status = int(wrapper.get("status", 0) or 0)
-                    headers = wrapper.get("headers") or {}
-                    body = wrapper.get("text") or ""
-
-                    print(
-                        f"✅ Response status: {status} (proxy={current_proxy or 'DIRECT'})"
-                    )
-
-                    # Detect Cloudflare-like challenge -> use cloudflare solver then rotate if unsolved
-                    if looks_like_html_challenge(status, body, headers):
-                        print(
-                            "⚠️ Detected Cloudflare-like anti-bot page (HTTP 403/522)."
-                        )
-                        if use_cloudscraper_on_403 and cloudscraper:
-                            data = try_cloudscraper_once(local_proxy=current_proxy)
-                            if isinstance(data, dict):
-                                if data.get("status") == "success":
-                                    resp_text = data.get("response", "")
-                                    print(
-                                        "⚠️ cloudscraper returned status=success — returning response."
-                                    )
-                                    return resp_text
-                                else:
-                                    print(
-                                        "→ cloudscraper returned JSON but not status==success (snippet)."
-                                    )
-                            else:
-                                print(
-                                    "→ cloudscraper did not solve the challenge or returned non-JSON."
-                                )
-                        if use_playwright_on_403 and PLAYWRIGHT_AVAILABLE:
-                            # attempt a playwright solver (optional) - keep original behaviour if implemented
+                        self._session = requests.Session()
+                        session = self._session
+                        if spinner:
                             try:
-                                # NOTE: kept as placeholder calling existing try_playwright_once if present
-                                if "try_playwright_once" in globals():
-                                    data = try_playwright_once()
-                                else:
-                                    data = None
+                                spinner.stop()
                             except Exception:
-                                data = None
-                            if (
-                                isinstance(data, dict)
-                                and data.get("status") == "success"
-                            ):
-                                resp_text = data.get("response", "")
-                                print(
-                                    "⚠️ Playwright-backed request returned status=success — returning response."
-                                )
-                                return resp_text
-                        # If solver didn't return success — rotate proxy now (user requested immediate rotation on 403)
-                        print("→ Rotating proxy due to anti-bot detection.")
-                        per_proxy_try = per_proxy_attempts
-                        break
-
-                    # Treat 4xx/5xx/429 similar to original, but rotate on persistent failures:
-                    if 400 <= status < 500:
-                        print(f"⚠️ Client error HTTP {status}. Response snippet:")
-                        print((body or "")[:1000])
-                        # rotate immediately (client errors often tied to IP or blocked)
-                        per_proxy_try = per_proxy_attempts
-                        break
-
-                    if status == 429 or 500 <= status < 600:
+                                pass
                         print(
-                            f"⚠️ Server error / rate-limit HTTP {status}. Response snippet:"
+                            "                                                                                 "
                         )
-                        print((body or "")[:1000])
-                        # treat as transient, but we will retry on same proxy up to per_proxy_attempts, unless it's an immediate block
-                        # small sleep then continue on same proxy
+                        print(
+                            f"⚠️ Attempt #{attempt} timed out after {configured_timeout}s. Backing off {backoff:.1f}s..."
+                        )
+                        time.sleep(backoff + random.random())
+                        backoff = min(backoff * 2, max_backoff)
+                        configured_timeout = min(
+                            configured_timeout + timeout_growth, max_timeout_cap
+                        )
+                        continue
+                    except Exception as e:
+                        # unexpected issue waiting on future
+                        if spinner:
+                            try:
+                                spinner.stop()
+                            except Exception:
+                                pass
+                        print(
+                            "                                                                                 "
+                        )
+                        print("⚠️ Exception while waiting for request future:", e)
+                        traceback.print_exc()
                         time.sleep(backoff + random.random())
                         backoff = min(backoff * 2, max_backoff)
                         configured_timeout = min(
@@ -746,47 +550,23 @@ class ChatAPI:
                         )
                         continue
 
-                    # Try parse JSON as before
-                    ct = (headers.get("Content-Type") or "").lower()
-                    parsed = None
-                    if "application/json" in ct or (
-                        isinstance(body, str)
-                        and (
-                            body.strip().startswith("{") or body.strip().startswith("[")
-                        )
-                    ):
-                        try:
-                            parsed = json.loads(body) if body else {}
-                        except Exception:
-                            print("⚠️ Failed to parse JSON response. Snippet:")
-                            print((body or "")[:1000])
-                            # parsing failure: treat as failed attempt; will retry same proxy up to per_proxy_attempts
-                            time.sleep(backoff + random.random())
-                            continue
-                    else:
-                        # non-JSON but not HTML-challenge -> return text if acceptable, else rotate
-                        print(
-                            "⚠️ Received non-JSON response (not an HTML challenge). Snippet:"
-                        )
-                        print((body or "")[:1000])
-                        # For safety, rotate after first such non-JSON to change IP quickly
-                        per_proxy_try = per_proxy_attempts
-                        break
-
-                    if isinstance(parsed, dict) and parsed.get("status") == "success":
-                        resp_text = parsed.get("response", "")
-                        print("✅ API returned status=success. Returning response.")
-                        return resp_text
-
-                    # JSON but not status==success -> backoff & retry (same proxy) until per_proxy_attempts exhausted
-                    print(
-                        "→ API returned JSON but not status==success. Payload snippet:"
-                    )
+                if spinner:
                     try:
-                        print(json.dumps(parsed, indent=2)[:1000])
+                        spinner.stop()
                     except Exception:
-                        print(parsed)
-                    # If this persists across multiple tries on same proxy, we'll rotate eventually
+                        pass
+
+                if not wrapper.get("ok"):
+                    # network exception inside worker
+                    exc = wrapper.get("exc")
+                    print(
+                        "                                                                                 "
+                    )
+                    print(f"⚠️ Network/worker exception on attempt #{attempt}: {exc!r}")
+                    try:
+                        print(wrapper.get("trace"))
+                    except Exception:
+                        pass
                     time.sleep(backoff + random.random())
                     backoff = min(backoff * 2, max_backoff)
                     configured_timeout = min(
@@ -794,49 +574,167 @@ class ChatAPI:
                     )
                     continue
 
-                except KeyboardInterrupt:
-                    if spinner:
-                        try:
-                            spinner.stop()
-                        except Exception:
-                            pass
-                    print("Interrupted by user. Aborting send_message.")
-                    raise
-                except Exception as e:
-                    if spinner:
-                        try:
-                            spinner.stop()
-                        except Exception:
-                            pass
-                    print("⚠️ Unexpected exception in send_message attempt:", e)
-                    traceback.print_exc()
-                    # treat as failure for this proxy attempt and continue
+                status = int(wrapper.get("status", 0) or 0)
+                headers = wrapper.get("headers") or {}
+                body = wrapper.get("text") or ""
+
+                print(
+                    "                                                                                 "
+                )
+                print(f"✅ Response status: {status}")
+
+                # Detect Cloudflare-like challenge and log identical message
+                if looks_like_html_challenge(status, body, headers):
+                    print("⚠️ Detected Cloudflare-like anti-bot page (HTTP 403).")
+                    # Try cloudscraper once per-challenge (best-effort)
+                    if use_cloudscraper_on_403 and cloudscraper:
+                        data = try_cloudscraper_once()
+                        if isinstance(data, dict):
+                            if data.get("status") == "success":
+                                resp_text = data.get("response", "")
+                                print(
+                                    "⚠️ cloudscraper returned status=success — returning response."
+                                )
+                                return resp_text
+                            else:
+                                print(
+                                    "→ cloudscraper returned JSON but not status==success (snippet):"
+                                )
+                                try:
+                                    print(json.dumps(data, indent=2)[:1000])
+                                except Exception:
+                                    print(data)
+                        else:
+                            print(
+                                "→ cloudscraper did not solve the challenge or returned non-JSON."
+                            )
+                    # Try Playwright once if enabled
+                    if use_playwright_on_403 and PLAYWRIGHT_AVAILABLE:
+                        data = try_playwright_once()
+                        if isinstance(data, dict):
+                            if data.get("status") == "success":
+                                resp_text = data.get("response", "")
+                                print(
+                                    "⚠️ Playwright-backed request returned status=success — returning response."
+                                )
+                                return resp_text
+                            else:
+                                print(
+                                    "→ Playwright returned JSON but not status==success (snippet):"
+                                )
+                                try:
+                                    print(json.dumps(data, indent=2)[:1000])
+                                except Exception:
+                                    print(data)
+                        else:
+                            print(
+                                "→ Playwright did not solve the challenge or returned non-JSON."
+                            )
+
+                    # keep original behavior: backoff and continue infinite attempts
+                    print(
+                        "                                                                                 "
+                    )
+                    print(
+                        "Attempt continuing after Cloudflare detection; backing off before next attempt."
+                    )
                     time.sleep(backoff + random.random())
+                    backoff = min(backoff * 2, max_backoff)
+                    configured_timeout = min(
+                        configured_timeout + timeout_growth, max_timeout_cap
+                    )
                     continue
 
-            # --- finished tries for this proxy (either exhausted or forced rotation) ---
-            # If we are in queue mode, rotate to next proxy
-            if proxy is None and proxies_deque:
-                # rotate deque to next proxy (previous first element goes to end)
-                try:
-                    rotated = _rotate_and_get_next(proxies_deque)
+                # Handle client errors (4xx) - log snippet and keep retrying indefinitely
+                if 400 <= status < 500:
                     print(
-                        f"→ Rotated proxy. Next proxy now: {proxies_deque[0] if proxies_deque else 'NONE'}"
+                        "                                                                                 "
                     )
-                except Exception:
-                    pass
-            else:
-                # If explicit proxy was provided (single-proxy mode), we won't rotate; just backoff and retry
-                print(
-                    "→ Using explicit proxy param or no proxies. Continuing after backoff..."
-                )
+                    print(f"⚠️ Client error HTTP {status}. Response snippet:")
+                    print((body or "")[:1000])
+                    print("Attempt continuing (infinite retry mode). Backing off...")
+                    time.sleep(backoff + random.random())
+                    backoff = min(backoff * 2, max_backoff)
+                    configured_timeout = min(
+                        configured_timeout + timeout_growth, max_timeout_cap
+                    )
+                    continue
 
-            # If proxies empty after rotation/refill attempt, try to refresh next loop iteration (handled at top)
-            if not proxies_deque:
-                # try to refresh once before next global loop
+                # Handle server errors (5xx) or rate limits
+                if status == 429 or 500 <= status < 600:
+                    print(
+                        "                                                                                 "
+                    )
+                    print(
+                        f"⚠️ Server error / rate-limit HTTP {status}. Response snippet:"
+                    )
+                    print((body or "")[:1000])
+                    print("Attempt continuing after backoff...")
+                    time.sleep(backoff + random.random())
+                    backoff = min(backoff * 2, max_backoff)
+                    configured_timeout = min(
+                        configured_timeout + timeout_growth, max_timeout_cap
+                    )
+                    continue
+
+                # Try parse JSON
+                ct = (headers.get("Content-Type") or "").lower()
+                parsed = None
+                if "application/json" in ct or (
+                    isinstance(body, str)
+                    and (body.strip().startswith("{") or body.strip().startswith("["))
+                ):
+                    try:
+                        parsed = json.loads(body) if body else {}
+                    except Exception:
+                        print(
+                            "                                                                                 "
+                        )
+                        print("⚠️ Failed to parse JSON response. Snippet:")
+                        print((body or "")[:1000])
+                        print("Will continue retrying...")
+                        time.sleep(backoff + random.random())
+                        backoff = min(backoff * 2, max_backoff)
+                        configured_timeout = min(
+                            configured_timeout + timeout_growth, max_timeout_cap
+                        )
+                        continue
+                else:
+                    # non-json non-html: log and continue
+                    print(
+                        "                                                                                 "
+                    )
+                    print(
+                        "⚠️ Received non-JSON response (not an HTML challenge). Snippet:"
+                    )
+                    print((body or "")[:1000])
+                    print("Attempt continuing (infinite retry mode).")
+                    time.sleep(backoff + random.random())
+                    backoff = min(backoff * 2, max_backoff)
+                    configured_timeout = min(
+                        configured_timeout + timeout_growth, max_timeout_cap
+                    )
+                    continue
+
+                # If parsed JSON exists, check for expected success
+                if isinstance(parsed, dict) and parsed.get("status") == "success":
+                    resp_text = parsed.get("response", "")
+                    print(
+                        "                                                                                 "
+                    )
+                    print("✅ API returned status=success. Returning response.")
+                    return resp_text
+
+                # JSON present but not success -> log and continue
                 print(
-                    "→ Proxy deque empty, will attempt refresh on next loop iteration."
+                    "                                                                                 "
                 )
+                print("→ API returned JSON but not status==success. Payload snippet:")
+                try:
+                    print(json.dumps(parsed, indent=2)[:2000])
+                except Exception:
+                    print(parsed)
+                print("Attempt continuing (infinite retry mode).")
                 time.sleep(backoff + random.random())
                 backoff = min(backoff * 2, max_backoff)
                 configured_timeout = min(
@@ -844,15 +742,32 @@ class ChatAPI:
                 )
                 continue
 
-            # small backoff before next per-proxy attempt sequence
-            time.sleep(min(1.0, backoff) + random.random() * 0.5)
-            backoff = min(backoff * 2, max_backoff)
-            configured_timeout = min(
-                configured_timeout + timeout_growth, max_timeout_cap
-            )
-
-        # the loop is infinite by design; this line should never be reached
-        raise RuntimeError("send_message loop terminated unexpectedly.")
+            except KeyboardInterrupt:
+                if spinner:
+                    try:
+                        spinner.stop()
+                    except Exception:
+                        pass
+                print("Interrupted by user. Aborting send_message.")
+                raise
+            except Exception as e:
+                if spinner:
+                    try:
+                        spinner.stop()
+                    except Exception:
+                        pass
+                print(
+                    "                                                                                 "
+                )
+                print("⚠️ Unexpected exception in send_message loop:", e)
+                traceback.print_exc()
+                print("Attempt continuing after backoff...")
+                time.sleep(backoff + random.random())
+                backoff = min(backoff * 2, max_backoff)
+                configured_timeout = min(
+                    configured_timeout + timeout_growth, max_timeout_cap
+                )
+                continue
 
 
 # ---------------------- UTILITIES ----------------------
@@ -1015,95 +930,6 @@ def clean_script_text(script_text: str) -> str:
     s = re.sub(r'([.!?])\s*([A-Z0-9"\'])', r"\1 \2", s)
 
     return s
-
-
-def generate_initial_script(
-    self, max_attempts: int = 6, initial_wait_max: float = 10.0
-):
-    """
-    Improved generate_initial_script that:
-      - adds seeded jitter so many parallel runners don't collide
-      - logs attempts clearly
-      - still retries (you keep infinite retry semantics by passing large max_attempts or looping externally),
-        but by default will try up to max_attempts with exponential backoff + random jitter between attempts.
-    """
-    import os
-    import time
-    import random
-    import traceback
-
-    # Seeded jitter to avoid thundering herd across many parallel GitHub workflows
-    try:
-        seed_base = int(
-            os.environ.get("GITHUB_RUN_NUMBER")
-            or os.environ.get("CI_PIPELINE_ID")
-            or random.randint(0, 9999)
-        )
-    except Exception:
-        seed_base = random.randint(0, 9999)
-    random.seed(seed_base + int(time.time() % 10000))
-    initial_jitter = random.uniform(0, float(initial_wait_max))
-    print(f"Generating initial script (starting jitter {initial_jitter:.2f}s) ...")
-    time.sleep(initial_jitter)
-
-    attempt = 0
-    backoff = 1.0
-    max_backoff = 60.0
-
-    # If you really want an infinite loop, call this with while True externally
-    while True:
-        attempt += 1
-        print(f"Generating initial script (attempt {attempt})... ⠋")
-        try:
-            # Invoke existing internal function that generates the script; keep your current logic untouched.
-            # I assume you had something like: script = self._generate_script() — replace below with your real call.
-            # Keep all features — do not remove anything inside the generation process.
-            script = None
-            # If your code already has a function like _generate_initial_script, call it:
-            if hasattr(self, "_generate_initial_script"):
-                script = self._generate_initial_script()
-            elif hasattr(self, "build_script"):
-                script = self.build_script()
-            else:
-                # fallback placeholder - preserve behavior by attempting the generic entrypoint if your module expects it
-                # If none exist, raise to surface the mismatch quickly.
-                raise RuntimeError(
-                    "generate_initial_script: cannot find internal generation entrypoint (expected _generate_initial_script or build_script)"
-                )
-
-            # If generator returned successfully, return it
-            print("Generating initial script done.")
-            return script
-
-        except KeyboardInterrupt:
-            print("User interrupted initial script generation.")
-            raise
-        except Exception as e:
-            # robust logging and backoff — avoids tight loops across parallel runs
-            print(
-                "                                                                                 "
-            )
-            print(
-                "⚠️ Exception while generating initial script (will back off and retry):",
-                e,
-            )
-            try:
-                traceback.print_exc()
-            except Exception:
-                pass
-
-            # If many runs are happening concurrently, randomize backoff
-            jitter = random.random() * backoff
-            wait_for = min(max_backoff, backoff + jitter)
-            print(
-                f"Attempt continuing after generation failure; backing off {wait_for:.1f}s before next attempt."
-            )
-            time.sleep(wait_for)
-            backoff = min(backoff * 2, max_backoff)
-
-            # If user passed max_attempts and we've exceeded it, still continue if you want infinite - here we keep infinite
-            # but you can change to `if attempt >= max_attempts: raise` to stop after some tries.
-            continue
 
 
 # ---------------------- STORY / ASSET PIPELINE ----------------------
@@ -2203,7 +2029,7 @@ if __name__ == "__main__":
     script = pipeline.generate_script(
         niche="Preschool-early-elementary children",
         person="",
-        timing_minutes=2,
+        timing_minutes=10,
         timeout=100,
         topic="The Little Cloud Painter",
     )
@@ -2215,7 +2041,7 @@ if __name__ == "__main__":
     image_prompts = pipeline.generate_image_prompts(
         script_text=script,
         theme="water color illustrations, children's book, whimsical, vibrant colors Creativity + sharing + emotional regulation",
-        img_number=30,  # set smaller for testing; set 50 in production
+        img_number=150,  # set smaller for testing; set 50 in production
         batch_size=30,  # reduce if timeouts happen frequently
         timeout_per_call=100,
     )
