@@ -303,8 +303,8 @@ class ChatAPI:
                     try:
                         return r.json()
                     except Exception:
-                        return None
-                return None
+                        return ""
+                return ""
             except Exception:
                 return None
 
@@ -371,8 +371,8 @@ class ChatAPI:
                     try:
                         return r.json()
                     except Exception:
-                        return None
-                return None
+                        return ""
+                return ""
             except Exception:
                 return None
 
@@ -380,162 +380,281 @@ class ChatAPI:
         current_proxy = proxy
         current_headers = dict(getattr(self, "headers", {"Content-Type": "application/json"}))
 
-        # === Ensure proxy pool is initialized and pick an initial proxy if none supplied ===
-        try:
-            # lazy init pool if empty
-            if not hasattr(self, "_proxy_pool") or not self._proxy_pool:
-                print("Initializing proxy pool (lazy fetch)...")
-                # small, safe fetch to prime the pool (tune max_proxies as needed)
+        # --- proxy failure handling state (add near top of send_message) ---
+        PROXY_FAIL_THRESHOLD = 3          # after this many consecutive proxy errors -> rotate
+        consec_proxy_failures = 0         # consecutive failures for the active proxy
+        last_proxy_used = current_proxy   # track which proxy we're counting failures for
+
+        # If _rotate_proxy is nested inside send_message, ensure it updates closure variables
+        def _rotate_proxy(reason="unknown"):
+            nonlocal current_proxy, current_headers, consec_proxy_failures, last_proxy_used
+            try:
+                print(f"Rotating proxy due to: {reason}")
+                new_p, new_h = self._pick_next_proxy_and_impersonation()
+                current_proxy = new_p
+                if isinstance(new_h, dict) and new_h.get("User-Agent"):
+                    current_headers = new_h
+                consec_proxy_failures = 0
+                last_proxy_used = current_proxy
+                print(f"Rotated -> new_proxy={current_proxy} pool_size={len(getattr(self,'_proxy_pool',[]))}")
+            except Exception as e:
+                print("Rotation attempt failed (will keep current proxy):", e)
+
+                # === Ensure proxy pool is initialized and pick an initial proxy if none supplied ===
                 try:
-                    self._proxy_pool = self.fetch_proxies_from_proxyscrape(max_proxies=500)
+                    # lazy init pool if empty
+                    if not hasattr(self, "_proxy_pool") or not self._proxy_pool:
+                        print("Initializing proxy pool (lazy fetch)...")
+                        # small, safe fetch to prime the pool (tune max_proxies as needed)
+                        try:
+                            self._proxy_pool = self.fetch_proxies_from_proxyscrape(max_proxies=500)
+                        except Exception as e:
+                            print("Proxy fetch failed:", e)
+                            self._proxy_pool = []
+
+                    # if no proxy argument was supplied, pick one now
+                    if current_proxy is None and getattr(self, "_proxy_pool", None):
+                        new_proxy, new_headers = self._pick_next_proxy_and_impersonation()
+                        current_proxy = new_proxy
+                        # only replace headers if we actually got something useful
+                        if isinstance(new_headers, dict) and new_headers.get("User-Agent"):
+                            current_headers = new_headers
+                    print(f"Proxy pool size={len(getattr(self,'_proxy_pool',[]))}, starting proxy={current_proxy or '<none>'}")
                 except Exception as e:
-                    print("Proxy fetch failed:", e)
+                    print("Proxy initialization debug:", e)
+
+                # ensure proxy pool object present for rotation (lazy)
+                if not hasattr(self, "_proxy_pool"):
                     self._proxy_pool = []
 
-            # if no proxy argument was supplied, pick one now
-            if current_proxy is None and getattr(self, "_proxy_pool", None):
-                new_proxy, new_headers = self._pick_next_proxy_and_impersonation()
-                current_proxy = new_proxy
-                # only replace headers if we actually got something useful
-                if isinstance(new_headers, dict) and new_headers.get("User-Agent"):
-                    current_headers = new_headers
-            print(f"Proxy pool size={len(getattr(self,'_proxy_pool',[]))}, starting proxy={current_proxy or '<none>'}")
-        except Exception as e:
-            print("Proxy initialization debug:", e)
-
-        # ensure proxy pool object present for rotation (lazy)
-        if not hasattr(self, "_proxy_pool"):
-            self._proxy_pool = []
-
-        # --- Proxy formatting helper (safe for socks/http/none) ---
-        def single_request(*args, **kwargs):
-            """
-            Robust single_request that tolerates multiple calling conventions:
-            - (sess, req_timeout, use_headers, use_proxy)  <-- what the executor currently passes
-            - (timeout,) or (req_timeout,)                  <-- some earlier helper versions
-            - keyword args: sess=..., req_timeout=..., use_headers=..., use_proxy=...
-
-            Returns the same wrapper dict your code expects:
-            {"ok": True, "status": int, "headers": dict, "text": str} OR
-            {"ok": False, "exc": Exception, "trace": traceback}
-            """
-            try:
-                # map positional args
-                sess = None
-                req_timeout = None
-                use_headers = None
-                use_proxy = None
-
-                if args:
-                    # common executor call: (session, configured_timeout, current_headers, current_proxy)
-                    if len(args) >= 4:
-                        sess, req_timeout, use_headers, use_proxy = args[0:4]
-                    elif len(args) == 3:
-                        sess, req_timeout, use_headers = args
-                    elif len(args) == 2:
-                        sess, req_timeout = args
-                    elif len(args) == 1:
-                        # some versions pass only timeout or only session — be defensive
-                        first = args[0]
-                        # guess: a Session object has .post; timeout is int/float
-                        if hasattr(first, "post"):
-                            sess = first
-                        else:
-                            req_timeout = first
-
-                # override with kwargs if present
-                sess = kwargs.get("sess", sess)
-                req_timeout = kwargs.get("req_timeout", kwargs.get("timeout", req_timeout))
-                use_headers = kwargs.get("use_headers", kwargs.get("headers", use_headers))
-                use_proxy = kwargs.get("use_proxy", kwargs.get("proxy", use_proxy))
-
-                # fallback to outer-scope names if still None (so this nested fn captures them)
-                if sess is None:
-                    sess = locals().get("session") or globals().get("session") or getattr(self, "_session", None)
-                if req_timeout is None:
-                    req_timeout = locals().get("configured_timeout") or kwargs.get("timeout") or getattr(self, "base_timeout", 60)
-                if use_headers is None:
-                    use_headers = locals().get("current_headers") or dict(getattr(self, "headers", {"Content-Type": "application/json"}))
-                if use_proxy is None:
-                    use_proxy = locals().get("current_proxy") or kwargs.get("proxy") or None
-
-                # ensure we have a session object
-                if sess is None:
-                    import requests
-                    sess = requests.Session()
-
-                # proxy formatting helper (same robust logic)
-                def _format_proxy_for_requests(p):
-                    if not p:
-                        return None
-                    p = str(p).strip()
-                    if p.startswith(("http://", "https://", "socks5://", "socks4://")):
-                        return p
-                    if "socks" in p.lower():
-                        return "socks5://" + p.split("://")[-1]
-                    return "http://" + p
-
-                proxies_cfg = None
-                if use_proxy:
-                    proxy_url = _format_proxy_for_requests(use_proxy)
-                    if proxy_url:
-                        proxies_cfg = {"http": proxy_url, "https": proxy_url}
-
-                # debug print so logs show exactly what's used per attempt
-                print(f"single_request() — session={'yes' if sess else 'no'} — timeout={req_timeout} — proxy={use_proxy or '<none>'}")
-
-                # perform the POST as your original function did (json payload with message)
-                r = sess.post(
-                    self.url,
-                    headers=use_headers,
-                    json={"message": message},
-                    timeout=(10, int(req_timeout) if req_timeout else None),
-                    proxies=proxies_cfg,
-                )
-                return {
-                    "ok": True,
-                    "status": r.status_code,
-                    "headers": dict(r.headers or {}),
-                    "text": r.text,
-                }
-
-            except Exception as e:
-                return {"ok": False, "exc": e, "trace": traceback.format_exc()}
-
-        print(
-            "send_message: starting infinite retry loop (preserving required infinite behavior)."
-        )
-        while True:
-            attempt += 1
-            print(
-                f"\nAttempt #{attempt} — timeout={int(configured_timeout)}s — proxy={current_proxy or '<none>'}"
-            )
-            # run request with thread pool to handle possible hang
-            try:
-                with cf.ThreadPoolExecutor(max_workers=1) as ex:
-                    fut = ex.submit(
-                        single_request,
-                        session,
-                        configured_timeout,
-                        current_headers,
-                        current_proxy,
-                    )
+                # --- Proxy formatting helper (safe for socks/http/none) ---
+                def single_request(sess, req_timeout, use_headers, use_proxy):
+                    """
+                    Robust single_request: accept the four positional args the ThreadPoolExecutor uses.
+                    - sess: requests.Session-like
+                    - req_timeout: int
+                    - use_headers: dict or None
+                    - use_proxy: 'ip:port' or None
+                    """
                     try:
-                        wrapper = fut.result(timeout=configured_timeout + 5)
-                    except cf.TimeoutError:
+                        # defensive defaults
+                        if sess is None:
+                            import requests
+                            sess = requests.Session()
                         try:
-                            fut.cancel()
+                            sess.trust_env = False
                         except Exception:
                             pass
-                        # recreate session to avoid broken states
+
+                        # prefer explicit headers passed in; fallback to outer self.headers if missing
+                        headers_local = use_headers or dict(getattr(self, "headers", {"Content-Type": "application/json"}))
+
+                        # format proxy safely for requests
+                        def _format_proxy_for_requests(p):
+                            if not p:
+                                return None
+                            p = str(p).strip()
+                            if p.startswith(("http://", "https://", "socks5://", "socks4://")):
+                                return p
+                            if "socks" in p.lower():
+                                return "socks5://" + p.split("://")[-1]
+                            return "http://" + p
+
+                        proxy_url = _format_proxy_for_requests(use_proxy) if use_proxy else None
+                        proxies_cfg = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+
+                        # Debug line similar to your logs
+                        print(f"single_request() — session={'yes' if sess else 'no'} — timeout={req_timeout} — proxy={use_proxy or '<none>'}")
+
+                        # send body if you use `message` variable; keep same behavior as original
+                        request_kwargs = {"headers": headers_local, "timeout": (10, int(req_timeout) if req_timeout else None)}
+                        # send JSON/body if present in outer scope (backwards-compatible)
+                        if "message" in locals() or "message" in globals():
+                            body_to_send = locals().get("message", globals().get("message", None))
+                        else:
+                            body_to_send = None
+                        if body_to_send is None:
+                            body_to_send = locals().get("payload", globals().get("payload", None)) or locals().get("json_payload", globals().get("json_payload", None))
+                        if body_to_send is not None:
+                            request_kwargs["json"] = body_to_send
+
+                        if proxies_cfg:
+                            request_kwargs["proxies"] = proxies_cfg
+
+                        r = sess.post(self.url, **request_kwargs)
+
+                        return {"ok": True, "status": getattr(r, "status_code", 0), "headers": dict(getattr(r, "headers", {}) or {}), "text": getattr(r, "text", "")}
+
+                    except Exception as e:
+                        import traceback as _tb
+                        return {"ok": False, "exc": e, "trace": _tb.format_exc()}
+
+                print(
+                    "send_message: starting infinite retry loop (preserving required infinite behavior)."
+                )
+                while True:
+                    attempt += 1
+                    print(
+                        f"\nAttempt #{attempt} — timeout={int(configured_timeout)}s — proxy={current_proxy or '<none>'}"
+                    )
+                    # run request with thread pool to handle possible hang
+                    try:
+                        with cf.ThreadPoolExecutor(max_workers=1) as ex:
+                            fut = ex.submit(
+                                single_request,
+                                session,
+                                configured_timeout,
+                                current_headers,
+                                current_proxy,
+                            )
+                            try:
+                                wrapper = fut.result(timeout=configured_timeout + 5)
+                            except cf.TimeoutError:
+                                try:
+                                    fut.cancel()
+                                except Exception:
+                                    pass
+                                # recreate session to avoid broken states
+                                try:
+                                    session.close()
+                                except Exception:
+                                    pass
+                                self._session = requests.Session()
+                                session = self._session
+                                print(
+                                    f"⚠️ Attempt #{attempt} timed out. Backing off {backoff:.1f}s..."
+                                )
+                                time.sleep(backoff + random.random())
+                                backoff = min(backoff * 2, max_backoff)
+                                configured_timeout = min(
+                                    configured_timeout + timeout_growth, max_timeout_cap
+                                )
+                                continue
+                    except KeyboardInterrupt:
+                        raise
+                    except Exception as e:
+                        print("⚠️ Unexpected executor error:", e)
+                        traceback.print_exc()
+                        time.sleep(backoff + random.random())
+                        backoff = min(backoff * 2, max_backoff)
+                        configured_timeout = min(
+                            configured_timeout + timeout_growth, max_timeout_cap
+                        )
+                        continue
+
+                    # wrapper is the result from single_request / worker
+                    if not wrapper.get("ok"):
+                        exc = wrapper.get("exc")
+                        exc_msg = str(exc) if exc is not None else wrapper.get("trace","")
+                        print(f"⚠️ Network exception on attempt #{attempt}: {type(exc).__name__}({exc_msg})")
+
+                        # rotate immediately for clear proxy-tunnel failures:
+                        proxy_failure_signals = [
+                            "Tunnel connection failed",
+                            "400 Bad Request",
+                            "Unable to connect to proxy",
+                            "Connection to",           # connect timeout text
+                            "Connection reset by peer",
+                            "Remote end closed connection without response",
+                            "ProxyError",
+                        ]
+                        immediate_rotate = any(sig.lower() in exc_msg.lower() for sig in proxy_failure_signals)
+
+                        # if we switched to a new proxy, reset the count
+                        if last_proxy_used != current_proxy:
+                            consec_proxy_failures = 0
+                            last_proxy_used = current_proxy
+
+                        if immediate_rotate:
+                            # rotate now — this changes only the proxy, not the infinite loop or return logic
+                            print("→ Detected proxy-specific failure, rotating proxy now.")
+                            _rotate_proxy(reason=f"immediate signal from exception: {exc_msg[:120]}")
+                        else:
+                            # prefer to retry same proxy a few times before rotating
+                            consec_proxy_failures += 1
+                            print(f"→ Consecutive failures for proxy {current_proxy}: {consec_proxy_failures}/{PROXY_FAIL_THRESHOLD}")
+                            if consec_proxy_failures >= PROXY_FAIL_THRESHOLD:
+                                print(f"→ Reached threshold {PROXY_FAIL_THRESHOLD} — rotating proxy now.")
+                                _rotate_proxy(reason=f"{consec_proxy_failures} consecutive network failures")
+                            else:
+                                print("→ Retrying with the SAME proxy after backoff (will rotate if threshold reached).")
+                    else:
+                        status = wrapper.get("status", 0)
+                        text = (wrapper.get("text") or "").strip()
+                        # detect empty or non-JSON responses as proxy failures (rotate)
+                        if status == 0 or not text:
+                            print(f"Response status={status} length={len(text)}")
+                            print("⚠️ Empty/non-JSON response detected — treating as proxy failure and rotating.")
+                            # rotate now (non-destructive)
+                            _rotate_proxy(reason="empty_or_status0_response")
+                            # continue infinite loop (do not change return/complete logic)
+                            continue
+
+                        # If content exists but isn't JSON, still consider rotating — some sites block proxies
                         try:
-                            session.close()
+                            import json
+                            _ = json.loads(text)
                         except Exception:
-                            pass
-                        self._session = requests.Session()
-                        session = self._session
+                            # If it's a Cloudflare/html challenge, you may handle that separately.
+                            # But for plain empty/non-json HTML responses from proxies, rotate.
+                            snippet = text[:200].replace("\n", " ")
+                            print("⚠️ Non-JSON response received (and NOT a challenge). Snippet:", snippet)
+                            print("→ Rotating proxy due to non-JSON response.")
+                            _rotate_proxy(reason="non_json_response")
+                            continue
+
+                    status = int(wrapper.get("status", 0) or 0)
+                    headers_resp = wrapper.get("headers") or {}
+                    body = (wrapper.get("text") or "") or ""
+                    print(f"Response status={status} length={len(body)}")
+
+                    # check if response body contains any of the specific_error substrings (case-insensitive)
+                    body_l = (body or "").lower()
+                    matched_specific = False
+                    for err in specific_error:
+                        if err and err.strip().lower() in body_l:
+                            matched_specific = True
+                            break
+
+                    if matched_specific:
+                        # rotate proxy + impersonation and continue
                         print(
-                            f"⚠️ Attempt #{attempt} timed out. Backing off {backoff:.1f}s..."
+                            "⚠️ Response matched specific_error -> rotating proxy + impersonation and retrying from where it failed."
+                        )
+                        try:
+                            new_proxy, new_headers = self._pick_next_proxy_and_impersonation()
+                            print(f"Rotated -> new_proxy={new_proxy}, pool_size={len(getattr(self,'_proxy_pool',[]))}, _proxy_index={getattr(self,'_proxy_index',None)}")
+                            current_proxy = new_proxy
+                            if isinstance(new_headers, dict) and new_headers.get("User-Agent"):
+                                current_headers = new_headers
+                        except Exception as e:
+                            print("→ Failed to rotate proxy (fetch/impersonation):", e)
+                        # small backoff, then continue (infinite)
+                        time.sleep(backoff + random.random())
+                        backoff = min(backoff * 2, max_backoff)
+                        configured_timeout = min(
+                            configured_timeout + timeout_growth, max_timeout_cap
+                        )
+                        continue
+
+                    # If not matched specific_error, follow original error handling policies but do NOT rotate proxy
+                    if looks_like_html_challenge(status, body, headers_resp):
+                        print("⚠️ Detected HTML challenge / Cloudflare-like content.")
+                        # attempt cloudscraper then playwright (these attempt *may* use the same current_proxy + headers)
+                        if use_cloudscraper_on_403 and cloudscraper:
+                            solved = try_cloudscraper_once(
+                                current_proxy, headers_override=current_headers
+                            )
+                            if isinstance(solved, dict) and solved.get("status") == "success":
+                                return solved.get("response", "")
+                        if use_playwright_on_403 and PLAYWRIGHT_AVAILABLE:
+                            solved = try_playwright_once(
+                                current_proxy, headers_override=current_headers
+                            )
+                            if isinstance(solved, dict) and solved.get("status") == "success":
+                                return solved.get("response", "")
+                        print(
+                            "Cloudflare solver didn't return success. Backing off and retrying with same proxy."
                         )
                         time.sleep(backoff + random.random())
                         backoff = min(backoff * 2, max_backoff)
@@ -543,129 +662,75 @@ class ChatAPI:
                             configured_timeout + timeout_growth, max_timeout_cap
                         )
                         continue
-            except KeyboardInterrupt:
-                raise
-            except Exception as e:
-                print("⚠️ Unexpected executor error:", e)
-                traceback.print_exc()
-                time.sleep(backoff + random.random())
-                backoff = min(backoff * 2, max_backoff)
-                configured_timeout = min(
-                    configured_timeout + timeout_growth, max_timeout_cap
-                )
-                continue
 
-            if not wrapper.get("ok"):
-                # network/exception — important: do NOT rotate proxy on general network/exception per requirement
-                print(
-                    f"⚠️ Network exception on attempt #{attempt}: {wrapper.get('exc')!r}"
-                )
-                print("Retrying with the SAME proxy (do not rotate) after backoff.")
-                time.sleep(backoff + random.random())
-                backoff = min(backoff * 2, max_backoff)
-                configured_timeout = min(
-                    configured_timeout + timeout_growth, max_timeout_cap
-                )
-                continue
+                    # 4xx client errors (keep same proxy)
+                    if 400 <= status < 500:
+                        print(
+                            f"⚠️ Client error HTTP {status}. Response snippet:\n{(body or '')[:1000]}"
+                        )
+                        print("Retrying with the SAME proxy (do not rotate).")
+                        time.sleep(backoff + random.random())
+                        backoff = min(backoff * 2, max_backoff)
+                        configured_timeout = min(
+                            configured_timeout + timeout_growth, max_timeout_cap
+                        )
+                        continue
 
-            status = int(wrapper.get("status", 0) or 0)
-            headers_resp = wrapper.get("headers") or {}
-            body = (wrapper.get("text") or "") or ""
-            print(f"Response status={status} length={len(body)}")
+                    # 5xx or 429 server errors/rate limit (keep same proxy)
+                    if status == 429 or 500 <= status < 600:
+                        print(
+                            f"⚠️ Server/Rate error HTTP {status}. Response snippet:\n{(body or '')[:1000]}"
+                        )
+                        print("Retrying with the SAME proxy (do not rotate).")
+                        time.sleep(backoff + random.random())
+                        backoff = min(backoff * 2, max_backoff)
+                        configured_timeout = min(
+                            configured_timeout + timeout_growth, max_timeout_cap
+                        )
+                        continue
 
-            # check if response body contains any of the specific_error substrings (case-insensitive)
-            body_l = (body or "").lower()
-            matched_specific = False
-            for err in specific_error:
-                if err and err.strip().lower() in body_l:
-                    matched_specific = True
-                    break
+                    # parse JSON success path
+                    ct = (headers_resp.get("Content-Type") or "").lower()
+                    parsed = None
+                    if "application/json" in ct or (
+                        isinstance(body, str)
+                        and (body.strip().startswith("{") or body.strip().startswith("["))
+                    ):
+                        try:
+                            parsed = json.loads(body) if body else {}
+                        except Exception:
+                            print("⚠️ Failed to parse JSON. Response snippet:")
+                            print((body or "")[:2000])
+                            print("Retrying (same proxy).")
+                            time.sleep(backoff + random.random())
+                            backoff = min(backoff * 2, max_backoff)
+                            configured_timeout = min(
+                                configured_timeout + timeout_growth, max_timeout_cap
+                            )
+                            continue
+                    else:
+                        # non-JSON non-challenge body, keep retrying same proxy
+                        print("⚠️ Non-JSON response received (and NOT a challenge). Snippet:")
+                        print((body or "")[:2000])
+                        print("Retrying (same proxy).")
+                        time.sleep(backoff + random.random())
+                        backoff = min(backoff * 2, max_backoff)
+                        configured_timeout = min(
+                            configured_timeout + timeout_growth, max_timeout_cap
+                        )
+                        continue
 
-            if matched_specific:
-                # rotate proxy + impersonation and continue
-                print(
-                    "⚠️ Response matched specific_error -> rotating proxy + impersonation and retrying from where it failed."
-                )
-                try:
-                    new_proxy, new_headers = self._pick_next_proxy_and_impersonation()
-                    print(f"Rotated -> new_proxy={new_proxy}, pool_size={len(getattr(self,'_proxy_pool',[]))}, _proxy_index={getattr(self,'_proxy_index',None)}")
-                    current_proxy = new_proxy
-                    if isinstance(new_headers, dict) and new_headers.get("User-Agent"):
-                        current_headers = new_headers
-                except Exception as e:
-                    print("→ Failed to rotate proxy (fetch/impersonation):", e)
-                # small backoff, then continue (infinite)
-                time.sleep(backoff + random.random())
-                backoff = min(backoff * 2, max_backoff)
-                configured_timeout = min(
-                    configured_timeout + timeout_growth, max_timeout_cap
-                )
-                continue
+                    # if parsed JSON and status==success -> return
+                    if isinstance(parsed, dict) and parsed.get("status") == "success":
+                        print("✅ API returned success. Returning response.")
+                        return parsed.get("response", "")
 
-            # If not matched specific_error, follow original error handling policies but do NOT rotate proxy
-            if looks_like_html_challenge(status, body, headers_resp):
-                print("⚠️ Detected HTML challenge / Cloudflare-like content.")
-                # attempt cloudscraper then playwright (these attempt *may* use the same current_proxy + headers)
-                if use_cloudscraper_on_403 and cloudscraper:
-                    solved = try_cloudscraper_once(
-                        current_proxy, headers_override=current_headers
-                    )
-                    if isinstance(solved, dict) and solved.get("status") == "success":
-                        return solved.get("response", "")
-                if use_playwright_on_403 and PLAYWRIGHT_AVAILABLE:
-                    solved = try_playwright_once(
-                        current_proxy, headers_override=current_headers
-                    )
-                    if isinstance(solved, dict) and solved.get("status") == "success":
-                        return solved.get("response", "")
-                print(
-                    "Cloudflare solver didn't return success. Backing off and retrying with same proxy."
-                )
-                time.sleep(backoff + random.random())
-                backoff = min(backoff * 2, max_backoff)
-                configured_timeout = min(
-                    configured_timeout + timeout_growth, max_timeout_cap
-                )
-                continue
-
-            # 4xx client errors (keep same proxy)
-            if 400 <= status < 500:
-                print(
-                    f"⚠️ Client error HTTP {status}. Response snippet:\n{(body or '')[:1000]}"
-                )
-                print("Retrying with the SAME proxy (do not rotate).")
-                time.sleep(backoff + random.random())
-                backoff = min(backoff * 2, max_backoff)
-                configured_timeout = min(
-                    configured_timeout + timeout_growth, max_timeout_cap
-                )
-                continue
-
-            # 5xx or 429 server errors/rate limit (keep same proxy)
-            if status == 429 or 500 <= status < 600:
-                print(
-                    f"⚠️ Server/Rate error HTTP {status}. Response snippet:\n{(body or '')[:1000]}"
-                )
-                print("Retrying with the SAME proxy (do not rotate).")
-                time.sleep(backoff + random.random())
-                backoff = min(backoff * 2, max_backoff)
-                configured_timeout = min(
-                    configured_timeout + timeout_growth, max_timeout_cap
-                )
-                continue
-
-            # parse JSON success path
-            ct = (headers_resp.get("Content-Type") or "").lower()
-            parsed = None
-            if "application/json" in ct or (
-                isinstance(body, str)
-                and (body.strip().startswith("{") or body.strip().startswith("["))
-            ):
-                try:
-                    parsed = json.loads(body) if body else {}
-                except Exception:
-                    print("⚠️ Failed to parse JSON. Response snippet:")
-                    print((body or "")[:2000])
+                    # JSON present but not success -> log & continue
+                    print("→ API returned JSON but no 'status==success'. Payload snippet:")
+                    try:
+                        print(json.dumps(parsed, indent=2)[:2000])
+                    except Exception:
+                        print(parsed)
                     print("Retrying (same proxy).")
                     time.sleep(backoff + random.random())
                     backoff = min(backoff * 2, max_backoff)
@@ -673,36 +738,6 @@ class ChatAPI:
                         configured_timeout + timeout_growth, max_timeout_cap
                     )
                     continue
-            else:
-                # non-JSON non-challenge body, keep retrying same proxy
-                print("⚠️ Non-JSON response received (and NOT a challenge). Snippet:")
-                print((body or "")[:2000])
-                print("Retrying (same proxy).")
-                time.sleep(backoff + random.random())
-                backoff = min(backoff * 2, max_backoff)
-                configured_timeout = min(
-                    configured_timeout + timeout_growth, max_timeout_cap
-                )
-                continue
-
-            # if parsed JSON and status==success -> return
-            if isinstance(parsed, dict) and parsed.get("status") == "success":
-                print("✅ API returned success. Returning response.")
-                return parsed.get("response", "")
-
-            # JSON present but not success -> log & continue
-            print("→ API returned JSON but no 'status==success'. Payload snippet:")
-            try:
-                print(json.dumps(parsed, indent=2)[:2000])
-            except Exception:
-                print(parsed)
-            print("Retrying (same proxy).")
-            time.sleep(backoff + random.random())
-            backoff = min(backoff * 2, max_backoff)
-            configured_timeout = min(
-                configured_timeout + timeout_growth, max_timeout_cap
-            )
-            continue
 
 
 # ---------------------- UTILITIES ----------------------
@@ -1235,28 +1270,42 @@ class StoryPipeline:
                     if attempt == 1
                     else _strengthen_prompt(prompt, None, attempt)
                 )
-                try:
-                    resp = self.chat.send_message(
-                        req_prompt,
-                        timeout=timeout,
-                        spinner_message=f"Generating initial script (attempt {attempt})...",
-                    )
-                except Exception as e:
-                    print(f"⚠️ send_message failed on generation attempt {attempt}: {e}")
-                    # exponential backoff (bounded) before retrying to avoid tight infinite loops
-                    sleep_sec = min(8 + random.random() * 2, 30)
-                    print(f"Sleeping {sleep_sec:.1f}s before retrying generation...")
-                    time.sleep(sleep_sec)
-                    continue
+                resp = self.chat.send_message(
+                    req_prompt,
+                    timeout=timeout,
+                    spinner_message=f"Generating initial script (attempt {attempt}).",
+                )
 
-                # In strict mode we insist the model returns a bracketed block; otherwise we accept best candidate
+                # Defensive conversion: always turn None/dict/bytes into a string before regex checks
+                def _resp_to_text(r):
+                    if r is None:
+                        print("Warning: generate_script got None response; treating as empty string.")
+                        return ""
+                    if isinstance(r, bytes):
+                        return r.decode("utf-8", errors="replace")
+                    if isinstance(r, str):
+                        return r
+                    if isinstance(r, dict):
+                        for k in ("text", "response", "body"):
+                            if k in r and isinstance(r[k], (str, bytes)):
+                                v = r[k]
+                                return v.decode("utf-8", errors="replace") if isinstance(v, bytes) else v
+                        # if dict but nothing useful, stringify it for debug
+                        print("Debug: generate_script received dict response without 'text' key; keys:", list(r.keys()))
+                        return str(r)
+                    try:
+                        return str(r)
+                    except Exception:
+                        return ""
+
+                resp = _resp_to_text(resp)   # <-- important: coerce here before match()
+
                 if strict:
                     if not single_block_re.match(resp):
-                        print(
-                            "⚠️ Strict mode: response did not contain a single bracketed block — retrying."
-                        )
+                        print("⚠️ Strict mode: response did not contain a single bracketed block — retrying.")
                         time.sleep(0.2)
                         continue
+
                 candidate = _extract_candidate(resp)
                 try:
                     cleaned_candidate = clean_script_text(candidate) or candidate
