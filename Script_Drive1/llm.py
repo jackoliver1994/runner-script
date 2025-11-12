@@ -176,10 +176,12 @@ class ChatAPI:
         use_playwright_on_403: bool = False,
         proxy: str = None,
         specific_error: list = [
-            "✅ response status: 403",
-            "⚠️ detected cloudflare-like anti-bot page",
+            "response status: 403",
+            "detected cloudflare-like anti-bot page",
             "Response status=403 length=9245",
-            "⚠️ Detected HTML challenge / Cloudflare-like content.",
+            "Detected HTML challenge",
+            "Cloudflare-like content",
+            "Response status=403",
         ],
     ):
         """
