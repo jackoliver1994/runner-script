@@ -997,6 +997,8 @@ class StoryPipeline:
         strict: bool = True,
         max_attempts: int = 100,
         topic: str = "",
+        allow_infinite: bool = True,               # NEW: keep infinite by default
+        stop_event: Optional[Event] = None, 
     ) -> str:
         """
         COMPLETE generate_script implementation — infinite-retry until success (no internal caps).
@@ -1239,289 +1241,43 @@ class StoryPipeline:
         attempt = 0
 
         # Finalize helper — saves ONLY if non-empty and always as a single bracketed block
+        # Finalize helper — saves ONLY if non-empty and always returns a bracketed block
         def _finalize_and_save(text: str) -> Optional[str]:
             final_text = _remove_exact_and_fuzzy_duplicates(text, fuzzy_threshold=0.92)
+            # strip any accidental outer brackets (be conservative)
             if final_text.startswith("[") and final_text.endswith("]"):
                 final_text = final_text[1:-1].strip()
             final_text = final_text.strip()
             if not final_text:
                 # refuse to save empty content
-                print(
-                    "⚠️ Final text is empty after cleaning — will not save. Continuing retries."
-                )
+                print("⚠️ Final text is empty after cleaning — will not save. Continuing retries.")
                 return None
             # Save EXACTLY one bracketed block and nothing else
-            save_response(
-                "generated_complete_script",
-                "generated_complete_script.txt",
-                f"[{final_text}]",
-            )
-            return final_text
+            bracketed = f"[{final_text}]"
+            save_response("generated_complete_script", "generated_complete_script.txt", bracketed)
+            # Return the bracketed block so callers receive the saved artifact exactly as written
+            return bracketed
 
         # Main loop: keep trying until we produce a non-empty cleaned script close to target
         while True:
             attempt += 1
 
-            # --- generation phase ---
-            if not accumulated:
-                # initial generation
-                req_prompt = (
-                    prompt
-                    if attempt == 1
-                    else _strengthen_prompt(prompt, None, attempt)
-                )
-                resp = self.chat.send_message(
-                    req_prompt,
-                    timeout=timeout,
-                    spinner_message=f"Generating initial script (attempt {attempt}).",
-                )
+            # Optional graceful stop: external Event can request termination (non-destructive)
+            if stop_event is not None and stop_event.is_set():
+                print(f"Stop requested by stop_event (attempt {attempt}). Returning best-effort result if available.")
+                if accumulated:
+                    final_bracketed = _finalize_and_save(accumulated)
+                    return final_bracketed  # may be None if saving failed
+                return None
 
-                # Defensive conversion: always turn None/dict/bytes into a string before regex checks
-                def _resp_to_text(r):
-                    if r is None:
-                        print("Warning: generate_script got None response; treating as empty string.")
-                        return ""
-                    if isinstance(r, bytes):
-                        return r.decode("utf-8", errors="replace")
-                    if isinstance(r, str):
-                        return r
-                    if isinstance(r, dict):
-                        for k in ("text", "response", "body"):
-                            if k in r and isinstance(r[k], (str, bytes)):
-                                v = r[k]
-                                return v.decode("utf-8", errors="replace") if isinstance(v, bytes) else v
-                        # if dict but nothing useful, stringify it for debug
-                        print("Debug: generate_script received dict response without 'text' key; keys:", list(r.keys()))
-                        return str(r)
-                    try:
-                        return str(r)
-                    except Exception:
-                        return ""
-
-                resp = _resp_to_text(resp)   # <-- important: coerce here before match()
-
-                if strict:
-                    if not single_block_re.match(resp):
-                        print("⚠️ Strict mode: response did not contain a single bracketed block — retrying.")
-                        time.sleep(0.2)
-                        continue
-
-                candidate = _extract_candidate(resp)
-                try:
-                    cleaned_candidate = clean_script_text(candidate) or candidate
-                except Exception:
-                    cleaned_candidate = candidate
-                cleaned_candidate = _remove_exact_and_fuzzy_duplicates(
-                    cleaned_candidate, fuzzy_threshold=0.90
-                )
-                wc, remaining = _log_clean_state("Initial", cleaned_candidate)
-
-                # If too long, attempt model condense then deterministic trim
-                if wc > words_target + tolerance:
-                    condense_tries = min(6, max(1, max_attempts - attempt))
-                    prev_long = wc
-                    condensed_candidate = cleaned_candidate
-                    for ct in range(condense_tries):
-                        condense_prompt = (
-                            "You were given a previously generated script (below). The cleaned version currently has "
-                            f"{prev_long} words, but it must be reduced to exactly {words_target} words (or as close as possible within ±{tolerance}). "
-                            "Tighten and condense the text: remove redundancies, merge sentences, shorten descriptive passages, and preserve the original narrative structure, beats, and meaning. "
-                            "DO NOT invent new sections, scenes, characters, or facts. Do NOT change the sequence of events, character names, perspective, or core details. "
-                            "Keep tone, tense, and voice consistent with the original. Prefer preserving essential lines and emotional beats even when shortening. "
-                            "Produce exactly one bracketed script block and nothing else: output a single opening bracket [ then the entire script content followed by a single closing bracket ] — include no other characters, whitespace, newlines, headings, labels, metadata, counts, commentary, instructions, fragments of the prompt, code fences, or BOM before or after; the bracketed text must be the complete script with no explanatory notes, stage directions, or parenthetical remarks not part of the script; if the script cannot be produced, return exactly []; the response must contain absolutely nothing else.\n"
-                            "Output EXACTLY ONE bracketed block and NOTHING ELSE — the bracketed block must contain only the full revised script text (no extra whitespace, commentary, metadata, or explanation).\n\n"
-                            "PREVIOUS_SCRIPT_BEGIN\n"
-                            f"{condensed_candidate}\n"
-                            "PREVIOUS_SCRIPT_END\n"
-                        )
-                        try:
-                            cond_resp = self.chat.send_message(
-                                condense_prompt,
-                                timeout=timeout,
-                                spinner_message=f"Condensing (try {ct+1}/{condense_tries})...",
-                            )
-                        except Exception as e:
-                            print(f"⚠️ Condense send_message failed: {e}")
-                            break
-                        if strict and not single_block_re.match(cond_resp):
-                            print(
-                                "⚠️ Strict mode: condense response not bracketed — retrying condense."
-                            )
-                            time.sleep(0.2)
-                            continue
-                        cond_inner = _extract_candidate(cond_resp)
-                        try:
-                            cond_clean = clean_script_text(cond_inner) or cond_inner
-                        except Exception:
-                            cond_clean = cond_inner
-                        cond_clean = _remove_exact_and_fuzzy_duplicates(
-                            cond_clean, fuzzy_threshold=0.90
-                        )
-                        cond_wc, _ = _log_clean_state(f"Condense {ct+1}", cond_clean)
-                        if abs(cond_wc - words_target) <= tolerance:
-                            accumulated = cond_clean
-                            break
-                        if cond_wc < prev_long:
-                            condensed_candidate = cond_clean
-                            prev_long = cond_wc
-                            time.sleep(0.2)
-                            continue
-                        break
-                    # if condense loop failed to meet target exactly, run deterministic trim
-                    if not accumulated:
-                        trimmed = _heuristic_trim_to_target(
-                            condensed_candidate, words_target
-                        )
-                        try:
-                            trimmed_clean = clean_script_text(trimmed) or trimmed
-                        except Exception:
-                            trimmed_clean = trimmed
-                        accumulated = _remove_exact_and_fuzzy_duplicates(
-                            trimmed_clean, fuzzy_threshold=0.90
-                        )
-                else:
-                    # candidate is short or near-target — accept as accumulated block
-                    accumulated = cleaned_candidate
-
-                # If already within tolerance, attempt to save (must be non-empty)
-                acc_wc = _word_count(accumulated)
-                if abs(acc_wc - words_target) <= tolerance:
-                    res = _finalize_and_save(accumulated)
-                    if res is not None:
-                        return res
-                    else:
-                        # didn't save (empty); clear accumulated and continue
-                        accumulated = ""
-                        continue
-
-                # otherwise loop continues to request continuations
-                continue
-
-            # --- continuation phase: we have an accumulated block that is short ---
-            acc_wc = _word_count(accumulated)
-            remaining = max(0, words_target - acc_wc)
-            last_para = (
-                _get_paragraphs(accumulated)[-1] if _get_paragraphs(accumulated) else ""
-            )
-
-            cont_prompt = (
-                "You are an expert cinematic scriptwriter and continuity editor. "
-                "Below is a script already generated (PREV_BEGIN / PREV_END). Continue it seamlessly from the last paragraph so the final combined script reaches "
-                f"approximately {words_target} words (add about {remaining} words). Do NOT repeat the last paragraph; continue naturally. Maintain voice, pacing, and narrative logic. "
-                "Output ONLY the continuation text (no brackets, no labels, no metadata). Avoid repeating entire paragraphs; use callbacks, echoes, and thematic callbacks instead.\n\n"
-                f"PREV_BEGIN\n{accumulated}\nPREV_END\n\n"
-                f"LAST_PARAGRAPH_BEGIN\n{last_para}\nLAST_PARAGRAPH_END\n\n"
-                "GUIDELINES (follow these tightly):\n"
-                "- Seamlessness: bridge directly from LAST_PARAGRAPH so the result reads as one continuous video_script — no jarring resets, no reintroductory exposition.\n"
-                "- Middle-act mastery: prioritize rising action, conflict escalation, turning points, stakes increase, and micro-resolutions that propel the story forward.\n"
-                "- Maintain characters, names, facts, tone, and tense exactly as present in PREV and LAST_PARAGRAPH. If a scene or character is implied, continue that thread unless explicitly contradicted.\n"
-                "- Show, don't tell: prefer sensory details, short scenes, beats, and concrete actions over long explanation. Use short+long sentences rhythmically to control pacing.\n"
-                "- Callbacks, not copy: reference earlier lines or imagery with subtle callback phrases (echo words, repeated motifs, similar imagery) rather than copying whole sentences.\n"
-                "- Flow & transitions: use graceful transitions between beats or scenes (one-sentence visual transitions, cut-to, or a brief descriptive line) without headings, timestamps, or labels.\n"
-                "- Scene economy: each paragraph should function as a micro-scene or beat — introduce a small change, reveal, decision, or escalation that advances momentum.\n"
-                "- Dialogue & tags: if characters speak, keep speaker attribution consistent with prior format. Use realistic, concise dialogue that reveals character or motive.\n"
-                "- Continuity safety: never contradict established facts (names, timeline, locations, relationships). If uncertain, favor neutral phrasing that preserves continuity.\n"
-                "- Length control: aim for ~{words_target} total words. If you overshoot slightly that's fine; if you undershoot, continue until the target is sensibly reached. When within ~3-7% of the target, create a satisfying mini-cliff or logical segue for the next batch.\n"
-                "- Formatting: plain paragraphs only (no lists, no headers, no code). Keep natural paragraph breaks for beats. No editorial comments, no analysis, no instructions to the reader.\n"
-                "- Safety & quality: keep language appropriate for a wide audience; avoid gratuitous profanity unless already present and integral to character voice.\n\n"
-                "Produce exactly one bracketed script block and nothing else: output a single opening bracket [ then the entire script content followed by a single closing bracket ] — include no other characters, whitespace, newlines, headings, labels, metadata, counts, commentary, instructions, fragments of the prompt, code fences, or BOM before or after; the bracketed text must be the complete script with no explanatory notes, stage directions, or parenthetical remarks not part of the script; if the script cannot be produced, return exactly []; the response must contain absolutely nothing else.\n"
-                "Deliver a single continuous piece that a human editor could paste after PREV_BEGIN and have the full script read as one complete, cinematic video script.\n"
-            )
-            try:
-                cont_resp = self.chat.send_message(
-                    cont_prompt,
-                    timeout=timeout,
-                    spinner_message=f"Continuation attempt (overall attempt {attempt})...",
-                )
-            except Exception as e:
-                print(f"⚠️ Continuation send_message failed: {e}")
-                time.sleep(0.2)
-                continue
-
-            # In strict mode we accept only continuation text (model may return unbracketed continuation)
-            cont_candidate = _extract_candidate(cont_resp)
-            try:
-                cont_clean = clean_script_text(cont_candidate) or cont_candidate
-            except Exception:
-                cont_clean = cont_candidate
-
-            # Append and dedupe
-            combined = (accumulated.rstrip() + "\n\n" + cont_clean.strip()).strip()
-            combined = _remove_exact_and_fuzzy_duplicates(
-                combined, fuzzy_threshold=0.90
-            )
-            new_wc, remaining_after = _log_clean_state("After append", combined)
-
-            if new_wc <= acc_wc:
-                # no progress — try stronger regeneration append
-                print(
-                    "⚠️ Continuation produced no net progress; will retry with stronger generation prompt."
-                )
-                prompt = _strengthen_prompt(prompt, acc_wc, attempt + 1)
-                gen_prompt = (
-                    "Produce a new script section that continues the narrative below and does not repeat existing paragraphs. "
-                    f"Aim to add about {remaining} words. Output EXACTLY ONE bracketed block with only the new section text.\n\nPREV_BEGIN\n{accumulated}\nPREV_END\n"
-                )
-                try:
-                    gen_resp = self.chat.send_message(
-                        gen_prompt,
-                        timeout=timeout,
-                        spinner_message="Generating appended chunk...",
-                    )
-                except Exception as e:
-                    print(f"⚠️ Append-generation failed: {e}")
-                    time.sleep(0.2)
-                    continue
-                if strict and not single_block_re.match(gen_resp):
-                    print("⚠️ Strict mode: append generation not bracketed — retrying.")
-                    time.sleep(0.2)
-                    continue
-                gen_candidate = _extract_candidate(gen_resp)
-                try:
-                    gen_clean = clean_script_text(gen_candidate) or gen_candidate
-                except Exception:
-                    gen_clean = gen_candidate
-                new_combined = (
-                    accumulated.rstrip() + "\n\n" + gen_clean.strip()
-                ).strip()
-                new_combined = _remove_exact_and_fuzzy_duplicates(
-                    new_combined, fuzzy_threshold=0.90
-                )
-                new_wc2, remaining2 = _log_clean_state(
-                    "After regeneration append", new_combined
-                )
-                if new_wc2 > acc_wc:
-                    accumulated = new_combined
-                    continue
-                else:
-                    time.sleep(0.2)
-                    continue
-
-            # progress made
-            accumulated = combined
-
-            # if reached or exceeded target -> finalize
-            if _word_count(accumulated) >= words_target:
-                # if over target, trim conservatively
-                if _word_count(accumulated) > words_target + tolerance:
-                    trimmed = _heuristic_trim_to_target(accumulated, words_target)
-                    try:
-                        trimmed_clean = clean_script_text(trimmed) or trimmed
-                    except Exception:
-                        trimmed_clean = trimmed
-                    accumulated = _remove_exact_and_fuzzy_duplicates(
-                        trimmed_clean, fuzzy_threshold=0.92
-                    )
-                res = _finalize_and_save(accumulated)
-                if res is not None:
-                    return res
-                else:
-                    # didn't save (empty) — reset and continue
-                    accumulated = ""
-                    continue
-
-            # slight pause before next continuation (keeps CPU friendly)
-            time.sleep(0.05)
+            # Optional bounded mode (if caller explicitly turns off infinite behavior)
+            # default keep infinite; this branch only triggers when allow_infinite == False
+            if not allow_infinite and attempt > max_attempts:
+                print(f"Max attempts ({max_attempts}) reached in non-infinite mode. Finalizing best-effort.")
+                if accumulated:
+                    final_bracketed = _finalize_and_save(accumulated)
+                    return final_bracketed
+                return None
 
         # This loop is intended to run until succeed; reaching here is unexpected
         raise RuntimeError("generate_script failed to terminate normally.")
