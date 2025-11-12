@@ -69,7 +69,7 @@ class ChatAPI:
         self.base_timeout = default_timeout
 
     def fetch_proxies_from_proxyscrape(
-        self, max_proxies: int = 10000000, timeout: int = 10
+        self, max_proxies: int = 50000, timeout: int = 10
     ) -> list:
         """
         Best-effort fetch of proxy list lines 'ip:port' from common ProxyScrape endpoints.
@@ -176,8 +176,8 @@ class ChatAPI:
         use_playwright_on_403: bool = False,
         proxy: str = None,
         specific_error: list = [
-            """✅ Response status: 403
-⚠️ Detected Cloudflare-like anti-bot page (HTTP 403)."""
+            "✅ response status: 403",
+            "⚠️ detected cloudflare-like anti-bot page",
         ],
     ):
         """
@@ -1863,6 +1863,12 @@ if __name__ == "__main__":
     pipeline = StoryPipeline(
         api_url="https://apifreellm.com/api/chat", default_timeout=1000
     )
+
+    pipeline.chat.max_proxy_fetch = 50000
+    pipeline.chat.specific_error = [
+        "✅ response status: 403",
+        "⚠️ detected cloudflare-like anti-bot page",
+    ]
 
     # --- Example 1: Only generate the story/script (BRACKETED single block file saved) ---
     script = pipeline.generate_script(
