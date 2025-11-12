@@ -13,6 +13,7 @@ Use:
     pipeline.generate_image_prompts(script_text, img_number=150, batch_size=50)
 """
 
+from weakref import proxy
 import requests
 import json
 import time
@@ -377,30 +378,118 @@ class ChatAPI:
 
         # set current proxy/headers. If proxy argument provided, it will be used first until a specific_error forces rotation.
         current_proxy = proxy
-        current_headers = dict(
-            getattr(self, "headers", {"Content-Type": "application/json"})
-        )
+        current_headers = dict(getattr(self, "headers", {"Content-Type": "application/json"}))
+
+        # === Ensure proxy pool is initialized and pick an initial proxy if none supplied ===
+        try:
+            # lazy init pool if empty
+            if not hasattr(self, "_proxy_pool") or not self._proxy_pool:
+                print("Initializing proxy pool (lazy fetch)...")
+                # small, safe fetch to prime the pool (tune max_proxies as needed)
+                try:
+                    self._proxy_pool = self.fetch_proxies_from_proxyscrape(max_proxies=500)
+                except Exception as e:
+                    print("Proxy fetch failed:", e)
+                    self._proxy_pool = []
+
+            # if no proxy argument was supplied, pick one now
+            if current_proxy is None and getattr(self, "_proxy_pool", None):
+                new_proxy, new_headers = self._pick_next_proxy_and_impersonation()
+                current_proxy = new_proxy
+                # only replace headers if we actually got something useful
+                if isinstance(new_headers, dict) and new_headers.get("User-Agent"):
+                    current_headers = new_headers
+            print(f"Proxy pool size={len(getattr(self,'_proxy_pool',[]))}, starting proxy={current_proxy or '<none>'}")
+        except Exception as e:
+            print("Proxy initialization debug:", e)
 
         # ensure proxy pool object present for rotation (lazy)
         if not hasattr(self, "_proxy_pool"):
             self._proxy_pool = []
 
-        def single_request(sess, req_timeout, use_headers, use_proxy):
-            "Executes a single POST request and returns wrapper with status/text/headers or exception info"
+        # --- Proxy formatting helper (safe for socks/http/none) ---
+        def single_request(*args, **kwargs):
+            """
+            Robust single_request that tolerates multiple calling conventions:
+            - (sess, req_timeout, use_headers, use_proxy)  <-- what the executor currently passes
+            - (timeout,) or (req_timeout,)                  <-- some earlier helper versions
+            - keyword args: sess=..., req_timeout=..., use_headers=..., use_proxy=...
+
+            Returns the same wrapper dict your code expects:
+            {"ok": True, "status": int, "headers": dict, "text": str} OR
+            {"ok": False, "exc": Exception, "trace": traceback}
+            """
             try:
-                headers_local = use_headers or dict(
-                    getattr(self, "headers", {"Content-Type": "application/json"})
-                )
-                proxies_cfg = (
-                    {"http": f"http://{use_proxy}", "https": f"http://{use_proxy}"}
-                    if use_proxy
-                    else None
-                )
+                # map positional args
+                sess = None
+                req_timeout = None
+                use_headers = None
+                use_proxy = None
+
+                if args:
+                    # common executor call: (session, configured_timeout, current_headers, current_proxy)
+                    if len(args) >= 4:
+                        sess, req_timeout, use_headers, use_proxy = args[0:4]
+                    elif len(args) == 3:
+                        sess, req_timeout, use_headers = args
+                    elif len(args) == 2:
+                        sess, req_timeout = args
+                    elif len(args) == 1:
+                        # some versions pass only timeout or only session — be defensive
+                        first = args[0]
+                        # guess: a Session object has .post; timeout is int/float
+                        if hasattr(first, "post"):
+                            sess = first
+                        else:
+                            req_timeout = first
+
+                # override with kwargs if present
+                sess = kwargs.get("sess", sess)
+                req_timeout = kwargs.get("req_timeout", kwargs.get("timeout", req_timeout))
+                use_headers = kwargs.get("use_headers", kwargs.get("headers", use_headers))
+                use_proxy = kwargs.get("use_proxy", kwargs.get("proxy", use_proxy))
+
+                # fallback to outer-scope names if still None (so this nested fn captures them)
+                if sess is None:
+                    sess = locals().get("session") or globals().get("session") or getattr(self, "_session", None)
+                if req_timeout is None:
+                    req_timeout = locals().get("configured_timeout") or kwargs.get("timeout") or getattr(self, "base_timeout", 60)
+                if use_headers is None:
+                    use_headers = locals().get("current_headers") or dict(getattr(self, "headers", {"Content-Type": "application/json"}))
+                if use_proxy is None:
+                    use_proxy = locals().get("current_proxy") or kwargs.get("proxy") or None
+
+                # ensure we have a session object
+                if sess is None:
+                    import requests
+                    sess = requests.Session()
+
+                # proxy formatting helper (same robust logic)
+                def _format_proxy_for_requests(p):
+                    if not p:
+                        return None
+                    p = str(p).strip()
+                    if p.startswith(("http://", "https://", "socks5://", "socks4://")):
+                        return p
+                    if "socks" in p.lower():
+                        return "socks5://" + p.split("://")[-1]
+                    return "http://" + p
+
+                proxies_cfg = None
+                if use_proxy:
+                    proxy_url = _format_proxy_for_requests(use_proxy)
+                    if proxy_url:
+                        proxies_cfg = {"http": proxy_url, "https": proxy_url}
+
+                # debug print so logs show exactly what's used per attempt
+                print(f"single_request() — session={'yes' if sess else 'no'} — timeout={req_timeout} — proxy={use_proxy or '<none>'}")
+
+                # perform the POST as your original function did (json payload with message)
                 r = sess.post(
                     self.url,
-                    headers=headers_local,
+                    headers=use_headers,
                     json={"message": message},
-                    timeout=(10, req_timeout),
+                    timeout=(10, int(req_timeout) if req_timeout else None),
                     proxies=proxies_cfg,
                 )
                 return {
@@ -409,6 +498,7 @@ class ChatAPI:
                     "headers": dict(r.headers or {}),
                     "text": r.text,
                 }
+
             except Exception as e:
                 return {"ok": False, "exc": e, "trace": traceback.format_exc()}
 
@@ -498,8 +588,10 @@ class ChatAPI:
                 )
                 try:
                     new_proxy, new_headers = self._pick_next_proxy_and_impersonation()
+                    print(f"Rotated -> new_proxy={new_proxy}, pool_size={len(getattr(self,'_proxy_pool',[]))}, _proxy_index={getattr(self,'_proxy_index',None)}")
                     current_proxy = new_proxy
-                    current_headers = new_headers
+                    if isinstance(new_headers, dict) and new_headers.get("User-Agent"):
+                        current_headers = new_headers
                 except Exception as e:
                     print("→ Failed to rotate proxy (fetch/impersonation):", e)
                 # small backoff, then continue (infinite)
