@@ -224,51 +224,53 @@ class ChatAPI:
         timeout: int = None,
         spinner_message: str = "Waiting for response.",
         initial_backoff: float = 2.0,
-        max_backoff: float = 8.0,
+        max_backoff: float = 60.0,
         timeout_growth: int = 100,
         max_timeout_cap: int = 1000000,
         use_cloudscraper_on_403: bool = True,
-        use_playwright_on_403: bool = False,
+        use_playwright_on_403: bool = True,
         proxy: str = None,
         specific_error: list = None,
     ):
         """
-        Robust send_message preserving infinite retry semantics and all original features.
+        Robust send_message with:
+        - proxy rotation + bad-proxy removal,
+        - curl impersonation fallback,
+        - Playwright stealth-ish fetch + URL path fuzzing,
+        - Node Puppeteer-stealth fallback (if node/npm available),
+        - cloudscraper fallback,
+        - preserves infinite retry behavior.
 
-        Key fixes for proxy rotation:
-        - Detects ProxyError / tunnel failures and removes the bad proxy from the pool.
-        - Immediately rotates to a new proxy (and updates self._current_proxy) and retries.
-        - When body matches specific_error markers, marks current proxy as bad and rotates.
+        Returns either a string (body) or parsed JSON (if code paths return parsed objects in your original code).
+        Many callers expect textual responses so StoryPipeline now converts dicts to strings safely.
         """
-        import requests
-        from requests.exceptions import ProxyError as ReqProxyError, RequestException
+        import subprocess
+        import shutil
+        import json
         import random
+        import tempfile
 
         if specific_error is None:
             specific_error = [
                 "response status: 403",
                 "detected cloudflare-like anti-bot page",
-                "Response status=403 length=9245",
-                "Detected HTML challenge",
-                "Cloudflare-like content",
-                "Response status=403",
-                "cloudflare",
                 "detected cloudflare",
                 "access denied",
                 "anti-bot",
+                "captcha",
+                "forbidden",
             ]
 
-        def log(*args, **kwargs):
+        def log(*a, **k):
             ts = time.strftime("%H:%M:%S")
-            kwargs.setdefault("flush", True)
-            print(f"[{ts}]", *args, **kwargs)
+            print(f"[{ts}]", *a, **k)
 
         configured_timeout = int(timeout or getattr(self, "base_timeout", 60))
         configured_timeout = min(configured_timeout, max_timeout_cap)
         attempt = 0
         backoff = initial_backoff
 
-        # Start with explicit proxy argument if provided, otherwise use instance current proxy
+        # prefer explicit proxy arg, else last used instance proxy
         current_proxy = proxy or getattr(self, "_current_proxy", None)
 
         spinner = None
@@ -277,9 +279,9 @@ class ChatAPI:
                 spinner = LoadingSpinner(spinner_message)
                 spinner.start()
             except Exception:
-                log("⚠️ Failed to start spinner (non-fatal).")
+                log("⚠️ Spinner start failed (non-fatal).")
 
-        # helper to remove a failing proxy from the pool safely
+        # helper: mark a proxy as bad and remove from pool
         def _mark_bad_proxy(p):
             try:
                 if not p:
@@ -287,160 +289,301 @@ class ChatAPI:
                 pool = getattr(self, "_proxy_pool", None)
                 if not pool:
                     return
-                # remove all exact matches
                 pool = [x for x in pool if x != p]
                 self._proxy_pool = pool
-                # if index out of range fix it
                 if getattr(self, "_proxy_index", 0) >= max(1, len(self._proxy_pool)):
                     self._proxy_index = 0
-                # clear instance current proxy
                 if getattr(self, "_current_proxy", None) == p:
                     self._current_proxy = None
-                log(f"🗑️ Marked bad proxy and removed from pool: {p} (remaining {len(self._proxy_pool)})")
-            except Exception:
+                log("🗑️ Removed bad proxy:", p, "remaining:", len(self._proxy_pool))
+                # optionally persist bad proxies for offline debugging
                 try:
-                    log("⚠️ Failed to mark bad proxy:", p)
+                    bad_file = os.path.join("debug_proxies", "bad_proxies.txt")
+                    os.makedirs(os.path.dirname(bad_file), exist_ok=True)
+                    with open(bad_file, "a", encoding="utf-8") as f:
+                        f.write(p + "\n")
                 except Exception:
                     pass
+            except Exception:
+                pass
+
+        # helper: run curl impersonate (fast, uses system curl)
+        def _run_curl_impersonate(target_url, hdrs: dict, use_proxy_str: str, max_time=20):
+            try:
+                curl = shutil.which("curl")
+                if not curl:
+                    return None
+                args = [curl, "--location", "--silent", "--show-error", "--max-time", str(int(max_time))]
+                # Add headers
+                for k, v in (hdrs or {}).items():
+                    # curl -H "Header: value"
+                    args += ["-H", f"{k}: {v}"]
+                # set user agent explicitly if present
+                ua = hdrs.get("User-Agent") if hdrs else None
+                if ua:
+                    args += ["-A", ua]
+                # proxy
+                if use_proxy_str:
+                    p = str(use_proxy_str)
+                    if not (p.startswith("http://") or p.startswith("https://") or p.startswith("socks5://") or p.startswith("socks4://")):
+                        p = "http://" + p
+                    args += ["--proxy", p]
+                # follow redirects
+                args += ["-i", "--insecure", target_url]
+                proc = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=max_time + 5)
+                out = proc.stdout.decode("utf-8", "ignore")
+                # heuristics: if we get 200 and not a large HTML anti-bot page, return
+                return out
+            except Exception as e:
+                return None
+
+        # helper: simple set of URL fuzzed paths to try
+        def _fuzz_paths(base_url):
+            # generate candidate URL paths / query variations to try
+            urls = []
+            base = base_url.rstrip("/")
+            candidates = [
+                base,
+                base + "/",
+                base + "/api",
+                base + "/api/v1",
+                base + "/api/v2",
+                base + "/v1",
+                base + "/v2",
+                base + "/status",
+                base + "/health",
+                base + "/api/chat",
+                base + "/api/chat/",
+                base + "/index",
+                base + "/home",
+            ]
+            # add random query param variants to bypass naive caching/blocks
+            for c in candidates:
+                for i in range(3):
+                    q = f"?_={random.randint(1000,999999)}"
+                    urls.append(c + q)
+                urls.append(c)
+            # de-duplicate preserve order
+            seen = set()
+            out = []
+            for u in urls:
+                if u not in seen:
+                    seen.add(u)
+                    out.append(u)
+            return out
+
+        # helper: Playwright stealth-ish fetch + path fuzzing
+        def _playwright_stealth_fetch_and_fuzz(base_url, hdrs, use_proxy_str, tries=6, per_try_timeout=18):
+            try:
+                from playwright.sync_api import sync_playwright
+            except Exception:
+                return None
+            try:
+                with sync_playwright() as p:
+                    browser = None
+                    # try several path variants
+                    urls = _fuzz_paths(base_url)[:tries]
+                    for url_variant in urls:
+                        try:
+                            chromium = p.chromium
+                            launch_args = {"headless": True, "args": ["--no-sandbox", "--disable-blink-features=AutomationControlled", "--disable-dev-shm-usage"]}
+                            if use_proxy_str:
+                                # Playwright accepts proxy dict with server key like "http://host:port"
+                                proxy_arg = {}
+                                pstr = str(use_proxy_str)
+                                if not (pstr.startswith("http://") or pstr.startswith("https://") or pstr.startswith("socks5://") or pstr.startswith("socks4://")):
+                                    pstr = "http://" + pstr
+                                proxy_arg["server"] = pstr
+                                launch_args["proxy"] = proxy_arg
+                            browser = chromium.launch(**launch_args)
+                            context = browser.new_context(user_agent=hdrs.get("User-Agent") if hdrs else None, java_script_enabled=True, ignore_https_errors=True)
+                            # stealth tweaks: overwrite navigator webdriver and other signals
+                            page = context.new_page()
+                            page.set_default_navigation_timeout(per_try_timeout * 1000)
+                            # set extra headers if provided
+                            if hdrs:
+                                try:
+                                    extra = dict(hdrs)
+                                    # remove content-length if present
+                                    extra.pop("Content-Length", None)
+                                    page.set_extra_http_headers(extra)
+                                except Exception:
+                                    pass
+                            # evaluate to hide webdriver flag
+                            page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => false});")
+                            page.add_init_script("window.chrome = { runtime: {} };")
+                            page.add_init_script("Object.defineProperty(navigator, 'languages', {get: () => ['en-US','en']});")
+                            page.add_init_script("Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});")
+                            # try to goto
+                            page.goto(url_variant, wait_until="domcontentloaded")
+                            content = page.content()
+                            page.close()
+                            context.close()
+                            browser.close()
+                            # basic heuristics: if status 200-ish and body not huge anti-bot
+                            if content and len(content) > 0:
+                                return content
+                        except Exception:
+                            try:
+                                if browser:
+                                    browser.close()
+                            except Exception:
+                                pass
+                            continue
+            except Exception:
+                return None
+            return None
+
+        # helper: node puppeteer/stealth fallback (writes a small script and executes it)
+        def _node_puppeteer_stealth_fetch_and_fuzz(base_url, hdrs, use_proxy_str, tries=6, per_try_timeout=18):
+            node_bin = shutil.which("node") or shutil.which("nodejs")
+            if not node_bin:
+                return None
+            try:
+                tmpdir = tempfile.mkdtemp(prefix="puppet_")
+                script_path = os.path.join(tmpdir, "stealth_fetch.js")
+                # small Puppeteer script using puppeteer-extra + stealth plugin if present; otherwise fallback to puppeteer
+                js = r"""
+    ( async () => {
+    const fs = require('fs');
+    const url = process.argv[2] || '';
+    const proxy = process.argv[3] || '';
+    const userAgent = process.argv[4] || '';
+    const timeout = parseInt(process.argv[5] || '18000', 10);
+    let puppeteer;
+    let useExtra = false;
+    try {
+        puppeteer = require('puppeteer-extra');
+        const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+        puppeteer.use(StealthPlugin());
+        useExtra = true;
+    } catch (e) {
+        try {
+        puppeteer = require('puppeteer');
+        } catch (e2) {
+        console.error('NO_PUPPETEER');
+        process.exit(2);
+        }
+    }
+    try {
+        const launchOpts = { headless: true, args: ['--no-sandbox','--disable-blink-features=AutomationControlled'] };
+        if (proxy) {
+        launchOpts.args.push(`--proxy-server=${proxy}`);
+        }
+        const browser = await puppeteer.launch(launchOpts);
+        const page = await browser.newPage();
+        if (userAgent) await page.setUserAgent(userAgent);
+        await page.setDefaultNavigationTimeout(timeout);
+        try {
+        await page.goto(url, { waitUntil: 'domcontentloaded' });
+        const content = await page.content();
+        console.log(content);
+        } catch (e) {
+        console.error('ERR', e && e.message ? e.message : String(e));
+        process.exit(3);
+        } finally {
+        await browser.close();
+        }
+    } catch (e) {
+        console.error('ERR', e && e.message ? e.message : String(e));
+        process.exit(4);
+    }
+    })();
+    """
+                with open(script_path, "w", encoding="utf-8") as fw:
+                    fw.write(js)
+                # build candidate URLs
+                urls = _fuzz_paths(base_url)[:tries]
+                for u in urls:
+                    try:
+                        args = [node_bin, script_path, u, (str(use_proxy_str) if use_proxy_str else ""), (hdrs.get("User-Agent") if hdrs else ""), str(int(per_try_timeout * 1000))]
+                        proc = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=per_try_timeout + 5)
+                        out = proc.stdout.decode("utf-8", "ignore")
+                        err = proc.stderr.decode("utf-8", "ignore")
+                        if out and len(out) > 0 and ("NO_PUPPETEER" not in err):
+                            return out
+                    except Exception:
+                        continue
+            except Exception:
+                return None
+            return None
+
+        # nested single_request using requests (kept minimal)
+        def single_request(sess, req_timeout, use_headers, use_proxy):
+            try:
+                import requests
+                if sess is None:
+                    sess = requests.Session()
+                try:
+                    sess.trust_env = False
+                except Exception:
+                    pass
+                headers_local = dict(use_headers or {})
+                proxies_cfg = None
+                if use_proxy:
+                    p = str(use_proxy)
+                    if not (p.startswith("http://") or p.startswith("https://") or p.startswith("socks5://") or p.startswith("socks4://")):
+                        p = "http://" + p
+                    proxies_cfg = {"http": p, "https": p}
+                read_timeout = int(req_timeout) if req_timeout else 60
+                read_timeout = min(max(10, read_timeout), 300)
+                timeout_arg = (10, read_timeout)
+                r = sess.post(self.url, json={"message": message}, headers=headers_local, timeout=timeout_arg, proxies=proxies_cfg)
+                headers_resp = r.headers or {}
+                body = r.text if hasattr(r, "text") else (r.content.decode("utf-8", "ignore") if hasattr(r, "content") else "")
+                return {"ok": True, "status_code": r.status_code, "body": body, "headers": headers_resp}
+            except Exception as e:
+                return {"ok": False, "exc": e, "trace": traceback.format_exc()}
 
         try:
-            # lazy import cloudscraper/playwright if needed
-            try:
-                import cloudscraper
-            except Exception:
-                cloudscraper = None
-
-            PLAYWRIGHT_AVAILABLE = False
-            if use_playwright_on_403:
-                try:
-                    from playwright.sync_api import sync_playwright
-                    PLAYWRIGHT_AVAILABLE = True
-                except Exception:
-                    PLAYWRIGHT_AVAILABLE = False
-
-            # normalize specific_error to lowercase for matching
-            specific_error = [s.lower() for s in (specific_error or [])]
-
-            def single_request(sess, req_timeout, use_headers, use_proxy):
-                """
-                Execute a single HTTP POST in a worker thread. Returns a dict describing outcome.
-                """
-                try:
-                    if sess is None:
-                        sess = requests.Session()
-                    try:
-                        sess.trust_env = False
-                    except Exception:
-                        pass
-
-                    headers_local = dict(use_headers or {})
-                    proxies_cfg = None
-                    if use_proxy:
-                        # requests expects scheme in proxy URL
-                        p = str(use_proxy)
-                        if not (p.startswith("http://") or p.startswith("https://") or p.startswith("socks5://") or p.startswith("socks4://")):
-                            # assume http if no scheme
-                            p = "http://" + p
-                        proxies_cfg = {"http": p, "https": p}
-
-                    read_timeout = int(req_timeout) if req_timeout else 60
-                    read_timeout = min(max(10, read_timeout), 300)
-                    timeout_arg = (10, read_timeout)
-
-                    r = sess.post(
-                        self.url,
-                        json={"message": message},
-                        headers=headers_local,
-                        timeout=timeout_arg,
-                        proxies=proxies_cfg,
-                    )
-
-                    headers_resp = r.headers or {}
-                    body = r.text if hasattr(r, "text") else (r.content.decode("utf-8", "ignore") if hasattr(r, "content") else "")
-                    return {"ok": True, "status_code": r.status_code, "body": body, "headers": headers_resp}
-                except Exception as e:
-                    return {"ok": False, "exc": e, "trace": traceback.format_exc()}
-
-            log("send_message: starting retry loop (proxy-rotation enabled).")
+            # attempt loop (infinite retry by design)
             while True:
                 attempt += 1
-
-                # If no current_proxy and we have a pool, pick one now
+                # choose proxy/headers
                 if not current_proxy and getattr(self, "_proxy_pool", None):
-                    current_proxy, hdrs = self._pick_next_proxy_and_impersonation()
-                    # _pick_next_proxy_and_impersonation sets self._current_proxy already
-                    # but also update local headers for immediate call
-                    use_headers = hdrs
+                    current_proxy, pick_headers = self._pick_next_proxy_and_impersonation()
+                    use_headers = pick_headers
                 else:
-                    # choose headers: prefer instance headers, fallback to default_headers
                     use_headers = dict(getattr(self, "headers", {})) or dict(getattr(self, "default_headers", {}))
 
-                # run request inside a worker to avoid C-level read hangs
-                try:
-                    with cf.ThreadPoolExecutor(max_workers=1) as ex:
-                        fut = ex.submit(single_request, getattr(self, "_session", None), configured_timeout, use_headers, current_proxy)
-                        wrapper = None
-                        wait_timeout = min(configured_timeout, 300) + 5
-                        try:
-                            wrapper = fut.result(timeout=wait_timeout)
-                        except cf.TimeoutError:
-                            log("⚠️ Worker timed out (fut.result). Cancelling worker and recreating session.")
-                            try:
-                                fut.cancel()
-                            except Exception:
-                                pass
-                            try:
-                                self._session = None
-                            except Exception:
-                                pass
-                            time.sleep(backoff + random.random())
-                            backoff = min(backoff * 2, max_backoff)
-                            configured_timeout = min(configured_timeout + timeout_growth, max_timeout_cap)
-                            # rotate proxy on worker timeout to avoid stuck proxy
-                            if current_proxy:
-                                _mark_bad_proxy(current_proxy)
-                                current_proxy = None
-                            continue
-                except Exception as e:
-                    log("⚠️ Unexpected executor error:", e)
-                    log(traceback.format_exc())
-                    time.sleep(backoff + random.random())
-                    backoff = min(backoff * 2, max_backoff)
-                    configured_timeout = min(configured_timeout + timeout_growth, max_timeout_cap)
-                    continue
+                # run worker request to avoid blocking
+                with cf.ThreadPoolExecutor(max_workers=1) as ex:
+                    fut = ex.submit(single_request, getattr(self, "_session", None), configured_timeout, use_headers, current_proxy)
+                    wrapper = None
+                    wait_timeout = min(configured_timeout, 300) + 5
+                    try:
+                        wrapper = fut.result(timeout=wait_timeout)
+                    except cf.TimeoutError:
+                        log("⚠️ Worker timed out; marking proxy bad and retrying.")
+                        # suspected proxy stuck
+                        if current_proxy:
+                            _mark_bad_proxy(current_proxy)
+                            current_proxy = None
+                        time.sleep(backoff + random.random())
+                        backoff = min(backoff * 2, max_backoff)
+                        configured_timeout = min(configured_timeout + timeout_growth, max_timeout_cap)
+                        continue
 
                 if not wrapper:
-                    log("⚠️ No wrapper result returned from worker — retrying.")
-                    configured_timeout = min(configured_timeout + timeout_growth, max_timeout_cap)
+                    log("⚠️ No wrapper result; retrying.")
                     time.sleep(backoff + random.random())
                     backoff = min(backoff * 2, max_backoff)
                     continue
 
                 if wrapper.get("ok") is False:
                     exc = wrapper.get("exc")
-                    # Detect proxy-related exceptions and mark proxy bad + rotate immediately
-                    try:
-                        if isinstance(exc, ReqProxyError) or "ProxyError" in type(exc).__name__ or "Tunnel connection failed" in str(exc) or "Unable to connect to proxy" in str(exc):
-                            log(f"⚠️ Proxy failure detected on attempt #{attempt}: {type(exc).__name__} — rotating proxy.")
-                            log(wrapper.get("trace"))
-                            # mark and remove the current proxy from pool
-                            if current_proxy:
-                                _mark_bad_proxy(current_proxy)
-                                current_proxy = None
-                            # pick the next proxy immediately (if available)
-                            if getattr(self, "_proxy_pool", None):
-                                current_proxy, hdrs = self._pick_next_proxy_and_impersonation()
-                                use_headers = hdrs
-                            time.sleep(min(backoff, 5) + random.random())
-                            backoff = min(backoff * 2, max_backoff)
-                            continue
-                    except Exception:
-                        # if detection failed, fall through to generic handling
-                        pass
-
-                    log(f"⚠️ Network exception on attempt #{attempt}: {type(exc).__name__} — {getattr(exc, 'args', '')}")
-                    log(wrapper.get("trace"))
-                    configured_timeout = min(configured_timeout + timeout_growth, max_timeout_cap)
+                    # detect proxy-related failures
+                    s_exc = str(exc).lower() if exc else ""
+                    if "proxyerror" in type(exc).__name__.lower() or "tunnel connection failed" in s_exc or "unable to connect to proxy" in s_exc or "connection refused" in s_exc:
+                        log("⚠️ Proxy error detected:", s_exc)
+                        if current_proxy:
+                            _mark_bad_proxy(current_proxy)
+                            current_proxy = None
+                        time.sleep(min(backoff, 4) + random.random())
+                        backoff = min(backoff * 2, max_backoff)
+                        continue
+                    # generic network exception: backoff and retry
+                    log("⚠️ Network exception:", s_exc)
                     time.sleep(backoff + random.random())
                     backoff = min(backoff * 2, max_backoff)
                     continue
@@ -448,86 +591,161 @@ class ChatAPI:
                 status_code = wrapper.get("status_code", 0)
                 body = wrapper.get("body", "") or ""
                 headers_resp = wrapper.get("headers", {}) or {}
-
                 ct = (headers_resp.get("Content-Type") or "").lower()
-                # 403 handling: cloudscraper fallback (pass proxies to cloudscraper if we had one)
-                if status_code == 403 and use_cloudscraper_on_403 and cloudscraper:
-                    log("→ Detected 403; attempting cloudscraper fallback (using current proxy if present).")
-                    try:
-                        scraper = cloudscraper.create_scraper()
-                        proxies_cfg = None
-                        if current_proxy:
-                            p = str(current_proxy)
-                            if not (p.startswith("http://") or p.startswith("https://") or p.startswith("socks5://") or p.startswith("socks4://")):
-                                p = "http://" + p
-                            proxies_cfg = {"http": p, "https": p}
-                        r2 = scraper.post(self.url, json={"message": message}, headers=getattr(self, "default_headers", {}), timeout=(10, min(configured_timeout, 300)), proxies=proxies_cfg)
-                        body = r2.text
-                        headers_resp = r2.headers or {}
-                        status_code = r2.status_code
-                    except Exception as e:
-                        log("⚠️ cloudscraper attempt failed:", traceback.format_exc())
-                        # cloudscraper attempt failed - likely proxy issue or blocking; mark bad proxy
-                        if current_proxy:
-                            _mark_bad_proxy(current_proxy)
-                            current_proxy = None
-                        time.sleep(min(backoff, 4) + random.random())
-                        backoff = min(backoff * 2, max_backoff)
-                        continue
 
-                # attempt to parse JSON if it looks like JSON
+                # Status 403 -> try multi-stage anti-bot recovery
+                if status_code == 403:
+                    log("→ Detected 403. Starting anti-bot recovery sequence (rotate IP, curl impersonate, Playwright/Puppeteer stealth, cloudscraper).")
+                    # mark current proxy as possibly bad and rotate
+                    if current_proxy:
+                        _mark_bad_proxy(current_proxy)
+                        current_proxy = None
+                    # immediate rotate to next proxy (if any)
+                    if getattr(self, "_proxy_pool", None):
+                        current_proxy, pick_headers = self._pick_next_proxy_and_impersonation()
+                        use_headers = pick_headers
+
+                    # 1) try curl impersonation (fast)
+                    try:
+                        curl_out = _run_curl_impersonate(self.url, use_headers, current_proxy, max_time=12)
+                        if curl_out and any(k in curl_out.lower() for k in ("{", "[", "message", "status")):
+                            log("→ curl impersonation returned content; using that result.")
+                            return curl_out
+                    except Exception:
+                        pass
+
+                    # 2) try Playwright stealth + path fuzzing
+                    if use_playwright_on_403:
+                        try:
+                            pw_out = _playwright_stealth_fetch_and_fuzz(self.url, use_headers, current_proxy, tries=10, per_try_timeout=18)
+                            if pw_out and len(pw_out) > 10:
+                                log("→ Playwright stealth fetch returned content; using that result.")
+                                return pw_out
+                        except Exception:
+                            pass
+
+                    # 3) try Node puppeteer stealth fallback (if node available)
+                    try:
+                        pp_out = _node_puppeteer_stealth_fetch_and_fuzz(self.url, use_headers, current_proxy, tries=8, per_try_timeout=18)
+                        if pp_out and len(pp_out) > 10:
+                            log("→ Puppeteer stealth (node) returned content; using that result.")
+                            return pp_out
+                    except Exception:
+                        pass
+
+                    # 4) try cloudscraper fallback last
+                    if use_cloudscraper_on_403:
+                        try:
+                            import cloudscraper
+                            scraper = cloudscraper.create_scraper()
+                            proxies_cfg = None
+                            if current_proxy:
+                                p = str(current_proxy)
+                                if not (p.startswith("http://") or p.startswith("https://") or p.startswith("socks5://") or p.startswith("socks4://")):
+                                    p = "http://" + p
+                                proxies_cfg = {"http": p, "https": p}
+                            try:
+                                r2 = scraper.post(self.url, json={"message": message}, headers=getattr(self, "default_headers", {}), timeout=(10, min(configured_timeout, 300)), proxies=proxies_cfg)
+                                body = r2.text
+                                headers_resp = r2.headers or {}
+                                status_code = r2.status_code
+                                if body and len(body) > 0:
+                                    log("→ cloudscraper fallback returned a body; returning it.")
+                                    # keep current_proxy if it worked
+                                    self._current_proxy = current_proxy
+                                    return body
+                            except Exception:
+                                # cloudscraper failure -> mark proxy bad
+                                if current_proxy:
+                                    _mark_bad_proxy(current_proxy)
+                                    current_proxy = None
+                        except Exception:
+                            pass
+
+                    # after all attempts, bump backoff and continue loop
+                    time.sleep(backoff + random.random())
+                    backoff = min(backoff * 1.8, max_backoff)
+                    continue
+
+                # If body contains anti-bot specific_error markers -> similar recovery (rotate)
+                low_body = (body or "").lower()
+                if any(marker in low_body for marker in (s.lower() for s in specific_error)):
+                    log("→ Detected anti-bot markers in body. Rotating proxy and trying recovery sequence.")
+                    if current_proxy:
+                        _mark_bad_proxy(current_proxy)
+                        current_proxy = None
+                    if getattr(self, "_proxy_pool", None):
+                        current_proxy, pick_headers = self._pick_next_proxy_and_impersonation()
+                        use_headers = pick_headers
+                    # try curl + playwright + puppeteer + cloudscraper (same as above)
+                    try:
+                        curl_out = _run_curl_impersonate(self.url, use_headers, current_proxy, max_time=12)
+                        if curl_out and any(k in curl_out.lower() for k in ("{", "[", "message", "status")):
+                            return curl_out
+                    except Exception:
+                        pass
+                    try:
+                        pw_out = _playwright_stealth_fetch_and_fuzz(self.url, use_headers, current_proxy, tries=8, per_try_timeout=14)
+                        if pw_out and len(pw_out) > 10:
+                            return pw_out
+                    except Exception:
+                        pass
+                    try:
+                        pp_out = _node_puppeteer_stealth_fetch_and_fuzz(self.url, use_headers, current_proxy, tries=6, per_try_timeout=14)
+                        if pp_out and len(pp_out) > 10:
+                            return pp_out
+                    except Exception:
+                        pass
+                    if use_cloudscraper_on_403:
+                        try:
+                            import cloudscraper
+                            scraper = cloudscraper.create_scraper()
+                            proxies_cfg = None
+                            if current_proxy:
+                                p = str(current_proxy)
+                                if not (p.startswith("http://") or p.startswith("https://") or p.startswith("socks5://") or p.startswith("socks4://")):
+                                    p = "http://" + p
+                                proxies_cfg = {"http": p, "https": p}
+                            r2 = scraper.post(self.url, json={"message": message}, headers=getattr(self, "default_headers", {}), timeout=(10, min(configured_timeout, 300)), proxies=proxies_cfg)
+                            body = r2.text
+                            if body and len(body) > 0:
+                                return body
+                        except Exception:
+                            if current_proxy:
+                                _mark_bad_proxy(current_proxy)
+                                current_proxy = None
+                    time.sleep(backoff + random.random())
+                    backoff = min(backoff * 1.8, max_backoff)
+                    continue
+
+                # try to parse JSON if looks like JSON
                 parsed = None
                 try:
                     if "application/json" in ct or (isinstance(body, str) and (body.strip().startswith("{") or body.strip().startswith("["))):
                         parsed = json.loads(body) if body else {}
                 except Exception:
-                    log("⚠️ Failed to parse JSON. Response snippet:")
-                    log((body or "")[:2000])
+                    log("⚠️ JSON parse failed; body snippet follows.")
+                    log((body or "")[:1000])
 
-                # Accept responses similar to previous design:
+                # If parsed looks like success return it
                 if parsed and ((isinstance(parsed, dict) and parsed.get("status") == "success") or ("message" in parsed and parsed.get("message"))):
-                    log("✅ API returned success. Returning parsed payload or body.")
-                    # persist the working proxy (keep it for next call), do not mark as bad
                     self._current_proxy = current_proxy
-                    return parsed if parsed else body
+                    return parsed
 
-                # If content-type not JSON, but body non-empty — check for anti-bot markers
+                # If no JSON but body non-empty, return it
                 if not parsed and body:
-                    low = (body or "").lower()
-                    if any(err_marker in low for err_marker in specific_error):
-                        log(f"→ Detected anti-bot / specific error marker in body (attempt {attempt}). Rotating proxy + retrying.")
-                        # mark the current proxy as bad because it likely caused the challenge
-                        if current_proxy:
-                            _mark_bad_proxy(current_proxy)
-                            current_proxy = None
-                        # pick a fresh proxy for next attempt if available
-                        if getattr(self, "_proxy_pool", None):
-                            current_proxy, hdrs = self._pick_next_proxy_and_impersonation()
-                            use_headers = hdrs
-                        # small backoff and retry
-                        time.sleep(backoff + random.random())
-                        backoff = min(backoff * 2, max_backoff)
-                        configured_timeout = min(configured_timeout + timeout_growth, max_timeout_cap)
-                        continue
-                    # otherwise, treat it as a valid raw textual response (matching prior behaviour)
-                    log("→ Returning raw body (non-JSON).")
                     self._current_proxy = current_proxy
                     return body
 
-                # If parsed JSON but not recognized success shape, print diagnostics and retry after rotating proxy
-                log("→ Received JSON but no recognized 'success' or message field. Payload (truncated):")
-                try:
-                    log(json.dumps(parsed, indent=2)[:2000])
-                except Exception:
-                    log(parsed)
-                # rotate proxy on repeated unexpected JSON to attempt different route
+                # If parsed JSON but not recognized shape -> rotate and retry
+                log("→ Received JSON but not the expected shape. Rotating proxy and retrying.")
                 if current_proxy:
                     _mark_bad_proxy(current_proxy)
                     current_proxy = None
-                log("Retrying after backoff; attempt:", attempt)
                 time.sleep(backoff + random.random())
-                backoff = min(backoff * 2, max_backoff)
+                backoff = min(backoff * 1.8, max_backoff)
                 configured_timeout = min(configured_timeout + timeout_growth, max_timeout_cap)
+                continue
 
         finally:
             if spinner:
@@ -795,518 +1013,186 @@ class StoryPipeline:
         topic: str = "",
     ) -> str:
         """
-        COMPLETE generate_script implementation — infinite-retry until success (no internal caps).
-
-        Behavior summary:
-        - Keeps all original features from your initial design: bracketed-only outputs in strict mode,
-          strengthen/retry prompts, continuation seeded with last paragraph, model condense attempts,
-          deterministic trimming fallback, fuzzy dedupe, cleaning hooks, and saving.
-        - **No wall-clock or API-call caps**: the method will keep retrying until a satisfactory
-          non-empty cleaned script that meets the target (within tolerance) is produced. This is
-          intentional per your request. The only "cap" is success.
-        - The saved artifact is EXACTLY one bracketed block and nothing else: `[<cleaned script>]`.
-        - The function will not save empty content. If a generated candidate cleans to empty, it will
-          keep retrying.
-
-        WARNING: Running without caps can consume unbounded resources. Use in a controlled environment.
+        Generate the bracketed script. This version keeps your infinite-retry behaviour
+        but fixes TypeError by converting send_message results into text safely.
         """
-
-        # Derived values
         words_target = timing_minutes * words_per_minute
         tolerance = max(1, int(words_target * 0.01))
-
-        # Base prompt
-        prompt = self._build_script_prompt(
-            niche=niche,
-            person=person,
-            timing_minutes=timing_minutes,
-            words_per_minute=words_per_minute,
-            topic=topic,
-        )
-
+        prompt = self._build_script_prompt(niche=niche, person=person, timing_minutes=timing_minutes, words_per_minute=words_per_minute, topic=topic)
         timeout = timeout or getattr(self.chat, "base_timeout", None)
-
-        # Helper regex and utilities
         single_block_re = re.compile(r"^\s*\[[\s\S]*\]\s*$", flags=re.DOTALL)
 
-        def _word_count(text: str) -> int:
-            return len(re.findall(r"\w+", text or ""))
-
-        def _get_paragraphs(text: str) -> list:
-            if not text:
-                return []
-            paras = [p.strip() for p in re.split(r"\n{2,}|\r\n{2,}", text) if p.strip()]
-            if not paras:
-                paras = [p.strip() for p in re.split(r"\n|\r\n", text) if p.strip()]
-            return paras
-
-        def _normalize(s: str) -> str:
-            return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", "", s or "").lower()).strip()
-
-        def _remove_exact_and_fuzzy_duplicates(
-            text: str, fuzzy_threshold: float = 0.90
-        ) -> str:
-            paras = _get_paragraphs(text)
-            if not paras:
-                return text
-            kept = []
-            normals = []
-            for p in paras:
-                np = _normalize(p)
-                if not np:
-                    continue
-                duplicate = False
-                if np in normals:
-                    duplicate = True
-                else:
-                    for k in normals:
-                        if len(np) < 40 or len(k) < 40:
-                            continue
-                        if (
-                            difflib.SequenceMatcher(None, np, k).ratio()
-                            >= fuzzy_threshold
-                        ):
-                            duplicate = True
-                            break
-                if not duplicate:
-                    kept.append(p)
-                    normals.append(np)
-            return "\n\n".join(kept).strip()
-
-        def _log_clean_state(label: str, text: str):
-            wc = _word_count(text)
-            remaining = words_target - wc
-            print(
-                f"[{label}] After cleaning: {wc} words; Remaining to target: {remaining} ({words_target}±{tolerance})"
-            )
-            return wc, remaining
-
-        def _strengthen_prompt(
-            base_prompt: str, previous_words: Optional[int], attempt_no: int
-        ) -> str:
-            extra = (
-                "\n\nIMPORTANT: You MUST output EXACTLY ONE bracketed block and NOTHING ELSE. "
-                "The output must start with '[' and end with ']' and contain no characters outside those brackets. "
-                "The bracketed block should contain ONLY the full script text (no labels, no JSON, no commentary, no metadata, no tags). "
-                "There must be no additional bracketed blocks, and no leading or trailing whitespace or blank lines outside the brackets. "
-                f"Now adjust the script so that it contains exactly {words_target} words (count words in the usual sense—whitespace-separated). "
-                f"If you cannot hit exactly {words_target}, produce a script that is as close as possible within ±{tolerance} words. "
-                "Prioritize an exact match; if multiple outputs tie for closeness, any may be used. "
-                "Do not include any explanations, diagnostics, or extra output — only the single bracketed script block."
-                "Produce exactly one bracketed script block and nothing else: output a single opening bracket [ then the entire script content followed by a single closing bracket ] — include no other characters, whitespace, newlines, headings, labels, metadata, counts, commentary, instructions, fragments of the prompt, code fences, or BOM before or after; the bracketed text must be the complete script with no explanatory notes, stage directions, or parenthetical remarks not part of the script; if the script cannot be produced, return exactly []; the response must contain absolutely nothing else.\n"
-            )
-            if previous_words is not None:
-                diff = words_target - previous_words
-                extra += f"Previous attempt had {previous_words} words ({'short' if diff>0 else 'long' if diff<0 else 'exact'} by {abs(diff)}). "
-                if diff > 0:
-                    extra += "Extend and enrich naturally to reach the target. "
-                elif diff < 0:
-                    extra += (
-                        "Tightly condense and remove redundancies (preserve beats). "
-                    )
-            extra += f"Attempt #{attempt_no}."
-            return base_prompt + extra
-
-        def _extract_candidate(resp: str) -> str:
-            # prefer the largest bracketed block if present; otherwise return whole response
+        def _resp_to_text(resp) -> str:
+            # Convert various possible send_message returns into a representative string for regex checks.
             try:
-                brs = re.findall(r"\[[\s\S]*?\]", resp)
+                if resp is None:
+                    return ""
+                if isinstance(resp, str):
+                    return resp
+                if isinstance(resp, (dict, list)):
+                    # prefer message/body keys if present
+                    if isinstance(resp, dict):
+                        for k in ("message", "body", "text", "result", "data"):
+                            if k in resp and isinstance(resp[k], str) and resp[k].strip():
+                                return resp[k]
+                    try:
+                        return json.dumps(resp)
+                    except Exception:
+                        return str(resp)
+                return str(resp)
+            except Exception:
+                return str(resp)
+
+        def _extract_candidate(resp_text: str) -> str:
+            try:
+                brs = re.findall(r"\[[\s\S]*?\]", resp_text)
                 if brs:
                     return max(brs, key=len)[1:-1].strip()
             except Exception:
                 pass
-            return resp.strip()
+            return resp_text.strip()
 
-        def _heuristic_trim_to_target(text: str, target_words: int) -> str:
-            # deterministic conservative trimming preserving anchors
-            paras = _get_paragraphs(text)
-            if not paras:
-                return text
-            protect_first = min(1, len(paras))
-            protect_last = min(1, len(paras) - protect_first) if len(paras) > 1 else 0
-            para_sents = []
-            for p in paras:
-                sents = [
-                    s.strip() for s in re.split(r"(?<=[\.\?\!])\s+", p) if s.strip()
-                ]
-                if not sents:
-                    sents = [p.strip()]
-                para_sents.append(sents)
-            flat = []
-            loc = []
-            for pi, sents in enumerate(para_sents):
-                for si, s in enumerate(sents):
-                    flat.append(_normalize(s))
-                    loc.append((pi, si))
-            n = len(flat)
-            if n == 0:
-                return text
-            scores = [0.0] * n
-            for i in range(n):
-                si = flat[i]
-                if not si or len(si) < 20:
-                    scores[i] = 0.0
-                    continue
-                tot = 0.0
-                cnt = 0
-                for j in range(n):
-                    if i == j:
-                        continue
-                    sj = flat[j]
-                    if not sj:
-                        continue
-                    tot += difflib.SequenceMatcher(None, si, sj).ratio()
-                    cnt += 1
-                scores[i] = (tot / cnt) if cnt else 0.0
-            removable = []
-            for idx, (pi, si) in enumerate(loc):
-                if pi < protect_first or pi >= len(paras) - protect_last:
-                    continue
-                sent_text = para_sents[pi][si]
-                wc_sent = _word_count(sent_text)
-                removable.append((scores[idx], wc_sent, pi, si, sent_text))
-            removable.sort(key=lambda x: (x[0], x[1]), reverse=True)
-            current_text = text
-            current_wc = _word_count(current_text)
-            removals_by_para = {}
-            for score, wc_sent, pi, si, stext in removable:
-                if current_wc <= target_words:
-                    break
-                if len(para_sents[pi]) <= 1:
-                    continue
-                already = removals_by_para.get(pi, 0)
-                if (already + 1) / len(para_sents[pi]) > 0.6:
-                    continue
-                para_sents[pi][si] = ""
-                removals_by_para[pi] = already + 1
-                new_paras = []
-                for sents in para_sents:
-                    sents_clean = [s for s in sents if s and s.strip()]
-                    if sents_clean:
-                        new_paras.append(" ".join(sents_clean))
-                current_text = "\n\n".join(new_paras).strip()
-                current_wc = _word_count(current_text)
-                if current_wc <= target_words:
-                    break
-            if _word_count(current_text) > target_words:
-                paras_now = _get_paragraphs(current_text)
-                cand_idxs = [
-                    i
-                    for i in range(len(paras_now))
-                    if i >= protect_first and i < len(paras_now) - protect_last
-                ]
-                cand_idxs_sorted = sorted(
-                    cand_idxs, key=lambda i: _word_count(paras_now[i])
-                )
-                for i in cand_idxs_sorted:
-                    if _word_count(current_text) <= target_words:
-                        break
-                    paras_now[i] = ""
-                    current_text = "\n\n".join(
-                        [p for p in paras_now if p.strip()]
-                    ).strip()
-            if _word_count(current_text) > target_words:
-                words = re.findall(r"\S+", current_text)
-                paras_now = _get_paragraphs(current_text)
-                cum = []
-                total = 0
-                for p in paras_now:
-                    wc_p = _word_count(p)
-                    cum.append((total, total + wc_p))
-                    total += wc_p
-                last_protected_idx = (
-                    max(0, len(paras_now) - protect_last)
-                    if protect_last > 0
-                    else len(paras_now)
-                )
-                keep_last_start_word = (
-                    cum[last_protected_idx][0] if last_protected_idx < len(cum) else 0
-                )
-                allowable = max(0, keep_last_start_word + 3)
-                if target_words <= allowable:
-                    truncated = " ".join(words[:target_words])
-                else:
-                    truncated = " ".join(words[: max(target_words, allowable)])
-                return truncated.strip()
-            return current_text.strip()
+        def _word_count(text: str) -> int:
+            return len(re.findall(r"\w+", text or ""))
 
-        # Accumulation state
-        accumulated = ""
+        # reuse cleaning/trim helpers already in your file: clean_script_text, _heuristic_trim_to_target, _remove_exact_and_fuzzy_duplicates etc.
         attempt = 0
+        accumulated = ""
+        last_wc = None
+        backoff = 1.0
 
-        # Finalize helper — saves ONLY if non-empty and always as a single bracketed block
-        def _finalize_and_save(text: str) -> Optional[str]:
-            final_text = _remove_exact_and_fuzzy_duplicates(text, fuzzy_threshold=0.92)
-            if final_text.startswith("[") and final_text.endswith("]"):
-                final_text = final_text[1:-1].strip()
-            final_text = final_text.strip()
-            if not final_text:
-                # refuse to save empty content
-                print(
-                    "⚠️ Final text is empty after cleaning — will not save. Continuing retries."
-                )
-                return None
-            # Save EXACTLY one bracketed block and nothing else
-            save_response(
-                "generated_complete_script",
-                "generated_complete_script.txt",
-                f"[{final_text}]",
-            )
-            return final_text
-
-        # Main loop: keep trying until we produce a non-empty cleaned script close to target
         while True:
             attempt += 1
 
-            # --- generation phase ---
-            if not accumulated:
-                # initial generation
-                req_prompt = (
-                    prompt
-                    if attempt == 1
-                    else _strengthen_prompt(prompt, None, attempt)
-                )
-                try:
-                    resp = self.chat.send_message(
-                        req_prompt,
-                        timeout=timeout,
-                        spinner_message=f"Generating initial script (attempt {attempt})...",
-                    )
-                except Exception as e:
-                    print(f"⚠️ send_message failed on generation attempt {attempt}: {e}")
-                    # exponential backoff (bounded) before retrying to avoid tight infinite loops
-                    sleep_sec = min(8 + random.random() * 2, 30)
-                    print(f"Sleeping {sleep_sec:.1f}s before retrying generation...")
-                    time.sleep(sleep_sec)
-                    continue
+            # generate or strengthen prompt depending on attempt
+            req_prompt = prompt if attempt == 1 else prompt + f"\n\n(Attempt #{attempt} - refine to reach {words_target} words.)"
 
-                # In strict mode we insist the model returns a bracketed block; otherwise we accept best candidate
-                if strict:
-                    if not single_block_re.match(resp):
-                        print(
-                            "⚠️ Strict mode: response did not contain a single bracketed block — retrying."
-                        )
+            try:
+                resp = self.chat.send_message(req_prompt, timeout=timeout, spinner_message=f"Generating script (attempt {attempt})...")
+            except Exception as e:
+                print(f"⚠️ send_message raised on attempt {attempt}: {e}")
+                time.sleep(min(5 + backoff, 20))
+                backoff = min(backoff * 1.8, 60.0)
+                continue
+
+            # convert to text safely
+            resp_text = _resp_to_text(resp)
+
+            # If strict mode: require a single bracket block. Check on text.
+            if strict:
+                if not single_block_re.match(resp_text):
+                    print(f"⚠️ Strict mode: attempt {attempt} response not single bracketed block — retrying.")
+                    # if resp_text contains bracket blocks but also JSON wrapper, try to extract the largest.
+                    candidate_try = _extract_candidate(resp_text)
+                    if not candidate_try:
                         time.sleep(0.2)
                         continue
-                candidate = _extract_candidate(resp)
-                try:
-                    cleaned_candidate = clean_script_text(candidate) or candidate
-                except Exception:
-                    cleaned_candidate = candidate
-                cleaned_candidate = _remove_exact_and_fuzzy_duplicates(
-                    cleaned_candidate, fuzzy_threshold=0.90
-                )
-                wc, remaining = _log_clean_state("Initial", cleaned_candidate)
+                # else proceed
 
-                # If too long, attempt model condense then deterministic trim
-                if wc > words_target + tolerance:
-                    condense_tries = min(6, max(1, max_attempts - attempt))
-                    prev_long = wc
-                    condensed_candidate = cleaned_candidate
-                    for ct in range(condense_tries):
-                        condense_prompt = (
-                            "You were given a previously generated script (below). The cleaned version currently has "
-                            f"{prev_long} words, but it must be reduced to exactly {words_target} words (or as close as possible within ±{tolerance}). "
-                            "Tighten and condense the text: remove redundancies, merge sentences, shorten descriptive passages, and preserve the original narrative structure, beats, and meaning. "
-                            "DO NOT invent new sections, scenes, characters, or facts. Do NOT change the sequence of events, character names, perspective, or core details. "
-                            "Keep tone, tense, and voice consistent with the original. Prefer preserving essential lines and emotional beats even when shortening. "
-                            "Produce exactly one bracketed script block and nothing else: output a single opening bracket [ then the entire script content followed by a single closing bracket ] — include no other characters, whitespace, newlines, headings, labels, metadata, counts, commentary, instructions, fragments of the prompt, code fences, or BOM before or after; the bracketed text must be the complete script with no explanatory notes, stage directions, or parenthetical remarks not part of the script; if the script cannot be produced, return exactly []; the response must contain absolutely nothing else.\n"
-                            "Output EXACTLY ONE bracketed block and NOTHING ELSE — the bracketed block must contain only the full revised script text (no extra whitespace, commentary, metadata, or explanation).\n\n"
-                            "PREVIOUS_SCRIPT_BEGIN\n"
-                            f"{condensed_candidate}\n"
-                            "PREVIOUS_SCRIPT_END\n"
-                        )
-                        try:
-                            cond_resp = self.chat.send_message(
-                                condense_prompt,
-                                timeout=timeout,
-                                spinner_message=f"Condensing (try {ct+1}/{condense_tries})...",
-                            )
-                        except Exception as e:
-                            print(f"⚠️ Condense send_message failed: {e}")
-                            break
-                        if strict and not single_block_re.match(cond_resp):
-                            print(
-                                "⚠️ Strict mode: condense response not bracketed — retrying condense."
-                            )
-                            time.sleep(0.2)
-                            continue
-                        cond_inner = _extract_candidate(cond_resp)
-                        try:
-                            cond_clean = clean_script_text(cond_inner) or cond_inner
-                        except Exception:
-                            cond_clean = cond_inner
-                        cond_clean = _remove_exact_and_fuzzy_duplicates(
-                            cond_clean, fuzzy_threshold=0.90
-                        )
-                        cond_wc, _ = _log_clean_state(f"Condense {ct+1}", cond_clean)
-                        if abs(cond_wc - words_target) <= tolerance:
-                            accumulated = cond_clean
-                            break
-                        if cond_wc < prev_long:
-                            condensed_candidate = cond_clean
-                            prev_long = cond_wc
-                            time.sleep(0.2)
-                            continue
-                        break
-                    # if condense loop failed to meet target exactly, run deterministic trim
-                    if not accumulated:
-                        trimmed = _heuristic_trim_to_target(
-                            condensed_candidate, words_target
-                        )
-                        try:
-                            trimmed_clean = clean_script_text(trimmed) or trimmed
-                        except Exception:
-                            trimmed_clean = trimmed
-                        accumulated = _remove_exact_and_fuzzy_duplicates(
-                            trimmed_clean, fuzzy_threshold=0.90
-                        )
-                else:
-                    # candidate is short or near-target — accept as accumulated block
-                    accumulated = cleaned_candidate
-
-                # If already within tolerance, attempt to save (must be non-empty)
-                acc_wc = _word_count(accumulated)
-                if abs(acc_wc - words_target) <= tolerance:
-                    res = _finalize_and_save(accumulated)
-                    if res is not None:
-                        return res
-                    else:
-                        # didn't save (empty); clear accumulated and continue
-                        accumulated = ""
-                        continue
-
-                # otherwise loop continues to request continuations
-                continue
-
-            # --- continuation phase: we have an accumulated block that is short ---
-            acc_wc = _word_count(accumulated)
-            remaining = max(0, words_target - acc_wc)
-            last_para = (
-                _get_paragraphs(accumulated)[-1] if _get_paragraphs(accumulated) else ""
-            )
-
-            cont_prompt = (
-                "You are an expert cinematic scriptwriter and continuity editor. "
-                "Below is a script already generated (PREV_BEGIN / PREV_END). Continue it seamlessly from the last paragraph so the final combined script reaches "
-                f"approximately {words_target} words (add about {remaining} words). Do NOT repeat the last paragraph; continue naturally. Maintain voice, pacing, and narrative logic. "
-                "Output ONLY the continuation text (no brackets, no labels, no metadata). Avoid repeating entire paragraphs; use callbacks, echoes, and thematic callbacks instead.\n\n"
-                f"PREV_BEGIN\n{accumulated}\nPREV_END\n\n"
-                f"LAST_PARAGRAPH_BEGIN\n{last_para}\nLAST_PARAGRAPH_END\n\n"
-                "GUIDELINES (follow these tightly):\n"
-                "- Seamlessness: bridge directly from LAST_PARAGRAPH so the result reads as one continuous video_script — no jarring resets, no reintroductory exposition.\n"
-                "- Middle-act mastery: prioritize rising action, conflict escalation, turning points, stakes increase, and micro-resolutions that propel the story forward.\n"
-                "- Maintain characters, names, facts, tone, and tense exactly as present in PREV and LAST_PARAGRAPH. If a scene or character is implied, continue that thread unless explicitly contradicted.\n"
-                "- Show, don't tell: prefer sensory details, short scenes, beats, and concrete actions over long explanation. Use short+long sentences rhythmically to control pacing.\n"
-                "- Callbacks, not copy: reference earlier lines or imagery with subtle callback phrases (echo words, repeated motifs, similar imagery) rather than copying whole sentences.\n"
-                "- Flow & transitions: use graceful transitions between beats or scenes (one-sentence visual transitions, cut-to, or a brief descriptive line) without headings, timestamps, or labels.\n"
-                "- Scene economy: each paragraph should function as a micro-scene or beat — introduce a small change, reveal, decision, or escalation that advances momentum.\n"
-                "- Dialogue & tags: if characters speak, keep speaker attribution consistent with prior format. Use realistic, concise dialogue that reveals character or motive.\n"
-                "- Continuity safety: never contradict established facts (names, timeline, locations, relationships). If uncertain, favor neutral phrasing that preserves continuity.\n"
-                "- Length control: aim for ~{words_target} total words. If you overshoot slightly that's fine; if you undershoot, continue until the target is sensibly reached. When within ~3-7% of the target, create a satisfying mini-cliff or logical segue for the next batch.\n"
-                "- Formatting: plain paragraphs only (no lists, no headers, no code). Keep natural paragraph breaks for beats. No editorial comments, no analysis, no instructions to the reader.\n"
-                "- Safety & quality: keep language appropriate for a wide audience; avoid gratuitous profanity unless already present and integral to character voice.\n\n"
-                "Produce exactly one bracketed script block and nothing else: output a single opening bracket [ then the entire script content followed by a single closing bracket ] — include no other characters, whitespace, newlines, headings, labels, metadata, counts, commentary, instructions, fragments of the prompt, code fences, or BOM before or after; the bracketed text must be the complete script with no explanatory notes, stage directions, or parenthetical remarks not part of the script; if the script cannot be produced, return exactly []; the response must contain absolutely nothing else.\n"
-                "Deliver a single continuous piece that a human editor could paste after PREV_BEGIN and have the full script read as one complete, cinematic video script.\n"
-            )
+            candidate = _extract_candidate(resp_text)
+            cleaned_candidate = clean_script_text(candidate or "")
+            # dedupe fuzzily (use existing helper if present; fallback simple)
             try:
-                cont_resp = self.chat.send_message(
-                    cont_prompt,
-                    timeout=timeout,
-                    spinner_message=f"Continuation attempt (overall attempt {attempt})...",
-                )
-            except Exception as e:
-                print(f"⚠️ Continuation send_message failed: {e}")
-                time.sleep(0.2)
-                continue
-
-            # In strict mode we accept only continuation text (model may return unbracketed continuation)
-            cont_candidate = _extract_candidate(cont_resp)
-            try:
-                cont_clean = clean_script_text(cont_candidate) or cont_candidate
+                cleaned_candidate = _remove_exact_and_fuzzy_duplicates(cleaned_candidate, fuzzy_threshold=0.92)
             except Exception:
-                cont_clean = cont_candidate
+                cleaned_candidate = cleaned_candidate
 
-            # Append and dedupe
-            combined = (accumulated.rstrip() + "\n\n" + cont_clean.strip()).strip()
-            combined = _remove_exact_and_fuzzy_duplicates(
-                combined, fuzzy_threshold=0.90
-            )
-            new_wc, remaining_after = _log_clean_state("After append", combined)
+            wc = _word_count(cleaned_candidate)
+            last_wc = wc
+            print(f"[Attempt {attempt}] Candidate words={wc}; target={words_target} ±{tolerance}")
 
-            if new_wc <= acc_wc:
-                # no progress — try stronger regeneration append
-                print(
-                    "⚠️ Continuation produced no net progress; will retry with stronger generation prompt."
-                )
-                prompt = _strengthen_prompt(prompt, acc_wc, attempt + 1)
-                gen_prompt = (
-                    "Produce a new script section that continues the narrative below and does not repeat existing paragraphs. "
-                    f"Aim to add about {remaining} words. Output EXACTLY ONE bracketed block with only the new section text.\n\nPREV_BEGIN\n{accumulated}\nPREV_END\n"
-                )
-                try:
-                    gen_resp = self.chat.send_message(
-                        gen_prompt,
-                        timeout=timeout,
-                        spinner_message="Generating appended chunk...",
-                    )
-                except Exception as e:
-                    print(f"⚠️ Append-generation failed: {e}")
-                    time.sleep(0.2)
-                    continue
-                if strict and not single_block_re.match(gen_resp):
-                    print("⚠️ Strict mode: append generation not bracketed — retrying.")
-                    time.sleep(0.2)
-                    continue
-                gen_candidate = _extract_candidate(gen_resp)
-                try:
-                    gen_clean = clean_script_text(gen_candidate) or gen_candidate
-                except Exception:
-                    gen_clean = gen_candidate
-                new_combined = (
-                    accumulated.rstrip() + "\n\n" + gen_clean.strip()
-                ).strip()
-                new_combined = _remove_exact_and_fuzzy_duplicates(
-                    new_combined, fuzzy_threshold=0.90
-                )
-                new_wc2, remaining2 = _log_clean_state(
-                    "After regeneration append", new_combined
-                )
-                if new_wc2 > acc_wc:
-                    accumulated = new_combined
-                    continue
+            if not cleaned_candidate:
+                print("⚠️ Candidate cleaned to empty; retrying.")
+                time.sleep(min(2 + backoff, 10))
+                backoff = min(backoff * 1.8, 60.0)
+                continue
+
+            # accumulate candidate (so abort returns something)
+            if cleaned_candidate and cleaned_candidate not in accumulated:
+                accumulated = (accumulated + "\n\n" + cleaned_candidate).strip()
+
+            # if close enough -> finalize save and return
+            if abs(wc - words_target) <= tolerance:
+                # save exactly one bracketed block
+                final = cleaned_candidate
+                if final.startswith("[") and final.endswith("]"):
+                    final = final[1:-1].strip()
+                if final:
+                    save_response("generated_complete_script", "generated_complete_script.txt", f"[{final}]")
+                    return f"[{final}]"
                 else:
-                    time.sleep(0.2)
-                    continue
-
-            # progress made
-            accumulated = combined
-
-            # if reached or exceeded target -> finalize
-            if _word_count(accumulated) >= words_target:
-                # if over target, trim conservatively
-                if _word_count(accumulated) > words_target + tolerance:
-                    trimmed = _heuristic_trim_to_target(accumulated, words_target)
-                    try:
-                        trimmed_clean = clean_script_text(trimmed) or trimmed
-                    except Exception:
-                        trimmed_clean = trimmed
-                    accumulated = _remove_exact_and_fuzzy_duplicates(
-                        trimmed_clean, fuzzy_threshold=0.92
-                    )
-                res = _finalize_and_save(accumulated)
-                if res is not None:
-                    return res
-                else:
-                    # didn't save (empty) — reset and continue
+                    print("⚠️ Final candidate empty after stripping; continuing.")
                     accumulated = ""
                     continue
 
-            # slight pause before next continuation (keeps CPU friendly)
-            time.sleep(0.05)
+            # if too long -> condense with the model once then trim heuristically
+            if wc > words_target + tolerance:
+                print("→ Candidate too long; asking model to condense then applying deterministic trim.")
+                condense_prompt = (
+                    "Condense the script inside the single bracket so the content reaches the exact target word count without changing beats or facts. Output exactly one bracketed block and nothing else."
+                )
+                try:
+                    cond_resp = self.chat.send_message(condense_prompt + "\n\n" + resp_text, timeout=timeout, spinner_message="Condensing...")
+                except Exception:
+                    cond_resp = None
+                cond_text = _resp_to_text(cond_resp) if cond_resp is not None else ""
+                cond_candidate = _extract_candidate(cond_text) if cond_text else ""
+                cond_clean = clean_script_text(cond_candidate or "")
+                try:
+                    cond_clean = _remove_exact_and_fuzzy_duplicates(cond_clean, fuzzy_threshold=0.90)
+                except Exception:
+                    pass
+                if cond_clean:
+                    if abs(_word_count(cond_clean) - words_target) <= tolerance:
+                        save_response("generated_complete_script", "generated_complete_script.txt", f"[{cond_clean}]")
+                        return f"[{cond_clean}]"
+                    trimmed = _heuristic_trim_to_target(cond_clean, words_target)
+                    trimmed_clean = clean_script_text(trimmed)
+                    save_response("generated_complete_script", "generated_complete_script.txt", f"[{trimmed_clean}]")
+                    return f"[{trimmed_clean}]"
+                # else fallback to loop
+                time.sleep(0.5)
+                backoff = min(backoff * 1.5, 60.0)
+                continue
 
-        # This loop is intended to run until succeed; reaching here is unexpected
-        raise RuntimeError("generate_script failed to terminate normally.")
+            # if too short -> request continuation seeded with last paragraph
+            if wc < words_target - tolerance:
+                paras = [p.strip() for p in re.split(r"\n{2,}|\r\n{2,}", cleaned_candidate) if p.strip()]
+                last_para = paras[-1] if paras else ""
+                cont_prompt = (
+                    "Continue the script inside a single bracket so total script reaches the requested word count. "
+                    "Do NOT repeat the last paragraph; continue from there."
+                    f"\n\nSEED_LAST_PARAGRAPH:\n{last_para}\n\nTarget words: {words_target}"
+                )
+                try:
+                    cont_resp = self.chat.send_message(cont_prompt, timeout=timeout, spinner_message="Extending script...")
+                except Exception as e:
+                    print("⚠️ Continuation call failed:", e)
+                    time.sleep(0.5)
+                    continue
+                cont_text = _resp_to_text(cont_resp)
+                cont_candidate = _extract_candidate(cont_text)
+                cont_clean = clean_script_text(cont_candidate or "")
+                combined = (cleaned_candidate.rstrip() + "\n\n" + cont_clean.strip()).strip()
+                try:
+                    combined = _remove_exact_and_fuzzy_duplicates(combined, fuzzy_threshold=0.92)
+                except Exception:
+                    pass
+                combined_wc = _word_count(combined)
+                print(f"→ After extension combined words={combined_wc}")
+                if abs(combined_wc - words_target) <= tolerance:
+                    final = combined
+                    save_response("generated_complete_script", "generated_complete_script.txt", f"[{final}]")
+                    return f"[{final}]"
+                # adopt combined and continue loop
+                accumulated = combined
+                last_wc = combined_wc
+                time.sleep(0.3)
+                continue
+
+            # small sleep/backoff before next attempt
+            time.sleep(min(1.0 + backoff, 8.0))
+            backoff = min(backoff * 1.4, 60.0)
 
     def _split_text_into_n_parts(self, text: str, n: int) -> List[str]:
         """

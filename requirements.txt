@@ -17,3 +17,4 @@ playwright>=1.40.0
 mega.py==1.0.8
 cryptography>=42.0.0
 python-dotenv>=1.0.1
+pyppeteer
