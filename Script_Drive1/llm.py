@@ -256,6 +256,9 @@ class ChatAPI:
                 "detected cloudflare",
                 "access denied",
                 "anti-bot",
+                "Detected 403;",
+                "cloudscraper",
+                "attempting cloudscraper fallback"
             ]
 
         def log(*args, **kwargs):
