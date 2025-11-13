@@ -82,7 +82,7 @@ jobs:
           echo "No package-lock.json in repo. To enable npm caching you can generate and commit a lockfile locally:"
           echo "  npm install --package-lock-only && git add package-lock.json && git commit -m 'chore: add package-lock.json'"
 
-      - name: (Optional) Debug: list installed deps
+      - name: (Optional) Debug- list installed deps
         run: |
           python -m pip show requests cloudscraper playwright || true
           node -v && npm -v || true
