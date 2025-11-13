@@ -3,10 +3,6 @@ name: Run short all script
 on:
   workflow_dispatch:
 
-concurrency:
-  group: run-short-all-script-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   run-script:
     runs-on: ubuntu-latest
@@ -74,7 +70,7 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y curl
 
-      - name: (Optional) Debug: list installed deps
+      - name: (Optional) Debug- list installed deps
         run: |
           python -m pip show requests cloudscraper playwright || true
           node -v && npm -v || true
