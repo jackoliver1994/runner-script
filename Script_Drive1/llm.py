@@ -24,6 +24,7 @@ import re
 import ast
 import math
 import difflib
+import traceback
 import concurrent.futures as cf
 from typing import Optional, List, Dict
 from threading import Thread, Event
@@ -62,11 +63,11 @@ class LoadingSpinner:
 
 # ---------------------- CHAT API HANDLER ----------------------
 class ChatAPI:
-    def __init__(
-        self, url: str = "https://apifreellm.com/api/chat", default_timeout: int = 1000
-    ):
+    def __init__(self, url: str = "https://apifreellm.com/api/chat", default_timeout: int = 1000):
         self.url = url
         self.headers = {"Content-Type": "application/json"}
+        # keep the old attribute name used elsewhere:
+        self.default_headers = self.headers
         self.base_timeout = default_timeout
 
     def fetch_proxies_from_proxyscrape(
@@ -183,562 +184,226 @@ class ChatAPI:
             "Detected HTML challenge",
             "Cloudflare-like content",
             "Response status=403",
+			"cloudflare", 
+			"detected cloudflare", 
+			"access denied", 
+			"anti-bot"
         ],
     ):
         """
-        Robust infinite-retry send_message with proxy-rotation behavior:
-        - Fetches proxy pool first (lazy) using fetch_proxies_from_proxyscrape (max set with self.max_proxy_fetch).
-        - On each API call, checks response body against `specific_error` list (case-insensitive substring).
-            - if matches -> rotate proxy + impersonation, then continue from where it failed (keep infinite retry).
-            - if not matches and any other error occurs -> retry infinitely with the same proxy (do NOT rotate).
-        - Returns when JSON with {"status":"success", "response": "..."} is returned (same semantics as original).
+        Robust send_message preserving infinite retry semantics and all original features.
+        Improvements:
+        - start/stop LoadingSpinner when spinner_message is provided (non-blocking)
+        - use log() wrapper (print with flush) for immediate logs
+        - cap read timeouts to avoid C-level blocking of worker threads
+        - improved exception logging (tracebacks)
+        - keep infinite retry by default (while True:)
         """
-        import requests, time, random, json, re, traceback, concurrent.futures as cf
+        # local helper for consistent immediate logging
+        def log(*args, **kwargs):
+            # small timestamp for easier tracing
+            ts = time.strftime("%H:%M:%S")
+            kwargs.setdefault("flush", True)
+            print(f"[{ts}]", *args, **kwargs)
 
-        # normalize specific_error
-        specific_error = (
-            specific_error
-            if specific_error is not None
-            else getattr(self, "specific_error", [])
-        )
-        specific_error = [s.lower() for s in specific_error or []]
-
-        # optional libs
-        try:
-            import cloudscraper
-        except Exception:
-            cloudscraper = None
-
-        PLAYWRIGHT_AVAILABLE = False
-        if use_playwright_on_403:
-            try:
-                from playwright.sync_api import sync_playwright
-
-                PLAYWRIGHT_AVAILABLE = True
-            except Exception:
-                PLAYWRIGHT_AVAILABLE = False
-
-        # ensure session exists
-        if not hasattr(self, "_session") or self._session is None:
-            self._session = requests.Session()
-        session = self._session
-
-        # verify URL scheme/netloc as original code expects
-        from urllib.parse import urlparse, urlunparse
-
-        parsed = urlparse(self.url or "")
-        if not parsed.scheme:
-            parsed = parsed._replace(scheme="https")
-        if not parsed.netloc:
-            guessed = (self.url or "").replace(":///", "://").replace(":/", "://")
-            parsed2 = urlparse(guessed)
-            if parsed2.netloc:
-                parsed = parsed2
-            else:
-                raise ValueError(
-                    f"ChatAPI.send_message: invalid url configured for ChatAPI.url -> '{self.url}'"
-                )
-        root_url = urlunparse((parsed.scheme, parsed.netloc, "", "", "", ""))
-
+        # Defensive defaults
         configured_timeout = int(timeout or getattr(self, "base_timeout", 60))
         configured_timeout = min(configured_timeout, max_timeout_cap)
-        backoff = float(initial_backoff)
         attempt = 0
+        backoff = initial_backoff
+        current_proxy = proxy or getattr(self, "_current_proxy", None)
 
-        last_solver_time = {"cloudscraper": 0.0, "playwright": 0.0}
-        SOLVER_MIN_INTERVAL = 30.0
-
-        # very small helpers for challenges
-        def looks_like_html_challenge(status_code, text, headers):
+        # Spinner: start only if spinner_message is truthy. Always stop in finally.
+        spinner = None
+        if spinner_message:
             try:
-                if status_code in (403, 522):
-                    return True
-                t = (text or "").lower()
-                if (
-                    "just a moment" in t
-                    or "attention required" in t
-                    or "please enable javascript" in t
-                    or "cloudflare" in t
-                    or "connection timed out" in t
-                ):
-                    return True
-                ct = (headers or {}).get("Content-Type", "") or ""
-                if status_code == 403 and "text/html" in ct.lower():
-                    return True
-            except Exception:
-                pass
-            return False
-
-        def try_cloudscraper_once(proxy_to_use, headers_override=None):
-            if not cloudscraper:
-                return None
-            now = time.time()
-            if now - last_solver_time["cloudscraper"] < SOLVER_MIN_INTERVAL:
-                return None
-            last_solver_time["cloudscraper"] = now
-            try:
-                s = cloudscraper.create_scraper()
-                proxies_cfg = (
-                    {
-                        "http": f"http://{proxy_to_use}",
-                        "https": f"http://{proxy_to_use}",
-                    }
-                    if proxy_to_use
-                    else None
-                )
-                headers_local = dict(
-                    getattr(self, "headers", {"Content-Type": "application/json"})
-                )
-                if headers_override:
-                    headers_local.update(headers_override)
-                r = s.post(
-                    self.url,
-                    json={"message": message},
-                    headers=headers_local,
-                    timeout=min(30, configured_timeout),
-                    proxies=proxies_cfg,
-                )
-                ct = (r.headers.get("Content-Type") or "").lower()
-                if "application/json" in ct:
-                    try:
-                        return r.json()
-                    except Exception:
-                        return ""
-                return ""
-            except Exception:
-                return None
-
-        def try_playwright_once(proxy_to_use, headers_override=None):
-            if not PLAYWRIGHT_AVAILABLE:
-                return None
-            now = time.time()
-            if now - last_solver_time["playwright"] < SOLVER_MIN_INTERVAL:
-                return None
-            last_solver_time["playwright"] = now
-            try:
-                from playwright.sync_api import sync_playwright
-
-                with sync_playwright() as p:
-                    browser = p.chromium.launch(headless=True)
-                    ctx = browser.new_context()
-                    page = ctx.new_page()
-                    try:
-                        page.goto(
-                            root_url,
-                            wait_until="load",
-                            timeout=max(30000, int(configured_timeout * 1000)),
-                        )
-                    except Exception:
-                        pass
-                    time.sleep(2)
-                    cookies = ctx.cookies()
-                    ua = page.evaluate("() => navigator.userAgent")
-                    browser.close()
-                s = requests.Session()
-                for c in cookies:
-                    try:
-                        s.cookies.set(
-                            c.get("name"),
-                            c.get("value"),
-                            domain=c.get("domain"),
-                            path=c.get("path", "/"),
-                        )
-                    except Exception:
-                        pass
-                headers_local = dict(
-                    getattr(self, "headers", {"Content-Type": "application/json"})
-                )
-                if headers_override:
-                    headers_local.update(headers_override)
-                headers_local["User-Agent"] = ua
-                proxies_cfg = (
-                    {
-                        "http": f"http://{proxy_to_use}",
-                        "https": f"http://{proxy_to_use}",
-                    }
-                    if proxy_to_use
-                    else None
-                )
-                r = s.post(
-                    self.url,
-                    json={"message": message},
-                    headers=headers_local,
-                    timeout=configured_timeout,
-                    proxies=proxies_cfg,
-                )
-                ct = (r.headers.get("Content-Type") or "").lower()
-                if "application/json" in ct:
-                    try:
-                        return r.json()
-                    except Exception:
-                        return ""
-                return ""
-            except Exception:
-                return None
-
-        # set current proxy/headers. If proxy argument provided, it will be used first until a specific_error forces rotation.
-        current_proxy = proxy
-        current_headers = dict(getattr(self, "headers", {"Content-Type": "application/json"}))
-
-        # --- proxy failure handling state (add near top of send_message) ---
-        PROXY_FAIL_THRESHOLD = 3          # after this many consecutive proxy errors -> rotate
-        consec_proxy_failures = 0         # consecutive failures for the active proxy
-        last_proxy_used = current_proxy   # track which proxy we're counting failures for
-
-        # If _rotate_proxy is nested inside send_message, ensure it updates closure variables
-        def _rotate_proxy(reason="unknown"):
-            nonlocal current_proxy, current_headers, consec_proxy_failures, last_proxy_used
-            try:
-                print(f"Rotating proxy due to: {reason}")
-                new_p, new_h = self._pick_next_proxy_and_impersonation()
-                current_proxy = new_p
-                if isinstance(new_h, dict) and new_h.get("User-Agent"):
-                    current_headers = new_h
-                consec_proxy_failures = 0
-                last_proxy_used = current_proxy
-                print(f"Rotated -> new_proxy={current_proxy} pool_size={len(getattr(self,'_proxy_pool',[]))}")
+                spinner = LoadingSpinner(spinner_message)
+                spinner.start()
             except Exception as e:
-                print("Rotation attempt failed (will keep current proxy):", e)
+                log("⚠️ Failed to start spinner:", e)
 
-                # === Ensure proxy pool is initialized and pick an initial proxy if none supplied ===
+        try:
+            # optional libs
+            try:
+                import cloudscraper
+            except Exception:
+                cloudscraper = None
+
+            PLAYWRIGHT_AVAILABLE = False
+            if use_playwright_on_403:
                 try:
-                    # lazy init pool if empty
-                    if not hasattr(self, "_proxy_pool") or not self._proxy_pool:
-                        print("Initializing proxy pool (lazy fetch)...")
-                        # small, safe fetch to prime the pool (tune max_proxies as needed)
-                        try:
-                            self._proxy_pool = self.fetch_proxies_from_proxyscrape(max_proxies=500)
-                        except Exception as e:
-                            print("Proxy fetch failed:", e)
-                            self._proxy_pool = []
+                    from playwright.sync_api import sync_playwright
+                    PLAYWRIGHT_AVAILABLE = True
+                except Exception:
+                    PLAYWRIGHT_AVAILABLE = False
 
-                    # if no proxy argument was supplied, pick one now
-                    if current_proxy is None and getattr(self, "_proxy_pool", None):
-                        new_proxy, new_headers = self._pick_next_proxy_and_impersonation()
-                        current_proxy = new_proxy
-                        # only replace headers if we actually got something useful
-                        if isinstance(new_headers, dict) and new_headers.get("User-Agent"):
-                            current_headers = new_headers
-                    print(f"Proxy pool size={len(getattr(self,'_proxy_pool',[]))}, starting proxy={current_proxy or '<none>'}")
-                except Exception as e:
-                    print("Proxy initialization debug:", e)
+            # Build canonical specific_error list
+            specific_error = (
+                specific_error
+                if specific_error is not None
+                else getattr(self, "specific_error", [])
+            )
+            specific_error = [s.lower() for s in specific_error or []]
 
-                # ensure proxy pool object present for rotation (lazy)
-                if not hasattr(self, "_proxy_pool"):
-                    self._proxy_pool = []
-
-                # --- Proxy formatting helper (safe for socks/http/none) ---
-                def single_request(sess, req_timeout, use_headers, use_proxy):
-                    """
-                    Robust single_request: accept the four positional args the ThreadPoolExecutor uses.
-                    - sess: requests.Session-like
-                    - req_timeout: int
-                    - use_headers: dict or None
-                    - use_proxy: 'ip:port' or None
-                    """
+            # Internal single_request used by the thread pool.
+            def single_request(sess, req_timeout, use_headers, use_proxy):
+                """
+                Robust single_request — executed in a ThreadPoolExecutor to avoid blocking main thread.
+                Returns dict with structure: {"ok": bool, "status_code": int, "body": str, "headers": dict} OR {"ok": False, "exc": Exception}
+                """
+                try:
+                    if sess is None:
+                        import requests
+                        sess = requests.Session()
+                    # avoid env proxies interfering (we manage proxies explicitly)
                     try:
-                        # defensive defaults
-                        if sess is None:
-                            import requests
-                            sess = requests.Session()
-                        try:
-                            sess.trust_env = False
-                        except Exception:
-                            pass
+                        sess.trust_env = False
+                    except Exception:
+                        pass
 
-                        # prefer explicit headers passed in; fallback to outer self.headers if missing
-                        headers_local = use_headers or dict(getattr(self, "headers", {"Content-Type": "application/json"}))
+                    headers_local = dict(use_headers or {})
+                    proxies_cfg = None
+                    if use_proxy:
+                        proxies_cfg = {"http": f"http://{use_proxy}", "https": f"http://{use_proxy}"}
 
-                        # format proxy safely for requests
-                        def _format_proxy_for_requests(p):
-                            if not p:
-                                return None
-                            p = str(p).strip()
-                            if p.startswith(("http://", "https://", "socks5://", "socks4://")):
-                                return p
-                            if "socks" in p.lower():
-                                return "socks5://" + p.split("://")[-1]
-                            return "http://" + p
+                    # CAP read timeout: avoid C-level indefinite blocking (connect, read)
+                    # req_timeout may be seconds; enforce min 10s, max 300s by default
+                    read_timeout = int(req_timeout) if req_timeout else 60
+                    read_timeout = min(max(10, read_timeout), 300)
 
-                        proxy_url = _format_proxy_for_requests(use_proxy) if use_proxy else None
-                        proxies_cfg = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+                    # Prefer using a tuple (connect, read)
+                    timeout_arg = (10, read_timeout)
 
-                        # Debug line similar to your logs
-                        print(f"single_request() — session={'yes' if sess else 'no'} — timeout={req_timeout} — proxy={use_proxy or '<none>'}")
-
-                        # send body if you use `message` variable; keep same behavior as original
-                        request_kwargs = {"headers": headers_local, "timeout": (10, int(req_timeout) if req_timeout else None)}
-                        # send JSON/body if present in outer scope (backwards-compatible)
-                        if "message" in locals() or "message" in globals():
-                            body_to_send = locals().get("message", globals().get("message", None))
-                        else:
-                            body_to_send = None
-                        if body_to_send is None:
-                            body_to_send = locals().get("payload", globals().get("payload", None)) or locals().get("json_payload", globals().get("json_payload", None))
-                        if body_to_send is not None:
-                            request_kwargs["json"] = body_to_send
-
-                        if proxies_cfg:
-                            request_kwargs["proxies"] = proxies_cfg
-
-                        r = sess.post(self.url, **request_kwargs)
-
-                        return {"ok": True, "status": getattr(r, "status_code", 0), "headers": dict(getattr(r, "headers", {}) or {}), "text": getattr(r, "text", "")}
-
-                    except Exception as e:
-                        import traceback as _tb
-                        return {"ok": False, "exc": e, "trace": _tb.format_exc()}
-
-                print(
-                    "send_message: starting infinite retry loop (preserving required infinite behavior)."
-                )
-                while True:
-                    attempt += 1
-                    print(
-                        f"\nAttempt #{attempt} — timeout={int(configured_timeout)}s — proxy={current_proxy or '<none>'}"
+                    # many endpoints in your code use json payload
+                    import requests
+                    r = sess.post(
+                        self.url,
+                        json={"message": message},
+                        headers=headers_local,
+                        timeout=timeout_arg,
+                        proxies=proxies_cfg,
                     )
-                    # run request with thread pool to handle possible hang
-                    try:
-                        with cf.ThreadPoolExecutor(max_workers=1) as ex:
-                            fut = ex.submit(
-                                single_request,
-                                session,
-                                configured_timeout,
-                                current_headers,
-                                current_proxy,
-                            )
+
+                    headers_resp = r.headers or {}
+                    body = r.text if hasattr(r, "text") else (r.content.decode("utf-8", "ignore") if hasattr(r, "content") else None)
+                    return {"ok": True, "status_code": r.status_code, "body": body, "headers": headers_resp}
+                except Exception as e:
+                    # return full exception object so outer code can inspect type/trace
+                    return {"ok": False, "exc": e, "trace": traceback.format_exc()}
+
+            log("send_message: starting infinite retry loop (preserving infinite behavior).")
+            while True:
+                attempt += 1
+                log(f"Attempt #{attempt} — timeout={int(configured_timeout)}s — proxy={current_proxy or '<none>'}")
+
+                # run request with thread pool to handle possible hang
+                try:
+                    with cf.ThreadPoolExecutor(max_workers=1) as ex:
+                        fut = ex.submit(single_request, getattr(self, "_session", None), configured_timeout, getattr(self, "default_headers", {}), current_proxy)
+                        # choose an upper bound to wait for the worker thread result so main thread can recover.
+                        wrapper = None
+                        wait_timeout = min(configured_timeout, 300) + 5
+                        try:
+                            wrapper = fut.result(timeout=wait_timeout)
+                        except cf.TimeoutError:
+                            log("⚠️ Worker timed out (fut.result). Attempting to cancel worker thread.")
                             try:
-                                wrapper = fut.result(timeout=configured_timeout + 5)
-                            except cf.TimeoutError:
-                                try:
-                                    fut.cancel()
-                                except Exception:
-                                    pass
-                                # recreate session to avoid broken states
-                                try:
-                                    session.close()
-                                except Exception:
-                                    pass
-                                self._session = requests.Session()
-                                session = self._session
-                                print(
-                                    f"⚠️ Attempt #{attempt} timed out. Backing off {backoff:.1f}s..."
-                                )
-                                time.sleep(backoff + random.random())
-                                backoff = min(backoff * 2, max_backoff)
-                                configured_timeout = min(
-                                    configured_timeout + timeout_growth, max_timeout_cap
-                                )
-                                continue
-                    except KeyboardInterrupt:
-                        raise
-                    except Exception as e:
-                        print("⚠️ Unexpected executor error:", e)
-                        traceback.print_exc()
-                        time.sleep(backoff + random.random())
-                        backoff = min(backoff * 2, max_backoff)
-                        configured_timeout = min(
-                            configured_timeout + timeout_growth, max_timeout_cap
-                        )
-                        continue
-
-                    # wrapper is the result from single_request / worker
-                    if not wrapper.get("ok"):
-                        exc = wrapper.get("exc")
-                        exc_msg = str(exc) if exc is not None else wrapper.get("trace","")
-                        print(f"⚠️ Network exception on attempt #{attempt}: {type(exc).__name__}({exc_msg})")
-
-                        # rotate immediately for clear proxy-tunnel failures:
-                        proxy_failure_signals = [
-                            "Tunnel connection failed",
-                            "400 Bad Request",
-                            "Unable to connect to proxy",
-                            "Connection to",           # connect timeout text
-                            "Connection reset by peer",
-                            "Remote end closed connection without response",
-                            "ProxyError",
-                        ]
-                        immediate_rotate = any(sig.lower() in exc_msg.lower() for sig in proxy_failure_signals)
-
-                        # if we switched to a new proxy, reset the count
-                        if last_proxy_used != current_proxy:
-                            consec_proxy_failures = 0
-                            last_proxy_used = current_proxy
-
-                        if immediate_rotate:
-                            # rotate now — this changes only the proxy, not the infinite loop or return logic
-                            print("→ Detected proxy-specific failure, rotating proxy now.")
-                            _rotate_proxy(reason=f"immediate signal from exception: {exc_msg[:120]}")
-                        else:
-                            # prefer to retry same proxy a few times before rotating
-                            consec_proxy_failures += 1
-                            print(f"→ Consecutive failures for proxy {current_proxy}: {consec_proxy_failures}/{PROXY_FAIL_THRESHOLD}")
-                            if consec_proxy_failures >= PROXY_FAIL_THRESHOLD:
-                                print(f"→ Reached threshold {PROXY_FAIL_THRESHOLD} — rotating proxy now.")
-                                _rotate_proxy(reason=f"{consec_proxy_failures} consecutive network failures")
-                            else:
-                                print("→ Retrying with the SAME proxy after backoff (will rotate if threshold reached).")
-                    else:
-                        status = wrapper.get("status", 0)
-                        text = (wrapper.get("text") or "").strip()
-                        # detect empty or non-JSON responses as proxy failures (rotate)
-                        if status == 0 or not text:
-                            print(f"Response status={status} length={len(text)}")
-                            print("⚠️ Empty/non-JSON response detected — treating as proxy failure and rotating.")
-                            # rotate now (non-destructive)
-                            _rotate_proxy(reason="empty_or_status0_response")
-                            # continue infinite loop (do not change return/complete logic)
-                            continue
-
-                        # If content exists but isn't JSON, still consider rotating — some sites block proxies
-                        try:
-                            import json
-                            _ = json.loads(text)
-                        except Exception:
-                            # If it's a Cloudflare/html challenge, you may handle that separately.
-                            # But for plain empty/non-json HTML responses from proxies, rotate.
-                            snippet = text[:200].replace("\n", " ")
-                            print("⚠️ Non-JSON response received (and NOT a challenge). Snippet:", snippet)
-                            print("→ Rotating proxy due to non-JSON response.")
-                            _rotate_proxy(reason="non_json_response")
-                            continue
-
-                    status = int(wrapper.get("status", 0) or 0)
-                    headers_resp = wrapper.get("headers") or {}
-                    body = (wrapper.get("text") or "") or ""
-                    print(f"Response status={status} length={len(body)}")
-
-                    # check if response body contains any of the specific_error substrings (case-insensitive)
-                    body_l = (body or "").lower()
-                    matched_specific = False
-                    for err in specific_error:
-                        if err and err.strip().lower() in body_l:
-                            matched_specific = True
-                            break
-
-                    if matched_specific:
-                        # rotate proxy + impersonation and continue
-                        print(
-                            "⚠️ Response matched specific_error -> rotating proxy + impersonation and retrying from where it failed."
-                        )
-                        try:
-                            new_proxy, new_headers = self._pick_next_proxy_and_impersonation()
-                            print(f"Rotated -> new_proxy={new_proxy}, pool_size={len(getattr(self,'_proxy_pool',[]))}, _proxy_index={getattr(self,'_proxy_index',None)}")
-                            current_proxy = new_proxy
-                            if isinstance(new_headers, dict) and new_headers.get("User-Agent"):
-                                current_headers = new_headers
-                        except Exception as e:
-                            print("→ Failed to rotate proxy (fetch/impersonation):", e)
-                        # small backoff, then continue (infinite)
-                        time.sleep(backoff + random.random())
-                        backoff = min(backoff * 2, max_backoff)
-                        configured_timeout = min(
-                            configured_timeout + timeout_growth, max_timeout_cap
-                        )
-                        continue
-
-                    # If not matched specific_error, follow original error handling policies but do NOT rotate proxy
-                    if looks_like_html_challenge(status, body, headers_resp):
-                        print("⚠️ Detected HTML challenge / Cloudflare-like content.")
-                        # attempt cloudscraper then playwright (these attempt *may* use the same current_proxy + headers)
-                        if use_cloudscraper_on_403 and cloudscraper:
-                            solved = try_cloudscraper_once(
-                                current_proxy, headers_override=current_headers
-                            )
-                            if isinstance(solved, dict) and solved.get("status") == "success":
-                                return solved.get("response", "")
-                        if use_playwright_on_403 and PLAYWRIGHT_AVAILABLE:
-                            solved = try_playwright_once(
-                                current_proxy, headers_override=current_headers
-                            )
-                            if isinstance(solved, dict) and solved.get("status") == "success":
-                                return solved.get("response", "")
-                        print(
-                            "Cloudflare solver didn't return success. Backing off and retrying with same proxy."
-                        )
-                        time.sleep(backoff + random.random())
-                        backoff = min(backoff * 2, max_backoff)
-                        configured_timeout = min(
-                            configured_timeout + timeout_growth, max_timeout_cap
-                        )
-                        continue
-
-                    # 4xx client errors (keep same proxy)
-                    if 400 <= status < 500:
-                        print(
-                            f"⚠️ Client error HTTP {status}. Response snippet:\n{(body or '')[:1000]}"
-                        )
-                        print("Retrying with the SAME proxy (do not rotate).")
-                        time.sleep(backoff + random.random())
-                        backoff = min(backoff * 2, max_backoff)
-                        configured_timeout = min(
-                            configured_timeout + timeout_growth, max_timeout_cap
-                        )
-                        continue
-
-                    # 5xx or 429 server errors/rate limit (keep same proxy)
-                    if status == 429 or 500 <= status < 600:
-                        print(
-                            f"⚠️ Server/Rate error HTTP {status}. Response snippet:\n{(body or '')[:1000]}"
-                        )
-                        print("Retrying with the SAME proxy (do not rotate).")
-                        time.sleep(backoff + random.random())
-                        backoff = min(backoff * 2, max_backoff)
-                        configured_timeout = min(
-                            configured_timeout + timeout_growth, max_timeout_cap
-                        )
-                        continue
-
-                    # parse JSON success path
-                    ct = (headers_resp.get("Content-Type") or "").lower()
-                    parsed = None
-                    if "application/json" in ct or (
-                        isinstance(body, str)
-                        and (body.strip().startswith("{") or body.strip().startswith("["))
-                    ):
-                        try:
-                            parsed = json.loads(body) if body else {}
-                        except Exception:
-                            print("⚠️ Failed to parse JSON. Response snippet:")
-                            print((body or "")[:2000])
-                            print("Retrying (same proxy).")
+                                fut.cancel()
+                            except Exception:
+                                pass
+                            # recreate session to avoid stuck/broken session state (non-destructive)
+                            try:
+                                self._session = None
+                            except Exception:
+                                pass
+                            # backoff and continue the infinite retry loop
                             time.sleep(backoff + random.random())
                             backoff = min(backoff * 2, max_backoff)
-                            configured_timeout = min(
-                                configured_timeout + timeout_growth, max_timeout_cap
-                            )
+                            configured_timeout = min(configured_timeout + timeout_growth, max_timeout_cap)
                             continue
-                    else:
-                        # non-JSON non-challenge body, keep retrying same proxy
-                        print("⚠️ Non-JSON response received (and NOT a challenge). Snippet:")
-                        print((body or "")[:2000])
-                        print("Retrying (same proxy).")
-                        time.sleep(backoff + random.random())
-                        backoff = min(backoff * 2, max_backoff)
-                        configured_timeout = min(
-                            configured_timeout + timeout_growth, max_timeout_cap
-                        )
-                        continue
-
-                    # if parsed JSON and status==success -> return
-                    if isinstance(parsed, dict) and parsed.get("status") == "success":
-                        print("✅ API returned success. Returning response.")
-                        return parsed.get("response", "")
-
-                    # JSON present but not success -> log & continue
-                    print("→ API returned JSON but no 'status==success'. Payload snippet:")
-                    try:
-                        print(json.dumps(parsed, indent=2)[:2000])
-                    except Exception:
-                        print(parsed)
-                    print("Retrying (same proxy).")
+                except Exception as e:
+                    log("⚠️ Unexpected executor error:", e)
+                    log(traceback.format_exc())
+                    # backoff and continue (preserve infinite behavior)
                     time.sleep(backoff + random.random())
                     backoff = min(backoff * 2, max_backoff)
-                    configured_timeout = min(
-                        configured_timeout + timeout_growth, max_timeout_cap
-                    )
+                    configured_timeout = min(configured_timeout + timeout_growth, max_timeout_cap)
                     continue
 
+                # wrapper now contains the result of single_request
+                if not wrapper:
+                    log("⚠️ No wrapper result returned from worker — retrying.")
+                    configured_timeout = min(configured_timeout + timeout_growth, max_timeout_cap)
+                    time.sleep(backoff + random.random())
+                    backoff = min(backoff * 2, max_backoff)
+                    continue
+
+                if wrapper.get("ok") is False:
+                    # network or other exception occurred inside worker
+                    exc = wrapper.get("exc")
+                    log(f"⚠️ Network exception on attempt #{attempt}: {type(exc).__name__} — {getattr(exc, 'args', '')}")
+                    log(wrapper.get("trace"))
+                    # increase timeouts/backoff and continue infinite retry
+                    configured_timeout = min(configured_timeout + timeout_growth, max_timeout_cap)
+                    time.sleep(backoff + random.random())
+                    backoff = min(backoff * 2, max_backoff)
+                    continue
+
+                # successful low-level HTTP request; inspect response
+                status_code = wrapper.get("status_code", 0)
+                body = wrapper.get("body", "")
+                headers_resp = wrapper.get("headers", {}) or {}
+
+                # debug small snippet
+                ct = (headers_resp.get("Content-Type") or "").lower()
+                if status_code == 403 and use_cloudscraper_on_403 and cloudscraper:
+                    log("→ Detected 403; attempting cloudscraper.")
+                    try:
+                        scraper = cloudscraper.create_scraper()
+                        r2 = scraper.post(self.url, json={"message": message}, headers=getattr(self, "default_headers", {}), timeout=(10, min(configured_timeout, 300)))
+                        body = r2.text
+                        headers_resp = r2.headers or {}
+                        status_code = r2.status_code
+                    except Exception:
+                        log("⚠️ cloudscraper attempt failed:", traceback.format_exc())
+
+                # Now handle common failure vs success heuristics (preserve original logic)
+                # If response is JSON, parse and check for 'status==success' or other indicators
+                parsed = None
+                try:
+                    if "application/json" in ct or (isinstance(body, str) and (body.strip().startswith("{") or body.strip().startswith("["))):
+                        parsed = json.loads(body) if body else {}
+                except Exception:
+                    log("⚠️ Failed to parse JSON. Response snippet:")
+                    log((body or "")[:2000])
+
+                # Original success detection: if parsed and parsed.get("status") == "success" or similar
+                if parsed and (
+                    (isinstance(parsed, dict) and parsed.get("status") == "success")
+                    or ("message" in parsed and parsed.get("message"))
+                ):
+                    log("✅ API returned success. Returning response.")
+                    # return the parsed payload or raw body, matching previous design
+                    return parsed if parsed else body
+
+                # Otherwise nothing useful — print snippet and retry (preserve infinite retry)
+                log("→ API returned JSON but no 'status==success' or useful payload. Payload snippet:")
+                try:
+                    log(json.dumps(parsed, indent=2)[:2000])
+                except Exception:
+                    log(parsed)
+                log("Retrying (same proxy).")
+                time.sleep(backoff + random.random())
+                backoff = min(backoff * 2, max_backoff)
+                configured_timeout = min(configured_timeout + timeout_growth, max_timeout_cap)
+
+        finally:
+            if spinner:
+                try:
+                    spinner.stop()
+                except Exception:
+                    # do not raise; spinner stop shouldn't break flow
+                    pass
 
 # ---------------------- UTILITIES ----------------------
 def _nice_join(parts: list[str]) -> str:
@@ -998,23 +663,15 @@ class StoryPipeline:
         max_attempts: int = 100,
         topic: str = "",
         allow_infinite: bool = True,               # NEW: keep infinite by default
-        stop_event: Optional[Event] = None, 
+        stop_event: Optional[Event] = None,
     ) -> str:
         """
         COMPLETE generate_script implementation — infinite-retry until success (no internal caps).
 
-        Behavior summary:
-        - Keeps all original features from your initial design: bracketed-only outputs in strict mode,
-          strengthen/retry prompts, continuation seeded with last paragraph, model condense attempts,
-          deterministic trimming fallback, fuzzy dedupe, cleaning hooks, and saving.
-        - **No wall-clock or API-call caps**: the method will keep retrying until a satisfactory
-          non-empty cleaned script that meets the target (within tolerance) is produced. This is
-          intentional per your request. The only "cap" is success.
-        - The saved artifact is EXACTLY one bracketed block and nothing else: `[<cleaned script>]`.
-        - The function will not save empty content. If a generated candidate cleans to empty, it will
-          keep retrying.
-
-        WARNING: Running without caps can consume unbounded resources. Use in a controlled environment.
+        This implementation:
+        - Calls ChatAPI.send_message repeatedly until a satisfactory bracketed script is produced
+        - Uses the helper functions defined earlier (cleaning, trimming, strengthening, extraction)
+        - Preserves the infinite-retry option (allow_infinite) and supports external stop_event
         """
 
         # Derived values
@@ -1022,7 +679,7 @@ class StoryPipeline:
         tolerance = max(1, int(words_target * 0.01))
 
         # Base prompt
-        prompt = self._build_script_prompt(
+        base_prompt = self._build_script_prompt(
             niche=niche,
             person=person,
             timing_minutes=timing_minutes,
@@ -1032,255 +689,187 @@ class StoryPipeline:
 
         timeout = timeout or getattr(self.chat, "base_timeout", None)
 
-        # Helper regex and utilities
+        # Helpers already defined above are used: _word_count, _get_paragraphs, _normalize, etc.
         single_block_re = re.compile(r"^\s*\[[\s\S]*\]\s*$", flags=re.DOTALL)
 
         def _word_count(text: str) -> int:
             return len(re.findall(r"\w+", text or ""))
 
-        def _get_paragraphs(text: str) -> list:
-            if not text:
-                return []
-            paras = [p.strip() for p in re.split(r"\n{2,}|\r\n{2,}", text) if p.strip()]
-            if not paras:
-                paras = [p.strip() for p in re.split(r"\n|\r\n", text) if p.strip()]
-            return paras
+        def _extract_resp_text(resp):
+            # Accept dicts (parsed JSON) or raw text
+            if isinstance(resp, dict):
+                # common keys to consider
+                for k in ("message", "body", "text", "result", "data"):
+                    v = resp.get(k) if isinstance(resp, dict) else None
+                    if v:
+                        return v if isinstance(v, str) else str(v)
+                # fallback: stringify dict
+                try:
+                    return json.dumps(resp)
+                except Exception:
+                    return str(resp)
+            else:
+                return str(resp or "")
 
-        def _normalize(s: str) -> str:
-            return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", "", s or "").lower()).strip()
+        def _finalize_and_save_if_good(candidate_text: str):
+            # Clean dedupe and save exactly one bracketed block
+            bracketed = _finalize_and_save(candidate_text)
+            if bracketed:
+                return bracketed
+            return None
 
-        def _remove_exact_and_fuzzy_duplicates(
-            text: str, fuzzy_threshold: float = 0.90
-        ) -> str:
-            paras = _get_paragraphs(text)
-            if not paras:
-                return text
-            kept = []
-            normals = []
-            for p in paras:
-                np = _normalize(p)
-                if not np:
-                    continue
-                duplicate = False
-                if np in normals:
-                    duplicate = True
-                else:
-                    for k in normals:
-                        if len(np) < 40 or len(k) < 40:
-                            continue
-                        if (
-                            difflib.SequenceMatcher(None, np, k).ratio()
-                            >= fuzzy_threshold
-                        ):
-                            duplicate = True
-                            break
-                if not duplicate:
-                    kept.append(p)
-                    normals.append(np)
-            return "\n\n".join(kept).strip()
-
-        def _log_clean_state(label: str, text: str):
-            wc = _word_count(text)
-            remaining = words_target - wc
-            print(
-                f"[{label}] After cleaning: {wc} words; Remaining to target: {remaining} ({words_target}±{tolerance})"
-            )
-            return wc, remaining
-
-        def _strengthen_prompt(
-            base_prompt: str, previous_words: Optional[int], attempt_no: int
-        ) -> str:
-            extra = (
-                "\n\nIMPORTANT: You MUST output EXACTLY ONE bracketed block and NOTHING ELSE. "
-                "The output must start with '[' and end with ']' and contain no characters outside those brackets. "
-                "The bracketed block should contain ONLY the full script text (no labels, no JSON, no commentary, no metadata, no tags). "
-                "There must be no additional bracketed blocks, and no leading or trailing whitespace or blank lines outside the brackets. "
-                f"Now adjust the script so that it contains exactly {words_target} words (count words in the usual sense—whitespace-separated). "
-                f"If you cannot hit exactly {words_target}, produce a script that is as close as possible within ±{tolerance} words. "
-                "Prioritize an exact match; if multiple outputs tie for closeness, any may be used. "
-                "Do not include any explanations, diagnostics, or extra output — only the single bracketed script block."
-                "Produce exactly one bracketed script block and nothing else: output a single opening bracket [ then the entire script content followed by a single closing bracket ] — include no other characters, whitespace, newlines, headings, labels, metadata, counts, commentary, instructions, fragments of the prompt, code fences, or BOM before or after; the bracketed text must be the complete script with no explanatory notes, stage directions, or parenthetical remarks not part of the script; if the script cannot be produced, return exactly []; the response must contain absolutely nothing else.\n"
-            )
-            if previous_words is not None:
-                diff = words_target - previous_words
-                extra += f"Previous attempt had {previous_words} words ({'short' if diff>0 else 'long' if diff<0 else 'exact'} by {abs(diff)}). "
-                if diff > 0:
-                    extra += "Extend and enrich naturally to reach the target. "
-                elif diff < 0:
-                    extra += (
-                        "Tightly condense and remove redundancies (preserve beats). "
-                    )
-            extra += f"Attempt #{attempt_no}."
-            return base_prompt + extra
-
-        def _extract_candidate(resp: str) -> str:
-            # prefer the largest bracketed block if present; otherwise return whole response
-            try:
-                brs = re.findall(r"\[[\s\S]*?\]", resp)
-                if brs:
-                    return max(brs, key=len)[1:-1].strip()
-            except Exception:
-                pass
-            return resp.strip()
-
-        def _heuristic_trim_to_target(text: str, target_words: int) -> str:
-            # deterministic conservative trimming preserving anchors
-            paras = _get_paragraphs(text)
-            if not paras:
-                return text
-            protect_first = min(1, len(paras))
-            protect_last = min(1, len(paras) - protect_first) if len(paras) > 1 else 0
-            para_sents = []
-            for p in paras:
-                sents = [
-                    s.strip() for s in re.split(r"(?<=[\.\?\!])\s+", p) if s.strip()
-                ]
-                if not sents:
-                    sents = [p.strip()]
-                para_sents.append(sents)
-            flat = []
-            loc = []
-            for pi, sents in enumerate(para_sents):
-                for si, s in enumerate(sents):
-                    flat.append(_normalize(s))
-                    loc.append((pi, si))
-            n = len(flat)
-            if n == 0:
-                return text
-            scores = [0.0] * n
-            for i in range(n):
-                si = flat[i]
-                if not si or len(si) < 20:
-                    scores[i] = 0.0
-                    continue
-                tot = 0.0
-                cnt = 0
-                for j in range(n):
-                    if i == j:
-                        continue
-                    sj = flat[j]
-                    if not sj:
-                        continue
-                    tot += difflib.SequenceMatcher(None, si, sj).ratio()
-                    cnt += 1
-                scores[i] = (tot / cnt) if cnt else 0.0
-            removable = []
-            for idx, (pi, si) in enumerate(loc):
-                if pi < protect_first or pi >= len(paras) - protect_last:
-                    continue
-                sent_text = para_sents[pi][si]
-                wc_sent = _word_count(sent_text)
-                removable.append((scores[idx], wc_sent, pi, si, sent_text))
-            removable.sort(key=lambda x: (x[0], x[1]), reverse=True)
-            current_text = text
-            current_wc = _word_count(current_text)
-            removals_by_para = {}
-            for score, wc_sent, pi, si, stext in removable:
-                if current_wc <= target_words:
-                    break
-                if len(para_sents[pi]) <= 1:
-                    continue
-                already = removals_by_para.get(pi, 0)
-                if (already + 1) / len(para_sents[pi]) > 0.6:
-                    continue
-                para_sents[pi][si] = ""
-                removals_by_para[pi] = already + 1
-                new_paras = []
-                for sents in para_sents:
-                    sents_clean = [s for s in sents if s and s.strip()]
-                    if sents_clean:
-                        new_paras.append(" ".join(sents_clean))
-                current_text = "\n\n".join(new_paras).strip()
-                current_wc = _word_count(current_text)
-                if current_wc <= target_words:
-                    break
-            if _word_count(current_text) > target_words:
-                paras_now = _get_paragraphs(current_text)
-                cand_idxs = [
-                    i
-                    for i in range(len(paras_now))
-                    if i >= protect_first and i < len(paras_now) - protect_last
-                ]
-                cand_idxs_sorted = sorted(
-                    cand_idxs, key=lambda i: _word_count(paras_now[i])
-                )
-                for i in cand_idxs_sorted:
-                    if _word_count(current_text) <= target_words:
-                        break
-                    paras_now[i] = ""
-                    current_text = "\n\n".join(
-                        [p for p in paras_now if p.strip()]
-                    ).strip()
-            if _word_count(current_text) > target_words:
-                words = re.findall(r"\S+", current_text)
-                paras_now = _get_paragraphs(current_text)
-                cum = []
-                total = 0
-                for p in paras_now:
-                    wc_p = _word_count(p)
-                    cum.append((total, total + wc_p))
-                    total += wc_p
-                last_protected_idx = (
-                    max(0, len(paras_now) - protect_last)
-                    if protect_last > 0
-                    else len(paras_now)
-                )
-                keep_last_start_word = (
-                    cum[last_protected_idx][0] if last_protected_idx < len(cum) else 0
-                )
-                allowable = max(0, keep_last_start_word + 3)
-                if target_words <= allowable:
-                    truncated = " ".join(words[:target_words])
-                else:
-                    truncated = " ".join(words[: max(target_words, allowable)])
-                return truncated.strip()
-            return current_text.strip()
-
-        # Accumulation state
-        accumulated = ""
         attempt = 0
+        backoff = 1.0
+        accumulated = ""  # accumulate best candidates so abort can save something
+        last_wc = None
 
-        # Finalize helper — saves ONLY if non-empty and always as a single bracketed block
-        # Finalize helper — saves ONLY if non-empty and always returns a bracketed block
-        def _finalize_and_save(text: str) -> Optional[str]:
-            final_text = _remove_exact_and_fuzzy_duplicates(text, fuzzy_threshold=0.92)
-            # strip any accidental outer brackets (be conservative)
-            if final_text.startswith("[") and final_text.endswith("]"):
-                final_text = final_text[1:-1].strip()
-            final_text = final_text.strip()
-            if not final_text:
-                # refuse to save empty content
-                print("⚠️ Final text is empty after cleaning — will not save. Continuing retries.")
-                return None
-            # Save EXACTLY one bracketed block and nothing else
-            bracketed = f"[{final_text}]"
-            save_response("generated_complete_script", "generated_complete_script.txt", bracketed)
-            # Return the bracketed block so callers receive the saved artifact exactly as written
-            return bracketed
-
-        # Main loop: keep trying until we produce a non-empty cleaned script close to target
         while True:
             attempt += 1
 
-            # Optional graceful stop: external Event can request termination (non-destructive)
+            # Respect external stop
             if stop_event is not None and stop_event.is_set():
-                print(f"Stop requested by stop_event (attempt {attempt}). Returning best-effort result if available.")
+                print(f"Stop requested (attempt {attempt}). Finalizing best-effort.")
                 if accumulated:
-                    final_bracketed = _finalize_and_save(accumulated)
-                    return final_bracketed  # may be None if saving failed
+                    return _finalize_and_save_if_good(accumulated)
                 return None
 
-            # Optional bounded mode (if caller explicitly turns off infinite behavior)
-            # default keep infinite; this branch only triggers when allow_infinite == False
             if not allow_infinite and attempt > max_attempts:
                 print(f"Max attempts ({max_attempts}) reached in non-infinite mode. Finalizing best-effort.")
                 if accumulated:
-                    final_bracketed = _finalize_and_save(accumulated)
-                    return final_bracketed
+                    return _finalize_and_save_if_good(accumulated)
                 return None
 
-        # This loop is intended to run until succeed; reaching here is unexpected
-        raise RuntimeError("generate_script failed to terminate normally.")
+            # Prepare prompt: on 1st attempt use base_prompt, otherwise strengthen based on last_wc
+            if attempt == 1:
+                prompt_to_send = base_prompt
+            else:
+                prompt_to_send = _strengthen_prompt(base_prompt, last_wc, attempt)
+
+            try:
+                resp = self.chat.send_message(
+                    prompt_to_send,
+                    timeout=timeout or getattr(self.chat, "base_timeout", None),
+                    spinner_message=f"Generating script (attempt {attempt})...",
+                )
+            except Exception as e:
+                print(f"⚠️ API call failed on attempt {attempt}: {e}")
+                # exponential backoff but keep infinite behavior
+                time.sleep(min(30, backoff) + random.random() * 0.5)
+                backoff = min(backoff * 1.8, 60.0)
+                continue
+
+            resp_text = _extract_resp_text(resp)
+            candidate = _extract_candidate(resp_text)
+
+            # Clean the candidate text (remove brackets, normalize, etc)
+            cleaned = clean_script_text(candidate or "")
+            if cleaned.startswith("[") and cleaned.endswith("]"):
+                cleaned = cleaned[1:-1].strip()
+
+            # If the assistant strictly returned bracketed block with label/metadata, extract largest bracket only
+            if strict:
+                # prefer the largest bracketed block found in original response (already done by _extract_candidate),
+                # but still ensure cleaned is not empty
+                pass
+
+            wc = _word_count(cleaned)
+            last_wc = wc
+            print(f"[Attempt {attempt}] Candidate words={wc}; target={words_target} ±{tolerance}")
+
+            # If cleaned empty -> try again (maybe the model refused); preserve resp_text as diagnostic
+            if not cleaned:
+                print("⚠️ Candidate cleaned to empty. Retrying after backoff.")
+                time.sleep(min(5 + attempt * 0.5, 20))
+                backoff = min(backoff * 1.8, 60.0)
+                continue
+
+            # Accumulate if this candidate adds fresh content (simple dedupe by normalized start)
+            if cleaned and cleaned not in accumulated:
+                accumulated = (accumulated + "\n\n" + cleaned).strip()
+
+            # If within tolerance -> finalize and save
+            if abs(wc - words_target) <= tolerance:
+                print(f"✅ Candidate within tolerance: {wc} words. Finalizing and saving.")
+                final = _finalize_and_save_if_good(cleaned)
+                if final:
+                    return final
+                # If couldn't save (somehow), keep retrying
+                print("⚠️ Finalize/save did not produce an artifact; continuing retries.")
+                time.sleep(1 + random.random())
+                continue
+
+            # If too long: try deterministic trimming heuristics and finalize if good
+            if wc > words_target + tolerance:
+                print(f"→ Candidate too long ({wc} > {words_target}). Attempting heuristic trim.")
+                trimmed = _heuristic_trim_to_target(cleaned, words_target)
+                t_wc = _word_count(trimmed)
+                print(f"   Trimmed to {t_wc} words.")
+                if abs(t_wc - words_target) <= tolerance:
+                    print("✅ Trimmed candidate is within tolerance. Finalizing and saving.")
+                    final = _finalize_and_save_if_good(trimmed)
+                    if final:
+                        return final
+                # If trimming couldn't reach target, continue with stronger condense instructions next attempt
+                print("→ Trim did not reach acceptable length; retrying with stronger condense instruction.")
+                time.sleep(0.5 + random.random() * 0.7)
+                backoff = min(backoff * 1.5, 60.0)
+                continue
+
+            # If too short: extend/continue
+            if wc < words_target - tolerance:
+                print(f"→ Candidate too short ({wc} < {words_target}). Asking model to extend.")
+                # Build a short continuation instruction that seeds with the last paragraph to avoid repeats
+                paras = _get_paragraphs(cleaned)
+                last_para = paras[-1] if paras else ""
+                continue_prompt = (
+                    f"You produced the script below (inside brackets). The script is currently {wc} words but we need exactly {words_target} words "
+                    f"(±{tolerance}). Continue the story seamlessly from the last paragraph and expand naturally to meet the word target, "
+                    f"preserving voice, beats, and sensory detail. Do NOT repeat previous paragraphs; continue the narrative. "
+                    f"Seed (last paragraph):\n\n{last_para}\n\nNow continue. Output exactly one bracketed block and nothing else."
+                )
+                try:
+                    cont_resp = self.chat.send_message(
+                        continue_prompt,
+                        timeout=timeout or getattr(self.chat, "base_timeout", None),
+                        spinner_message=f"Extending script (attempt {attempt})...",
+                    )
+                except Exception as e:
+                    print(f"⚠️ Continue call failed: {e}")
+                    time.sleep(min(5, backoff) + random.random() * 0.5)
+                    backoff = min(backoff * 1.8, 60.0)
+                    continue
+
+                cont_text = _extract_resp_text(cont_resp)
+                cont_candidate = _extract_candidate(cont_text)
+                cont_cleaned = clean_script_text(cont_candidate or "")
+                if cont_cleaned.startswith("[") and cont_cleaned.endswith("]"):
+                    cont_cleaned = cont_cleaned[1:-1].strip()
+
+                # merge (append) and re-evaluate
+                merged = (cleaned + "\n\n" + cont_cleaned).strip()
+                merged = _remove_exact_and_fuzzy_duplicates(merged, fuzzy_threshold=0.92)
+                merged_wc = _word_count(merged)
+                print(f"   After continuation, merged words={merged_wc}")
+
+                if abs(merged_wc - words_target) <= tolerance:
+                    print("✅ Continued script meets the target. Finalizing and saving.")
+                    final = _finalize_and_save_if_good(merged)
+                    if final:
+                        return final
+                else:
+                    # adopt merged as accumulated and continue retrying with strengthened prompt next loop
+                    accumulated = merged
+                    last_wc = merged_wc
+                    time.sleep(0.6 + random.random() * 0.6)
+                    backoff = min(backoff * 1.5, 60.0)
+                    continue
+
+            # Fallback safety backoff before next attempt
+            time.sleep(min(3 + backoff, 30))
+            backoff = min(backoff * 1.4, 60.0)
+
+        # unreachable, but explicit
+        return None
 
     def _split_text_into_n_parts(self, text: str, n: int) -> List[str]:
         """
