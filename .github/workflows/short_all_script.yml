@@ -8,14 +8,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     env:
-      R_HOURS: "6"                      # shared env for all steps that need it
+      R_HOURS: "6"
       PYTHON_VERSION: "3.11"
       NODE_VERSION: "18"
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          # if you use submodules, enable fetch_submodules: true
           fetch-depth: 0
 
       - name: Setup Python
@@ -38,17 +38,19 @@ jobs:
 
       - name: Install Playwright browsers and platform dependencies
         run: |
-          # install browsers and native deps required by Playwright
-          python -m playwright install
-          python -m playwright install-deps
+          python -m pip install --upgrade playwright || true
+          python -m playwright install || true
+          python -m playwright install-deps || true
 
       - name: Setup Node.js (for Puppeteer fallback)
         uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
-          cache: "npm"
+          # DO NOT use `cache: "npm"` here (it requires lockfile); we'll cache explicitly below when lockfile exists
 
-      - name: Cache npm (explicit)
+      # Only cache npm when package-lock.json exists (avoid the 'lock file not found' error)
+      - name: Cache npm (when lockfile exists)
+        if: ${{ hashFiles('**/package-lock.json') != '' }}
         uses: actions/cache@v4
         with:
           path: ~/.npm
@@ -56,21 +58,31 @@ jobs:
           restore-keys: |
             npm-cache-${{ runner.os }}-node${{ env.NODE_VERSION }}-
 
-      - name: Install Node packages for Puppeteer
+      - name: Install Node packages for Puppeteer (lockfile-aware)
         run: |
-          # prefer deterministic install when lockfile exists
           if [ -f package-lock.json ]; then
+            echo "Lockfile present: using npm ci for reproducible install"
             npm ci --no-audit --no-fund
           else
-            npm install puppeteer puppeteer-extra puppeteer-extra-plugin-stealth --no-audit --no-fund
+            echo "No lockfile found: running npm install (no cache)."
+            npm install puppeteer puppeteer-extra puppeteer-extra-plugin-stealth --no-audit --no-fund || true
           fi
 
-      - name: Ensure system utilities (curl) are available
+      - name: Ensure system utilities (curl)
         run: |
           sudo apt-get update -y
           sudo apt-get install -y curl
 
-      - name: (Optional) Debug- list installed deps
+      - name: (Optional) Create package-lock.json (if you want to enable caching)
+        if: ${{ hashFiles('**/package-lock.json') == '' }}
+        run: |
+          # This will generate package-lock.json without installing node_modules
+          # Uncomment this step if you want to produce a lockfile in CI (but normally you should commit it locally)
+          # npm i --package-lock-only
+          echo "No package-lock.json in repo. To enable npm caching you can generate and commit a lockfile locally:"
+          echo "  npm install --package-lock-only && git add package-lock.json && git commit -m 'chore: add package-lock.json'"
+
+      - name: (Optional) Debug: list installed deps
         run: |
           python -m pip show requests cloudscraper playwright || true
           node -v && npm -v || true
