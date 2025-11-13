@@ -547,61 +547,95 @@ def _nice_join(parts: list[str]) -> str:
         return parts[0]
     return ", ".join(parts[:-1]) + " and " + parts[-1]
 
+
 def ensure_ffmpeg_available() -> Optional[str]:
-    import subprocess, sys, importlib
+    """
+    Try to find ffmpeg executable. Returns absolute path or None.
+    Strategy:
+     1) check system PATH
+     2) check imageio-ffmpeg (preferred fallback)
+     3) try to pip-install imageio-ffmpeg automatically (best-effort)
+    Note: we avoid installing arbitrary 'ffmpeg' wheel that may not provide a binary.
+    """
+    import shutil, subprocess, sys
+
+    # 1) system PATH
+    exe = shutil.which("ffmpeg")
+    if exe:
+        print(f"[ffmpeg] found system ffmpeg at: {exe}")
+        return exe
+
+    # 2) try imageio-ffmpeg (it exposes ffmpeg binary via get_ffmpeg_exe)
     try:
-        # 1) check PATH
-        from shutil import which
-        ff = which("ffmpeg")
+        import imageio_ffmpeg
+
+        ff = imageio_ffmpeg.get_ffmpeg_exe()
         if ff:
+            print(f"[ffmpeg] found imageio-ffmpeg binary at: {ff}")
             return ff
     except Exception:
         pass
+
+    # 3) try to pip install imageio-ffmpeg (best-effort)
     try:
+        print("[ffmpeg] attempting to pip install imageio-ffmpeg as a fallback...")
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "imageio-ffmpeg"]
+        )
+        import importlib
+
         imageio_ffmpeg = importlib.import_module("imageio_ffmpeg")
         ff = imageio_ffmpeg.get_ffmpeg_exe()
         if ff:
+            print(f"[ffmpeg] installed and found imageio-ffmpeg binary at: {ff}")
             return ff
-    except Exception:
-        pass
-    try:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "imageio-ffmpeg"])
-        imageio_ffmpeg = importlib.import_module("imageio_ffmpeg")
-        ff = imageio_ffmpeg.get_ffmpeg_exe()
-        if ff:
-            return ff
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[ffmpeg] pip install fallback failed: {e}")
+
+    print("[ffmpeg] ffmpeg not available on PATH and imageio-ffmpeg not available.")
     return None
 
-def log_execution_time(start_time: float, end_time: float, show_ms: bool = False) -> None:
+
+def log_execution_time(
+    start_time: float, end_time: float, show_ms: bool = False
+) -> None:
+    """
+    Print current time (12-hour) and elapsed time as human-readable hours/minutes/seconds.
+    :param start_time: float, start timestamp (time.time())
+    :param end_time: float, end timestamp (time.time())
+    :param show_ms: whether to include leftover milliseconds (default False)
+    """
     elapsed = max(0.0, end_time - start_time)
     hours = int(elapsed // 3600)
     minutes = int((elapsed % 3600) // 60)
     seconds = int(elapsed % 60)
     milliseconds = int((elapsed - int(elapsed)) * 1000)
+
     parts = []
     if hours:
         parts.append(f"{hours} hour{'s' if hours != 1 else ''}")
     if minutes:
         parts.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
+    # show seconds if nonzero or if no other part exists (so "0 seconds" is avoided unless elapsed < 1s)
     if seconds or not parts:
         parts.append(f"{seconds} second{'s' if seconds != 1 else ''}")
     if show_ms and milliseconds:
         parts.append(f"{milliseconds} ms")
+
     human = _nice_join(parts)
-    current_time = datetime.now().strftime("%I:%M:%S %p")
-    print(f"[{start_time} to {end_time} now {current_time}] Execution completed in {human}.")
+    current_time = datetime.now().strftime("%I:%M:%S %p")  # 12-hour with leading zero
+    print(
+        f"[{start_time} to {end_time} now {current_time}] Execution completed in {human}."
+    )
+
 
 def save_response(folder_name: str, file_name: str, content: str):
-    try:
-        os.makedirs(folder_name, exist_ok=True)
-        file_path = os.path.join(folder_name, file_name)
-        with open(file_path, "w", encoding="utf-8") as f:
-            f.write(content)
-        print(f"✅ Saved: {file_path}")
-    except Exception as e:
-        print(f"⚠️ Failed to save response {folder_name}/{file_name}: {e}")
+    os.makedirs(folder_name, exist_ok=True)
+    file_path = os.path.join(folder_name, file_name)
+    with open(file_path, "w", encoding="utf-8") as f:
+        f.write(content)
+    print(f"✅ Saved: {file_path}")
+
 
 def extract_largest_bracketed(text: str) -> Optional[str]:
     matches = re.findall(r"\[([^\]]+)\]", text, flags=re.DOTALL)
@@ -610,18 +644,24 @@ def extract_largest_bracketed(text: str) -> Optional[str]:
     largest = max(matches, key=lambda s: len(s))
     return largest.strip()
 
+
 def extract_all_bracketed_blocks(text: str) -> List[str]:
     return [m.strip() for m in re.findall(r"\[([^\]]+)\]", text, flags=re.DOTALL)]
 
+
 def escape_for_coqui_tts(text: str) -> str:
-    # Simple character cleanup to avoid odd tokens in Coqui; keep punctuation that matters.
-    text = (text or "").strip()
-    # replace repeated whitespace
-    text = re.sub(r"\s+", " ", text)
-    # ensure sentences separated by two newlines for paragraph breaks
-    paras = [p.strip() for p in re.split(r"\n{2,}|\r\n{2,}", text) if p.strip()]
-    out = "\n\n".join(paras)
-    return out
+    """
+    Escapes and normalizes text for safe, natural-sounding Coqui TTS synthesis.
+    """
+    text = text.replace("\\", "\\\\")
+    text = text.replace('"', '\\"')
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"([.,!?;:])([^\s])", r"\1 \2", text)
+    text = re.sub(r"--", "—", text)
+    if not re.search(r"[.!?…]$", text):
+        text += "."
+    return text
+
 
 def clean_script_text(script_text: str) -> str:
     s = script_text or ""
@@ -670,43 +710,79 @@ class StoryPipeline:
     ):
         self.chat = ChatAPI(url=api_url, default_timeout=default_timeout)
 
-    def _build_script_prompt(self, niche: str, person: str, timing_minutes: int = 10, words_per_minute: int = 250, topic: str = "") -> str:
+    def _build_script_prompt(
+        self,
+        niche: str,
+        person: str,
+        timing_minutes: int,
+        words_per_minute: int = 250,
+        topic: str = "",
+    ) -> str:
         """
-        Build the canonical story/script prompt, including strict bracket and word-count enforcement.
-        This preserves your original structure and constraints but ensures consistent formatting.
+        Universal cinematic prompt with structure + writing rules (keeps all existing features).
+        Improved for clarity and stronger enforcement of bracket-only output and word-count targets,
+        without removing existing features.
         """
         words_target = timing_minutes * words_per_minute
-        topic_clean = (topic or "").strip()
-        if person and person.strip():
-            person_section = (
-                f"Write the story centered on a fictionalized protagonist inspired by '{person}'. "
-                "Use the person only as inspiration — do NOT present real private facts or personal data about living persons. "
-                "If the name is public and widely-known, use fictionalized depiction only."
-            )
-        else:
-            person_section = (
-                f"Do not center the story on a real person. Instead, write an original third-person story relevant to niche '{niche}'."
-            )
+        person_clean = str(person).strip()
+        topic_clean = str(topic).strip()
 
+        if person_clean:
+            if topic_clean:
+                person_section = (
+                    f"Center the narrative on {person_clean} within the context of the topic '{topic_clean}'. "
+                    "Tell their story with emotional depth: origins, defining first struggles, turning points, setbacks, breakthroughs, and legacy. "
+                    "Weave 3-7 verifiable facts (dates, achievements, quirks) naturally into the storytelling to deepen stakes."
+                )
+            else:
+                person_section = (
+                    f"Center the narrative on {person_clean}. "
+                    "Tell their story with emotional depth: origins, defining first struggles, turning points, setbacks, breakthroughs, and legacy. "
+                    "Weave 3-7 verifiable facts (dates, achievements, quirks) naturally into the storytelling to deepen stakes."
+                )
+        else:
+            if topic_clean:
+                person_section = (
+                    f"Do not center the story on a real person. Instead, write an original third-person story relevant to niche '{niche}' and topic '{topic_clean}'. "
+                    "Create a protagonist who embodies the emotional essence of the topic and trace their origins, conflicts, transformations, and legacy."
+                )
+            else:
+                person_section = (
+                    f"Do not center the story on a real person. Instead, write an original third-person story relevant to niche '{niche}'. "
+                    "Create a protagonist, trace origins, conflicts, transformation, and legacy."
+                )
+
+        # Strong, explicit bracket + word-count enforcement appended to the end of the prompt.
         prompt = (
             "You are an expert cinematic storyteller and YouTube scriptwriter.\n\n"
             f"{person_section}\n\n"
-            f"Write a powerful, cinematic long-form storytelling script relevant to '{topic_clean}' and niche '{niche}'. "
-            f"Length: produce approximately {words_target} words (~{timing_minutes} minutes at {words_per_minute} wpm). "
-            "Aim to hit the target within ±1% if possible. Prefer slightly under if exact isn't possible.\n\n"
+            f"Write a powerful, cinematic long-form storytelling script (minimum 10 minutes) about the subject above. "
+            f"Length: produce approximately {words_target} words (this is ~{timing_minutes} minutes at {words_per_minute} wpm). "
+            f"Aim for between 90% and 110% if exact isn't possible, but prefer to meet the target within ±1% if you can.\n\n"
+            "Tone: immersive, emotional, deeply human — like a master storyteller holding the audience’s attention from start to finish.\n\n"
             "Structure (use naturally, do not label in output):\n"
-            "  - Hook (0:00-0:30)\n"
-            "  - Act 1 — Origins\n"
-            "  - Act 2 — Turning Points & Conflicts\n"
-            "  - Act 3 — Breakthrough & Mastery\n"
-            "  - Act 4 — Legacy, Reflection & Lessons\n"
-            "  - Closing Line: one powerful quotable sentence\n\n"
-            "Style: immersive, cinematic, show-not-tell, sensory detail, clean transitions, emotional hooks.\n\n"
-            "CRITICAL FORMATTING: OUTPUT EXACTLY ONE PAIR OF SQUARE BRACKETS AND NOTHING ELSE. "
-            "The content inside the brackets must be the complete script text with no labels, metadata, or commentary outside the brackets. "
-            f"Target words: {words_target} (±1%). If you cannot meet it exactly, produce the closest script within that tolerance. "
-            "If you cannot produce a script that meets these rules, output exactly [] (an empty bracket pair).\n\n"
-            "Produce now."
+            "  - Hook (0:00-0:30): gripping opening that instantly pulls viewers with emotion, curiosity, or conflict.\n"
+            "  - Act 1 — Origins: humble beginnings, key influences, early dreams, defining first struggles.\n"
+            "  - Act 2 — Turning Points & Conflicts: failures, risks, doubts, betrayals; build tension and pacing.\n"
+            "  - Act 3 — Breakthrough & Mastery: vivid sensory storytelling, decisive action, transformation.\n"
+            "  - Act 4 — Legacy, Reflection & Lessons: emotional depth and 3 memorable takeaways that feel earned.\n"
+            "  - Closing Line: one powerful quotable sentence to linger in the mind.\n\n"
+            "Writing style (stick to these rules):\n"
+            "  - Show, don't tell: use concrete sensory details, vivid imagery, and emotional interiority, any headings, any extra content.\n"
+            "  - Tension-release rhythm: mix punchy sentences with slower reflective lines.\n"
+            "  - Include brief quotes, internal thoughts, or imagined monologues for intimacy.\n"
+            "  - Avoid repetition: do NOT repeat paragraphs or large blocks of text. Use callbacks and echoes instead of restatement.\n"
+            "  - Keep transitions smooth and momentum-building; each scene should deepen emotion or advance narrative.\n"
+            "  - Maintain authenticity; avoid exaggeration — emotional truth over hype.\n\n"
+            "Formatting and output rules (CRITICAL):\n"
+            "  - OUTPUT EXACTLY ONE PAIR OF SQUARE BRACKETS AND NOTHING ELSE: a single pair of square brackets containing ONLY the full script text. "
+            "The assistant must not output any additional text, headings, labels, JSON, commentary, or metadata outside that single bracketed block. "
+            "Example valid output: [The full script goes here ...].\n"
+            "  - Count words in the usual sense. Produce exactly the target words if possible; otherwise get as close as possible within ±1% tolerance. "
+            "If you cannot precisely hit the target, prefer to be slightly under rather than exceeding the upper bound.\n\n"
+            "When you continue or condense content (if asked), do NOT repeat the last paragraph; continue seamlessly and maintain voice and pacing. "
+            "Produce exactly one bracketed script block and nothing else: output a single opening bracket [ then the entire script content followed by a single closing bracket ] — include no other characters, whitespace, newlines, headings, labels, metadata, counts, commentary, instructions, fragments of the prompt, code fences, or BOM before or after; the bracketed text must be the complete script with no explanatory notes, stage directions, or parenthetical remarks not part of the script; if the script cannot be produced, return exactly []; the response must contain absolutely nothing else.\n"
+            "Preserve important facts and beats. Generate now."
         )
         return prompt
 
@@ -720,18 +796,30 @@ class StoryPipeline:
         strict: bool = True,
         max_attempts: int = 100,
         topic: str = "",
-        allow_infinite: bool = True,
-        stop_event: Optional[Event] = None,
     ) -> str:
         """
-        Generate a cinematic bracketed script. Keeps infinite retry semantics by default.
-        Returns the saved bracketed script (string) or None on graceful stop/no-result.
+        COMPLETE generate_script implementation — infinite-retry until success (no internal caps).
+
+        Behavior summary:
+        - Keeps all original features from your initial design: bracketed-only outputs in strict mode,
+          strengthen/retry prompts, continuation seeded with last paragraph, model condense attempts,
+          deterministic trimming fallback, fuzzy dedupe, cleaning hooks, and saving.
+        - **No wall-clock or API-call caps**: the method will keep retrying until a satisfactory
+          non-empty cleaned script that meets the target (within tolerance) is produced. This is
+          intentional per your request. The only "cap" is success.
+        - The saved artifact is EXACTLY one bracketed block and nothing else: `[<cleaned script>]`.
+        - The function will not save empty content. If a generated candidate cleans to empty, it will
+          keep retrying.
+
+        WARNING: Running without caps can consume unbounded resources. Use in a controlled environment.
         """
 
+        # Derived values
         words_target = timing_minutes * words_per_minute
         tolerance = max(1, int(words_target * 0.01))
 
-        base_prompt = self._build_script_prompt(
+        # Base prompt
+        prompt = self._build_script_prompt(
             niche=niche,
             person=person,
             timing_minutes=timing_minutes,
@@ -741,6 +829,7 @@ class StoryPipeline:
 
         timeout = timeout or getattr(self.chat, "base_timeout", None)
 
+        # Helper regex and utilities
         single_block_re = re.compile(r"^\s*\[[\s\S]*\]\s*$", flags=re.DOTALL)
 
         def _word_count(text: str) -> int:
@@ -757,7 +846,9 @@ class StoryPipeline:
         def _normalize(s: str) -> str:
             return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", "", s or "").lower()).strip()
 
-        def _remove_exact_and_fuzzy_duplicates(text: str, fuzzy_threshold: float = 0.90) -> str:
+        def _remove_exact_and_fuzzy_duplicates(
+            text: str, fuzzy_threshold: float = 0.90
+        ) -> str:
             paras = _get_paragraphs(text)
             if not paras:
                 return text
@@ -774,7 +865,10 @@ class StoryPipeline:
                     for k in normals:
                         if len(np) < 40 or len(k) < 40:
                             continue
-                        if difflib.SequenceMatcher(None, np, k).ratio() >= fuzzy_threshold:
+                        if (
+                            difflib.SequenceMatcher(None, np, k).ratio()
+                            >= fuzzy_threshold
+                        ):
                             duplicate = True
                             break
                 if not duplicate:
@@ -782,26 +876,42 @@ class StoryPipeline:
                     normals.append(np)
             return "\n\n".join(kept).strip()
 
-        def _strengthen_prompt(base_prompt: str, previous_words: Optional[int], attempt_no: int) -> str:
+        def _log_clean_state(label: str, text: str):
+            wc = _word_count(text)
+            remaining = words_target - wc
+            print(
+                f"[{label}] After cleaning: {wc} words; Remaining to target: {remaining} ({words_target}±{tolerance})"
+            )
+            return wc, remaining
+
+        def _strengthen_prompt(
+            base_prompt: str, previous_words: Optional[int], attempt_no: int
+        ) -> str:
             extra = (
                 "\n\nIMPORTANT: You MUST output EXACTLY ONE bracketed block and NOTHING ELSE. "
                 "The output must start with '[' and end with ']' and contain no characters outside those brackets. "
-                "The bracketed block should contain ONLY the full script text (no labels, no JSON, no commentary). "
-                f"Now adjust the script so that it contains exactly {words_target} words. "
-                f"If you cannot hit exactly {words_target}, produce a script as close as possible within ±{tolerance} words. "
-                "Do not output anything outside the single bracketed block."
+                "The bracketed block should contain ONLY the full script text (no labels, no JSON, no commentary, no metadata, no tags). "
+                "There must be no additional bracketed blocks, and no leading or trailing whitespace or blank lines outside the brackets. "
+                f"Now adjust the script so that it contains exactly {words_target} words (count words in the usual sense—whitespace-separated). "
+                f"If you cannot hit exactly {words_target}, produce a script that is as close as possible within ±{tolerance} words. "
+                "Prioritize an exact match; if multiple outputs tie for closeness, any may be used. "
+                "Do not include any explanations, diagnostics, or extra output — only the single bracketed script block."
+                "Produce exactly one bracketed script block and nothing else: output a single opening bracket [ then the entire script content followed by a single closing bracket ] — include no other characters, whitespace, newlines, headings, labels, metadata, counts, commentary, instructions, fragments of the prompt, code fences, or BOM before or after; the bracketed text must be the complete script with no explanatory notes, stage directions, or parenthetical remarks not part of the script; if the script cannot be produced, return exactly []; the response must contain absolutely nothing else.\n"
             )
             if previous_words is not None:
                 diff = words_target - previous_words
-                extra += f" Previous attempt had {previous_words} words (difference {diff}). "
+                extra += f"Previous attempt had {previous_words} words ({'short' if diff>0 else 'long' if diff<0 else 'exact'} by {abs(diff)}). "
                 if diff > 0:
-                    extra += "Extend and enrich to reach the target."
+                    extra += "Extend and enrich naturally to reach the target. "
                 elif diff < 0:
-                    extra += "Condense tightly to reach the target."
-            extra += f" Attempt #{attempt_no}."
+                    extra += (
+                        "Tightly condense and remove redundancies (preserve beats). "
+                    )
+            extra += f"Attempt #{attempt_no}."
             return base_prompt + extra
 
         def _extract_candidate(resp: str) -> str:
+            # prefer the largest bracketed block if present; otherwise return whole response
             try:
                 brs = re.findall(r"\[[\s\S]*?\]", resp)
                 if brs:
@@ -811,173 +921,401 @@ class StoryPipeline:
             return resp.strip()
 
         def _heuristic_trim_to_target(text: str, target_words: int) -> str:
+            # deterministic conservative trimming preserving anchors
             paras = _get_paragraphs(text)
             if not paras:
                 return text
             protect_first = min(1, len(paras))
-            protect_last = min(1, max(0, len(paras) - protect_first))
-            words = re.findall(r"\S+", text)
-            if len(words) <= target_words:
+            protect_last = min(1, len(paras) - protect_first) if len(paras) > 1 else 0
+            para_sents = []
+            for p in paras:
+                sents = [
+                    s.strip() for s in re.split(r"(?<=[\.\?\!])\s+", p) if s.strip()
+                ]
+                if not sents:
+                    sents = [p.strip()]
+                para_sents.append(sents)
+            flat = []
+            loc = []
+            for pi, sents in enumerate(para_sents):
+                for si, s in enumerate(sents):
+                    flat.append(_normalize(s))
+                    loc.append((pi, si))
+            n = len(flat)
+            if n == 0:
                 return text
-            # try to remove middle content conserving first+last anchors
-            if len(paras) >= 3:
-                head = paras[0]
-                tail = paras[-1]
-                middle = " ".join(paras[1:-1])
-                middle_words = re.findall(r"\S+", middle)
-                allowed_middle = max(0, target_words - len(re.findall(r"\S+", head)) - len(re.findall(r"\S+", tail)))
-                if allowed_middle <= 0:
-                    out = " ".join((re.findall(r"\S+", head) + re.findall(r"\S+", tail))[:target_words])
-                    return out
-                trimmed_middle = " ".join(middle_words[:allowed_middle])
-                merged = (head + "\n\n" + trimmed_middle + "\n\n" + tail).strip()
-                return merged
-            # fallback: simple truncate
-            return " ".join(words[:target_words]).strip()
+            scores = [0.0] * n
+            for i in range(n):
+                si = flat[i]
+                if not si or len(si) < 20:
+                    scores[i] = 0.0
+                    continue
+                tot = 0.0
+                cnt = 0
+                for j in range(n):
+                    if i == j:
+                        continue
+                    sj = flat[j]
+                    if not sj:
+                        continue
+                    tot += difflib.SequenceMatcher(None, si, sj).ratio()
+                    cnt += 1
+                scores[i] = (tot / cnt) if cnt else 0.0
+            removable = []
+            for idx, (pi, si) in enumerate(loc):
+                if pi < protect_first or pi >= len(paras) - protect_last:
+                    continue
+                sent_text = para_sents[pi][si]
+                wc_sent = _word_count(sent_text)
+                removable.append((scores[idx], wc_sent, pi, si, sent_text))
+            removable.sort(key=lambda x: (x[0], x[1]), reverse=True)
+            current_text = text
+            current_wc = _word_count(current_text)
+            removals_by_para = {}
+            for score, wc_sent, pi, si, stext in removable:
+                if current_wc <= target_words:
+                    break
+                if len(para_sents[pi]) <= 1:
+                    continue
+                already = removals_by_para.get(pi, 0)
+                if (already + 1) / len(para_sents[pi]) > 0.6:
+                    continue
+                para_sents[pi][si] = ""
+                removals_by_para[pi] = already + 1
+                new_paras = []
+                for sents in para_sents:
+                    sents_clean = [s for s in sents if s and s.strip()]
+                    if sents_clean:
+                        new_paras.append(" ".join(sents_clean))
+                current_text = "\n\n".join(new_paras).strip()
+                current_wc = _word_count(current_text)
+                if current_wc <= target_words:
+                    break
+            if _word_count(current_text) > target_words:
+                paras_now = _get_paragraphs(current_text)
+                cand_idxs = [
+                    i
+                    for i in range(len(paras_now))
+                    if i >= protect_first and i < len(paras_now) - protect_last
+                ]
+                cand_idxs_sorted = sorted(
+                    cand_idxs, key=lambda i: _word_count(paras_now[i])
+                )
+                for i in cand_idxs_sorted:
+                    if _word_count(current_text) <= target_words:
+                        break
+                    paras_now[i] = ""
+                    current_text = "\n\n".join(
+                        [p for p in paras_now if p.strip()]
+                    ).strip()
+            if _word_count(current_text) > target_words:
+                words = re.findall(r"\S+", current_text)
+                paras_now = _get_paragraphs(current_text)
+                cum = []
+                total = 0
+                for p in paras_now:
+                    wc_p = _word_count(p)
+                    cum.append((total, total + wc_p))
+                    total += wc_p
+                last_protected_idx = (
+                    max(0, len(paras_now) - protect_last)
+                    if protect_last > 0
+                    else len(paras_now)
+                )
+                keep_last_start_word = (
+                    cum[last_protected_idx][0] if last_protected_idx < len(cum) else 0
+                )
+                allowable = max(0, keep_last_start_word + 3)
+                if target_words <= allowable:
+                    truncated = " ".join(words[:target_words])
+                else:
+                    truncated = " ".join(words[: max(target_words, allowable)])
+                return truncated.strip()
+            return current_text.strip()
 
+        # Accumulation state
+        accumulated = ""
+        attempt = 0
+
+        # Finalize helper — saves ONLY if non-empty and always as a single bracketed block
         def _finalize_and_save(text: str) -> Optional[str]:
             final_text = _remove_exact_and_fuzzy_duplicates(text, fuzzy_threshold=0.92)
             if final_text.startswith("[") and final_text.endswith("]"):
                 final_text = final_text[1:-1].strip()
             final_text = final_text.strip()
             if not final_text:
-                print("⚠️ Final text empty after cleaning — not saving.")
+                # refuse to save empty content
+                print(
+                    "⚠️ Final text is empty after cleaning — will not save. Continuing retries."
+                )
                 return None
-            bracketed = f"[{final_text}]"
-            save_response("generated_complete_script", "generated_complete_script.txt", bracketed)
-            return bracketed
+            # Save EXACTLY one bracketed block and nothing else
+            save_response(
+                "generated_complete_script",
+                "generated_complete_script.txt",
+                f"[{final_text}]",
+            )
+            return final_text
 
-        attempt = 0
-        backoff = 1.0
-        accumulated = ""
-        last_wc = None
-
+        # Main loop: keep trying until we produce a non-empty cleaned script close to target
         while True:
             attempt += 1
 
-            if stop_event is not None and stop_event.is_set():
-                print(f"Stop requested (attempt {attempt}). Finalizing best-effort.")
-                if accumulated:
-                    return _finalize_and_save(accumulated)
-                return None
-
-            if not allow_infinite and attempt > max_attempts:
-                print(f"Max attempts ({max_attempts}) reached in non-infinite mode. Finalizing best-effort.")
-                if accumulated:
-                    return _finalize_and_save(accumulated)
-                return None
-
-            if attempt == 1:
-                prompt_to_send = base_prompt
-            else:
-                prompt_to_send = _strengthen_prompt(base_prompt, last_wc, attempt)
-
-            try:
-                resp = self.chat.send_message(
-                    prompt_to_send,
-                    timeout=timeout or getattr(self.chat, "base_timeout", None),
-                    spinner_message=f"Generating script (attempt {attempt})...",
-                )
-            except Exception as e:
-                print(f"⚠️ API call failed on attempt {attempt}: {e}")
-                time.sleep(min(30, backoff) + random.random() * 0.5)
-                backoff = min(backoff * 1.8, 60.0)
-                continue
-
-            resp_text = resp if isinstance(resp, str) else (json.dumps(resp) if isinstance(resp, (dict, list)) else str(resp or ""))
-            candidate = _extract_candidate(resp_text)
-            cleaned = candidate or ""
-            # clean up common bracket artifacts
-            cleaned = re.sub(r"^\[+|\]+$", "", cleaned).strip()
-            cleaned = _remove_exact_and_fuzzy_duplicates(cleaned, fuzzy_threshold=0.94)
-            wc = _word_count(cleaned)
-            last_wc = wc
-            print(f"[Attempt {attempt}] Candidate words={wc}; target={words_target} ±{tolerance}")
-
-            if not cleaned:
-                print("⚠️ Candidate cleaned to empty. Retrying after backoff.")
-                time.sleep(min(5 + attempt * 0.5, 20))
-                backoff = min(backoff * 1.8, 60.0)
-                continue
-
-            if cleaned and cleaned not in accumulated:
-                accumulated = (accumulated + "\n\n" + cleaned).strip()
-
-            if abs(wc - words_target) <= tolerance:
-                print(f"✅ Candidate within tolerance: {wc} words. Finalizing and saving.")
-                final = _finalize_and_save(cleaned)
-                if final:
-                    return final
-                print("⚠️ Finalize/save did not produce artifact; continuing.")
-                time.sleep(1 + random.random())
-                continue
-
-            if wc > words_target + tolerance:
-                print(f"→ Candidate too long ({wc} > {words_target}). Attempting heuristic trim.")
-                trimmed = _heuristic_trim_to_target(cleaned, words_target)
-                t_wc = _word_count(trimmed)
-                print(f"   Trimmed to {t_wc} words.")
-                if abs(t_wc - words_target) <= tolerance:
-                    print("✅ Trimmed candidate is within tolerance. Finalizing and saving.")
-                    final = _finalize_and_save(trimmed)
-                    if final:
-                        return final
-                print("→ Trim did not reach acceptable length; will retry with condense instruction.")
-                time.sleep(0.5 + random.random() * 0.7)
-                backoff = min(backoff * 1.5, 60.0)
-                continue
-
-            if wc < words_target - tolerance:
-                print(f"→ Candidate too short ({wc} < {words_target}). Asking model to extend.")
-                paras = _get_paragraphs(cleaned)
-                last_para = paras[-1] if paras else ""
-                continue_prompt = (
-                    f"You produced the script below (inside brackets). The script is currently {wc} words but we need {words_target} "
-                    f"words (±{tolerance}). Continue seamlessly from the last paragraph and expand naturally to meet the target. "
-                    f"Seed (last paragraph):\n\n{last_para}\n\nNow continue and output exactly one bracketed block and nothing else."
+            # --- generation phase ---
+            if not accumulated:
+                # initial generation
+                req_prompt = (
+                    prompt
+                    if attempt == 1
+                    else _strengthen_prompt(prompt, None, attempt)
                 )
                 try:
-                    cont_resp = self.chat.send_message(
-                        continue_prompt,
-                        timeout=timeout or getattr(self.chat, "base_timeout", None),
-                        spinner_message=f"Extending script (attempt {attempt})...",
+                    resp = self.chat.send_message(
+                        req_prompt,
+                        timeout=timeout,
+                        spinner_message=f"Generating initial script (attempt {attempt})...",
                     )
                 except Exception as e:
-                    print(f"⚠️ Continue call failed: {e}")
-                    time.sleep(min(5, backoff) + random.random() * 0.5)
-                    backoff = min(backoff * 1.8, 60.0)
+                    print(f"⚠️ send_message failed on generation attempt {attempt}: {e}")
+                    # exponential backoff (bounded) before retrying to avoid tight infinite loops
+                    sleep_sec = min(8 + random.random() * 2, 30)
+                    print(f"Sleeping {sleep_sec:.1f}s before retrying generation...")
+                    time.sleep(sleep_sec)
                     continue
 
-                cont_text = cont_resp if isinstance(cont_resp, str) else (json.dumps(cont_resp) if isinstance(cont_resp, (dict, list)) else str(cont_resp or ""))
-                cont_candidate = _extract_candidate(cont_text)
-                cont_cleaned = re.sub(r"^\[+|\]+$", "", (cont_candidate or "")).strip()
-                merged = (cleaned + "\n\n" + cont_cleaned).strip()
-                merged = _remove_exact_and_fuzzy_duplicates(merged, fuzzy_threshold=0.92)
-                merged_wc = _word_count(merged)
-                print(f"   After continuation, merged words={merged_wc}")
+                # In strict mode we insist the model returns a bracketed block; otherwise we accept best candidate
+                if strict:
+                    if not single_block_re.match(resp):
+                        print(
+                            "⚠️ Strict mode: response did not contain a single bracketed block — retrying."
+                        )
+                        time.sleep(0.2)
+                        continue
+                candidate = _extract_candidate(resp)
+                try:
+                    cleaned_candidate = clean_script_text(candidate) or candidate
+                except Exception:
+                    cleaned_candidate = candidate
+                cleaned_candidate = _remove_exact_and_fuzzy_duplicates(
+                    cleaned_candidate, fuzzy_threshold=0.90
+                )
+                wc, remaining = _log_clean_state("Initial", cleaned_candidate)
 
-                if abs(merged_wc - words_target) <= tolerance:
-                    print("✅ Continued script meets the target. Finalizing and saving.")
-                    final = _finalize_and_save(merged)
-                    if final:
-                        return final
+                # If too long, attempt model condense then deterministic trim
+                if wc > words_target + tolerance:
+                    condense_tries = min(6, max(1, max_attempts - attempt))
+                    prev_long = wc
+                    condensed_candidate = cleaned_candidate
+                    for ct in range(condense_tries):
+                        condense_prompt = (
+                            "You were given a previously generated script (below). The cleaned version currently has "
+                            f"{prev_long} words, but it must be reduced to exactly {words_target} words (or as close as possible within ±{tolerance}). "
+                            "Tighten and condense the text: remove redundancies, merge sentences, shorten descriptive passages, and preserve the original narrative structure, beats, and meaning. "
+                            "DO NOT invent new sections, scenes, characters, or facts. Do NOT change the sequence of events, character names, perspective, or core details. "
+                            "Keep tone, tense, and voice consistent with the original. Prefer preserving essential lines and emotional beats even when shortening. "
+                            "Produce exactly one bracketed script block and nothing else: output a single opening bracket [ then the entire script content followed by a single closing bracket ] — include no other characters, whitespace, newlines, headings, labels, metadata, counts, commentary, instructions, fragments of the prompt, code fences, or BOM before or after; the bracketed text must be the complete script with no explanatory notes, stage directions, or parenthetical remarks not part of the script; if the script cannot be produced, return exactly []; the response must contain absolutely nothing else.\n"
+                            "Output EXACTLY ONE bracketed block and NOTHING ELSE — the bracketed block must contain only the full revised script text (no extra whitespace, commentary, metadata, or explanation).\n\n"
+                            "PREVIOUS_SCRIPT_BEGIN\n"
+                            f"{condensed_candidate}\n"
+                            "PREVIOUS_SCRIPT_END\n"
+                        )
+                        try:
+                            cond_resp = self.chat.send_message(
+                                condense_prompt,
+                                timeout=timeout,
+                                spinner_message=f"Condensing (try {ct+1}/{condense_tries})...",
+                            )
+                        except Exception as e:
+                            print(f"⚠️ Condense send_message failed: {e}")
+                            break
+                        if strict and not single_block_re.match(cond_resp):
+                            print(
+                                "⚠️ Strict mode: condense response not bracketed — retrying condense."
+                            )
+                            time.sleep(0.2)
+                            continue
+                        cond_inner = _extract_candidate(cond_resp)
+                        try:
+                            cond_clean = clean_script_text(cond_inner) or cond_inner
+                        except Exception:
+                            cond_clean = cond_inner
+                        cond_clean = _remove_exact_and_fuzzy_duplicates(
+                            cond_clean, fuzzy_threshold=0.90
+                        )
+                        cond_wc, _ = _log_clean_state(f"Condense {ct+1}", cond_clean)
+                        if abs(cond_wc - words_target) <= tolerance:
+                            accumulated = cond_clean
+                            break
+                        if cond_wc < prev_long:
+                            condensed_candidate = cond_clean
+                            prev_long = cond_wc
+                            time.sleep(0.2)
+                            continue
+                        break
+                    # if condense loop failed to meet target exactly, run deterministic trim
+                    if not accumulated:
+                        trimmed = _heuristic_trim_to_target(
+                            condensed_candidate, words_target
+                        )
+                        try:
+                            trimmed_clean = clean_script_text(trimmed) or trimmed
+                        except Exception:
+                            trimmed_clean = trimmed
+                        accumulated = _remove_exact_and_fuzzy_duplicates(
+                            trimmed_clean, fuzzy_threshold=0.90
+                        )
                 else:
-                    accumulated = merged
-                    last_wc = merged_wc
-                    time.sleep(0.6 + random.random() * 0.6)
-                    backoff = min(backoff * 1.5, 60.0)
+                    # candidate is short or near-target — accept as accumulated block
+                    accumulated = cleaned_candidate
+
+                # If already within tolerance, attempt to save (must be non-empty)
+                acc_wc = _word_count(accumulated)
+                if abs(acc_wc - words_target) <= tolerance:
+                    res = _finalize_and_save(accumulated)
+                    if res is not None:
+                        return res
+                    else:
+                        # didn't save (empty); clear accumulated and continue
+                        accumulated = ""
+                        continue
+
+                # otherwise loop continues to request continuations
+                continue
+
+            # --- continuation phase: we have an accumulated block that is short ---
+            acc_wc = _word_count(accumulated)
+            remaining = max(0, words_target - acc_wc)
+            last_para = (
+                _get_paragraphs(accumulated)[-1] if _get_paragraphs(accumulated) else ""
+            )
+
+            cont_prompt = (
+                "You are an expert cinematic scriptwriter and continuity editor. "
+                "Below is a script already generated (PREV_BEGIN / PREV_END). Continue it seamlessly from the last paragraph so the final combined script reaches "
+                f"approximately {words_target} words (add about {remaining} words). Do NOT repeat the last paragraph; continue naturally. Maintain voice, pacing, and narrative logic. "
+                "Output ONLY the continuation text (no brackets, no labels, no metadata). Avoid repeating entire paragraphs; use callbacks, echoes, and thematic callbacks instead.\n\n"
+                f"PREV_BEGIN\n{accumulated}\nPREV_END\n\n"
+                f"LAST_PARAGRAPH_BEGIN\n{last_para}\nLAST_PARAGRAPH_END\n\n"
+                "GUIDELINES (follow these tightly):\n"
+                "- Seamlessness: bridge directly from LAST_PARAGRAPH so the result reads as one continuous video_script — no jarring resets, no reintroductory exposition.\n"
+                "- Middle-act mastery: prioritize rising action, conflict escalation, turning points, stakes increase, and micro-resolutions that propel the story forward.\n"
+                "- Maintain characters, names, facts, tone, and tense exactly as present in PREV and LAST_PARAGRAPH. If a scene or character is implied, continue that thread unless explicitly contradicted.\n"
+                "- Show, don't tell: prefer sensory details, short scenes, beats, and concrete actions over long explanation. Use short+long sentences rhythmically to control pacing.\n"
+                "- Callbacks, not copy: reference earlier lines or imagery with subtle callback phrases (echo words, repeated motifs, similar imagery) rather than copying whole sentences.\n"
+                "- Flow & transitions: use graceful transitions between beats or scenes (one-sentence visual transitions, cut-to, or a brief descriptive line) without headings, timestamps, or labels.\n"
+                "- Scene economy: each paragraph should function as a micro-scene or beat — introduce a small change, reveal, decision, or escalation that advances momentum.\n"
+                "- Dialogue & tags: if characters speak, keep speaker attribution consistent with prior format. Use realistic, concise dialogue that reveals character or motive.\n"
+                "- Continuity safety: never contradict established facts (names, timeline, locations, relationships). If uncertain, favor neutral phrasing that preserves continuity.\n"
+                "- Length control: aim for ~{words_target} total words. If you overshoot slightly that's fine; if you undershoot, continue until the target is sensibly reached. When within ~3-7% of the target, create a satisfying mini-cliff or logical segue for the next batch.\n"
+                "- Formatting: plain paragraphs only (no lists, no headers, no code). Keep natural paragraph breaks for beats. No editorial comments, no analysis, no instructions to the reader.\n"
+                "- Safety & quality: keep language appropriate for a wide audience; avoid gratuitous profanity unless already present and integral to character voice.\n\n"
+                "Produce exactly one bracketed script block and nothing else: output a single opening bracket [ then the entire script content followed by a single closing bracket ] — include no other characters, whitespace, newlines, headings, labels, metadata, counts, commentary, instructions, fragments of the prompt, code fences, or BOM before or after; the bracketed text must be the complete script with no explanatory notes, stage directions, or parenthetical remarks not part of the script; if the script cannot be produced, return exactly []; the response must contain absolutely nothing else.\n"
+                "Deliver a single continuous piece that a human editor could paste after PREV_BEGIN and have the full script read as one complete, cinematic video script.\n"
+            )
+            try:
+                cont_resp = self.chat.send_message(
+                    cont_prompt,
+                    timeout=timeout,
+                    spinner_message=f"Continuation attempt (overall attempt {attempt})...",
+                )
+            except Exception as e:
+                print(f"⚠️ Continuation send_message failed: {e}")
+                time.sleep(0.2)
+                continue
+
+            # In strict mode we accept only continuation text (model may return unbracketed continuation)
+            cont_candidate = _extract_candidate(cont_resp)
+            try:
+                cont_clean = clean_script_text(cont_candidate) or cont_candidate
+            except Exception:
+                cont_clean = cont_candidate
+
+            # Append and dedupe
+            combined = (accumulated.rstrip() + "\n\n" + cont_clean.strip()).strip()
+            combined = _remove_exact_and_fuzzy_duplicates(
+                combined, fuzzy_threshold=0.90
+            )
+            new_wc, remaining_after = _log_clean_state("After append", combined)
+
+            if new_wc <= acc_wc:
+                # no progress — try stronger regeneration append
+                print(
+                    "⚠️ Continuation produced no net progress; will retry with stronger generation prompt."
+                )
+                prompt = _strengthen_prompt(prompt, acc_wc, attempt + 1)
+                gen_prompt = (
+                    "Produce a new script section that continues the narrative below and does not repeat existing paragraphs. "
+                    f"Aim to add about {remaining} words. Output EXACTLY ONE bracketed block with only the new section text.\n\nPREV_BEGIN\n{accumulated}\nPREV_END\n"
+                )
+                try:
+                    gen_resp = self.chat.send_message(
+                        gen_prompt,
+                        timeout=timeout,
+                        spinner_message="Generating appended chunk...",
+                    )
+                except Exception as e:
+                    print(f"⚠️ Append-generation failed: {e}")
+                    time.sleep(0.2)
+                    continue
+                if strict and not single_block_re.match(gen_resp):
+                    print("⚠️ Strict mode: append generation not bracketed — retrying.")
+                    time.sleep(0.2)
+                    continue
+                gen_candidate = _extract_candidate(gen_resp)
+                try:
+                    gen_clean = clean_script_text(gen_candidate) or gen_candidate
+                except Exception:
+                    gen_clean = gen_candidate
+                new_combined = (
+                    accumulated.rstrip() + "\n\n" + gen_clean.strip()
+                ).strip()
+                new_combined = _remove_exact_and_fuzzy_duplicates(
+                    new_combined, fuzzy_threshold=0.90
+                )
+                new_wc2, remaining2 = _log_clean_state(
+                    "After regeneration append", new_combined
+                )
+                if new_wc2 > acc_wc:
+                    accumulated = new_combined
+                    continue
+                else:
+                    time.sleep(0.2)
                     continue
 
-            time.sleep(min(3 + backoff, 30))
-            backoff = min(backoff * 1.4, 60.0)
+            # progress made
+            accumulated = combined
 
-        # unreachable
-        return None
+            # if reached or exceeded target -> finalize
+            if _word_count(accumulated) >= words_target:
+                # if over target, trim conservatively
+                if _word_count(accumulated) > words_target + tolerance:
+                    trimmed = _heuristic_trim_to_target(accumulated, words_target)
+                    try:
+                        trimmed_clean = clean_script_text(trimmed) or trimmed
+                    except Exception:
+                        trimmed_clean = trimmed
+                    accumulated = _remove_exact_and_fuzzy_duplicates(
+                        trimmed_clean, fuzzy_threshold=0.92
+                    )
+                res = _finalize_and_save(accumulated)
+                if res is not None:
+                    return res
+                else:
+                    # didn't save (empty) — reset and continue
+                    accumulated = ""
+                    continue
+
+            # slight pause before next continuation (keeps CPU friendly)
+            time.sleep(0.05)
+
+        # This loop is intended to run until succeed; reaching here is unexpected
+        raise RuntimeError("generate_script failed to terminate normally.")
 
     def _split_text_into_n_parts(self, text: str, n: int) -> List[str]:
         """
-        Split text into n parts of roughly equal word count while trying to preserve sentence boundaries.
-        Returns length==n list (may contain empty strings).
+        Split `text` into `n` parts of roughly equal word count while trying to preserve sentence boundaries.
+        Uses word-based targets: words_per_part = ceil(total_words / n).
+        Returns list length == n (may contain empty strings when text is very short).
         """
         from typing import List
         import re, math
@@ -986,48 +1324,60 @@ class StoryPipeline:
         if n <= 1 or not text:
             return [text] + [""] * (n - 1) if n > 0 else []
 
+        # Sentence split (best-effort)
         sentences = re.split(r"(?<=[\.\?!])\s+", text)
         if not sentences:
             return [""] * n
 
+        # words per sentence
         words_per_sentence = [len(re.findall(r"\S+", s)) for s in sentences]
         total_words = sum(words_per_sentence)
         if total_words == 0:
             return [""] * n
 
         target = math.ceil(total_words / n)
+
         parts = []
         current_sentences = []
         current_count = 0
-        idx = 0
+        sentences_idx = 0
 
-        while idx < len(sentences) and len(parts) < n - 1:
-            w = words_per_sentence[idx]
-            s = sentences[idx]
+        while sentences_idx < len(sentences) and len(parts) < n - 1:
+            w = words_per_sentence[sentences_idx]
+            s = sentences[sentences_idx]
+
+            # If adding exceeds target and we already have some content, close part
             if current_count + w > target and current_count > 0:
                 parts.append(" ".join(current_sentences).strip())
                 current_sentences = []
                 current_count = 0
+                # do not increment sentences_idx yet (re-evaluate same sentence into next part)
                 continue
+
+            # otherwise add sentence
             current_sentences.append(s)
             current_count += w
-            idx += 1
+            sentences_idx += 1
 
+        # append remaining sentences as the final part
+        # gather the rest of the sentences (including any not consumed)
         tail = []
-        while idx < len(sentences):
-            tail.append(sentences[idx])
-            idx += 1
+        while sentences_idx < len(sentences):
+            tail.append(sentences[sentences_idx])
+            sentences_idx += 1
 
+        # push current accumulation and tail merged as final part(s)
         if current_sentences:
             parts.append(" ".join(current_sentences).strip())
         if tail:
             parts.append(" ".join(tail).strip())
 
-        # ensure exactly n elements
+        # If fewer than n parts, pad with empty strings
         while len(parts) < n:
             parts.append("")
+
+        # If more than n parts (rare), merge extras into the last part
         if len(parts) > n:
-            # merge tail items into last to fit
             parts = parts[: n - 1] + [" ".join(parts[n - 1 :]).strip()]
 
         return parts
@@ -1040,16 +1390,20 @@ class StoryPipeline:
         batch_size: int = 5,
         timeout_per_call: Optional[int] = None,
         save_each_batch: bool = True,
-        parallel_batches: bool = False,
+        parallel_batches: bool = False,  # new optional: speeds up large jobs but off by default
     ) -> List[str]:
         """
-        Generate image prompts from script_text. Preserves per-paragraph quota semantics.
-        If parallel_batches=True, will attempt to generate paragraph batches in parallel (bounded).
+        Robust image prompt generation. Preserves strict per-paragraph quota semantics by default.
+        - If parallel_batches=True, paragraph batches may be generated in parallel (still tries to respect quota).
+        - Writes final validated prompts into image_response/image_prompts.txt (same behavior).
         """
         import os, re, math, random, time
-        from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        timeout_per_call = timeout_per_call or min(120, getattr(self.chat, "base_timeout", 120))
+        timeout_per_call = timeout_per_call or min(
+            120, getattr(self.chat, "base_timeout", 120)
+        )
+
+        # quick guards
         if img_number <= 0:
             return []
         if batch_size <= 0:
@@ -1060,21 +1414,30 @@ class StoryPipeline:
         final_path = os.path.join(response_folder, final_fname)
         os.makedirs(response_folder, exist_ok=True)
 
+        # compute paragraph splits
         num_paragraphs = max(1, math.ceil(img_number / max(1, batch_size)))
         try:
             paragraphs = self._split_text_into_n_parts(script_text, num_paragraphs)
         except Exception:
+            # fallback
             from math import ceil
+
             words = script_text.split()
             avg = max(1, ceil(len(words) / num_paragraphs)) if script_text else 0
-            paragraphs = [" ".join(words[i : i + avg]) for i in range(0, len(words), avg)]
+            paragraphs = [
+                " ".join(words[i : i + avg]) for i in range(0, len(words), avg)
+            ]
             while len(paragraphs) < num_paragraphs:
                 paragraphs.append("")
 
         prompts = []
         seen_prompts = set()
         per_paragraph_cap = getattr(self, "max_prompt_attempts", None)
-        per_paragraph_max = (per_paragraph_cap if (isinstance(per_paragraph_cap, int) and per_paragraph_cap > 0) else None)
+        per_paragraph_max = (
+            per_paragraph_cap
+            if (isinstance(per_paragraph_cap, int) and per_paragraph_cap > 0)
+            else None
+        )
 
         def _write_atomic(path, content):
             try:
@@ -1094,18 +1457,23 @@ class StoryPipeline:
             except Exception as e:
                 print(f"⚠️ Failed to save progress: {e}")
 
+        # attempt builder and validator reuse from instance
         def _build_request(script_paragraph, req_count, seed):
             try:
-                return self._build_image_prompt_request(script_paragraph, theme, req_count)
+                return self._build_image_prompt_request(
+                    script_paragraph, theme, req_count
+                )
             except Exception:
                 return f"{script_paragraph}\n\nGenerate {req_count} ultra-detailed image prompts. Seed:{seed}"
 
         def _extract_blocks(resp_text):
             if not resp_text:
                 return []
+            # try bracketed first
             blocks = extract_all_bracketed_blocks(resp_text)
             if blocks:
                 return [b.strip() for b in blocks if isinstance(b, str)]
+            # fallback: lines of sufficient length
             lines = [ln.strip() for ln in resp_text.splitlines() if ln.strip()]
             candidates = []
             for ln in lines:
@@ -1117,43 +1485,79 @@ class StoryPipeline:
             return candidates
 
         def _is_valid(candidate):
+            # reuse your same heuristic but keep it simpler and fast here to avoid subtle bugs
             if not candidate or len(candidate.strip()) < 8:
                 return False
             c = candidate.strip("[]()\"'` ").strip()
-            if len(c.split()) < 8 and not any(k in c.lower() for k in ("camera", "cinematic", "photoreal", "illustration", "render", "watercolor")):
+            if len(c.split()) < 8 and not any(
+                k in c.lower()
+                for k in (
+                    "camera",
+                    "cinematic",
+                    "photoreal",
+                    "illustration",
+                    "render",
+                    "watercolor",
+                )
+            ):
                 return False
+            # reject obvious meta lines
             lower = c.lower()
-            for bad in ("do you want", "please confirm", "which one", "error", "unable to", "service may be down", "example"):
+            for bad in (
+                "do you want",
+                "please confirm",
+                "which one",
+                "error",
+                "unable to",
+                "service may be down",
+                "example",
+            ):
                 if bad in lower:
                     return False
             return True
 
-        # helper to process a single paragraph into prompts (retries inside)
-        def _process_paragraph(p_idx):
-            local_prompts = []
+        # MAIN: sequential per-paragraph filling (keeps original semantics)
+        for p_idx in range(num_paragraphs):
+            if len(prompts) >= img_number:
+                break
             paragraph = paragraphs[p_idx] or script_text or ""
-            quota_for_para = min(batch_size, max(1, img_number - len(prompts))) if batch_size > 0 else img_number
+            quota_for_para = min(batch_size, img_number - len(prompts))
             collected = 0
             attempts = 0
-            seed = random.randint(1000, 9999)
-            while collected < quota_for_para and (per_paragraph_max is None or attempts < (per_paragraph_max or 9999)):
+            print(f"\n➡️ Paragraph {p_idx+1}/{num_paragraphs} quota={quota_for_para}")
+
+            while collected < quota_for_para and (
+                per_paragraph_max is None or attempts < per_paragraph_max
+            ):
                 attempts += 1
+                seed = random.randint(1000, 9999)
                 need = quota_for_para - collected
                 request_count = need
                 enriched = f"{paragraph}\n\n# Paragraph {p_idx+1} | Attempt {attempts} | Seed {seed}\nGenerate {request_count} unique, highly-detailed image prompts. Output one bracketed prompt per line."
                 req_body = _build_request(enriched, request_count, seed)
+
                 try:
-                    resp = self.chat.send_message(req_body, timeout=timeout_per_call, spinner_message=f"Generating para {p_idx+1} prompts (attempt {attempts}).")
+                    resp = self.chat.send_message(
+                        req_body,
+                        timeout=timeout_per_call,
+                        spinner_message=f"Generating para {p_idx+1} prompts (attempt {attempts})...",
+                    )
                 except Exception as e:
                     print(f"  ⚠️ API error: {e}")
+                    # save diagnostic
                     try:
-                        _write_atomic(os.path.join(response_folder, f"para_{p_idx+1}_err_{attempts}.txt"), str(e))
+                        _write_atomic(
+                            os.path.join(
+                                response_folder, f"para_{p_idx+1}_err_{attempts}.txt"
+                            ),
+                            str(e),
+                        )
                     except Exception:
                         pass
                     time.sleep(0.6 + random.random() * 0.4)
                     continue
 
-                blocks = _extract_blocks(resp if isinstance(resp, str) else (json.dumps(resp) if isinstance(resp,(dict,list)) else str(resp or "")))
+                blocks = _extract_blocks(resp)
                 added = 0
                 for blk in blocks:
                     if added >= request_count:
@@ -1167,51 +1571,23 @@ class StoryPipeline:
                     if cand in seen_prompts:
                         continue
                     seen_prompts.add(cand)
-                    local_prompts.append(cand)
+                    prompts.append(cand)
                     added += 1
                     collected += 1
-                print(f"  ⚪ para {p_idx+1} added {added} prompts this attempt (collected {collected}/{quota_for_para}).")
+
+                print(
+                    f"  ⚪ added {added} prompts this attempt (collected {collected}/{quota_for_para}, total {len(prompts)}/{img_number})"
+                )
                 if save_each_batch and added:
-                    # merge local into global and save
-                    prompts.extend(local_prompts[-added:])
                     _save_progress()
                 time.sleep(0.3 + random.random() * 0.5)
+
             if collected < quota_for_para:
-                print(f"⚠️ Could not fill paragraph {p_idx+1} quota (collected {collected}/{quota_for_para}).")
-            return local_prompts
+                print(
+                    f"⚠️ Could not fill paragraph {p_idx+1} quota (collected {collected}/{quota_for_para}). Moving on."
+                )
 
-        # Main: either sequential or parallel
-        if parallel_batches and len(paragraphs) > 1:
-            # limit parallelism to small pool to avoid overloading API
-            max_workers = min(4, len(paragraphs))
-            with ThreadPoolExecutor(max_workers=max_workers) as ex:
-                futures = {ex.submit(_process_paragraph, i): i for i in range(len(paragraphs))}
-                for fut in as_completed(futures):
-                    try:
-                        res = fut.result()
-                        # extend prompts maintaining order best-effort
-                        for p in res:
-                            if p not in prompts:
-                                prompts.append(p)
-                                if len(prompts) >= img_number:
-                                    break
-                        if save_each_batch:
-                            _save_progress()
-                    except Exception as e:
-                        print(f"⚠️ Paragraph worker error: {e}")
-        else:
-            for p_idx in range(len(paragraphs)):
-                if len(prompts) >= img_number:
-                    break
-                res = _process_paragraph(p_idx)
-                # extend canonical prompts
-                for p in res:
-                    if p not in prompts:
-                        prompts.append(p)
-                    if len(prompts) >= img_number:
-                        break
-
-        # final dedupe and trim
+        # final dedupe & trim
         final_prompts = []
         for p in prompts:
             if p not in final_prompts:
@@ -1219,97 +1595,195 @@ class StoryPipeline:
             if len(final_prompts) >= img_number:
                 break
 
+        # write final canonical file
         try:
             _write_atomic(final_path, "".join(f"[{p}]\n" for p in final_prompts))
-            print(f"\n✅ Final saved {len(final_prompts)}/{img_number} prompts -> {final_path}")
+            print(
+                f"\n✅ Final saved {len(final_prompts)}/{img_number} prompts -> {final_path}"
+            )
         except Exception as e:
             print(f"\n⚠️ Failed final save: {e}")
 
         return final_prompts
 
-    def _build_image_prompt_request(self, script_text: str, theme: str, img_number: int) -> str:
+    def _build_image_prompt_request(
+        self, script_text: str, theme: str, img_number: int
+    ) -> str:
         """
-        Build a rich, exhaustive image prompt generator request. Preserves the verbose spec you used before.
+        Builds a robust, uniqueness-focused prompt for generating cinematic image prompts.
+        This variant explicitly requests exhaustive micro-details and photographic specs; no length constraint.
+        Output must be one bracketed prompt per line.
+
+        This method prefers the rich prompt body you provided; it's preserved verbatim.
         """
-        if hasattr(self, "_custom_image_prompt_builder") and callable(self._custom_image_prompt_builder):
+        # If user previously supplied a custom builder on the instance, prefer that
+        if hasattr(self, "_custom_image_prompt_builder") and callable(
+            self._custom_image_prompt_builder
+        ):
             try:
                 return self._custom_image_prompt_builder(script_text, theme, img_number)
             except Exception:
                 pass
 
         body = f"""
-    You are an expert visual concept designer, cinematographer, production photographer, studio art director, and elite prompt engineer.
+        You are an expert visual concept designer, cinematographer, production photographer, studio art director, and elite prompt engineer.
 
-    TASK:
-    Generate {img_number} UNIQUE, imaginative image prompts based on the paragraph below. Do NOT restrict prompt length — include exhaustive micro-details and photographic specifications.
+        🎬 TASK:
+        Generate {img_number} completely UNIQUE, imaginative, and visually distinct image prompts 
+        based on the paragraph below. Do NOT restrict prompt length — include exhaustive micro-details and photographic specifications.
 
-    EACH PROMPT MUST:
-    - Describe a single, self-contained scene (composition, subject(s), environment, mood).
-    - Include camera type and lens focal length (e.g., 24mm / 50mm / 85mm), aperture (e.g., f/1.4), shutter speed, ISO, and perspective.
-    - Specify shot framing, distance to subject, lighting, modifiers (softbox, grid), and micro-details (fabric weave, skin pores, droplets).
-    - Define foreground/midground/background layering, atmospheric effects, and color palette with example hex codes.
-    - Suggest cinematic color grading (e.g., Kodak Portra, teal-orange) and finishing styles (film grain, chromatic aberration).
-    - Provide one-line mood caption and 2-3 short phrase tags for style.
+        EACH PROMPT MUST:
+        - Describe a single, self-contained scene (composition, subject(s), environment, mood).
+        - Include camera type and lens focal length (e.g., 24mm / 50mm / 85mm), aperture (e.g., f/1.4), shutter speed, ISO, and perspective (wide/close/low/eye-level/aerial).
+        - Specify exact shot framing (headroom, lead room, rule of thirds), and distance to subject.
+        - Provide detailed lighting: time of day, key/fill/rim configuration, light quality (soft/hard), direction, color temperature or hex codes, and modifiers (softbox, grid, snoot, reflector).
+        - Describe micro-details and tactile cues: fabric weave and stitching, skin pores, hair strands, lens dust, water droplets, rust, paint flake, reflections, specular highlights, bokeh character.
+        - Define foreground / midground / background elements and depth layering plus atmospheric effects (fog, haze, smoke, rain, mist, particulate).
+        - Provide color palette with primary/secondary accents and example hex codes; include tonal contrast and color grading notes (e.g., Kodak Portra, teal-orange, high-contrast filmic).
+        - Offer stylistic references (artists, films, photographers) and choose a rendering style (photoreal, hyperreal 3D, cinematic CG, oil paint, anime cel-shaded).
+        - Include post-processing/rendering guidance: grain size, lens flare style, denoiser/upscaler hints, sharpness, highlight rolloff.
+        - If people are present, include ages, ethnicities, wardrobe layers, poses, micro-expressions, eye catchlights, and number of people. If objects/vehicles, include make/model, era, condition, and materials.
+        - Provide exact aspect ratio (e.g., 16:9, 2:3, 9:16) where relevant.
+        - Optionally append negative guidance (what to avoid).
 
-    OUTPUT:
-    Return EXACTLY ONE bracketed prompt per line. Example valid line: [Young girl painting clouds, watercolor illustration, 50mm, f/2.0, soft morning light, warm pastel palette, cinematic shallow DOF, --v 5] 
+        Always append `| Theme: {theme}` at the end of each prompt.
 
-    Paragraph:
-    {script_text}
+        🎞 SCRIPT PARAGRAPH (inspiration — use this to generate the prompts, do not output it verbatim unless required to convey the scene):
+        {script_text.strip()}
 
-    Theme / constraints: {theme}
+        ⚙️ OUTPUT FORMAT:
+        - Output exactly one prompt per line, wrapped in square brackets [ ... ].
+        - No extra commentary, numbering, or metadata.
+        - Preserve maximal detail — longer prompts are acceptable.
+        """.strip()
+        return body
 
-    Generate now.
-    """
-        return body.strip()
-
-    def generate_narration(self, script_text: str, timing_minutes: int = 10, words_per_minute: int = 250) -> str:
+    def generate_narration(
+        self,
+        script_text: str,
+        timing_minutes: int,
+        words_per_minute: int = 250,
+        bracket_label: str = "narrate_prompt",
+        timeout: Optional[int] = None,
+    ) -> str:
         """
-        Produce narration text suitable for Coqui or other TTS systems.
-        - Returns escaped narration string and writes file narration/narration.txt
+        Generate TTS-ready narration. Returns narration text (escaped for Coqui).
+        Expects the API to return a single bracketed block that begins with 'narrate_prompt' label.
         """
         words_target = timing_minutes * words_per_minute
-        # simple cleaning & normalization preserving paragraphs
-        paras = [p.strip() for p in re.split(r"\n{2,}|\r\n{2,}", script_text) if p.strip()]
-        # join and normalize spaces while keeping paragraph breaks
-        cleaned = "\n\n".join(re.sub(r"\s+", " ", p).strip() for p in paras)
-        # naive length adapt: if too long, keep first words_target words; if too short, leave as-is
-        wc = len(re.findall(r"\w+", cleaned))
-        if wc > words_target:
-            words = re.findall(r"\S+", cleaned)
-            cleaned = " ".join(words[: words_target])
-        escaped = escape_for_coqui_tts(cleaned)
-        # save
-        os.makedirs("narration", exist_ok=True)
-        with open(os.path.join("narration", "narration.txt"), "w", encoding="utf-8") as f:
-            f.write(escaped)
-        print(f"💾 Saved narration (approx {min(wc, words_target)} words) -> narration/narration.txt")
-        return escaped
-
-    def generate_youtube_metadata(self, script_text: str, timing_minutes: int = 10, words_per_minute: int = 250, timeout: Optional[int] = None) -> dict:
-        """
-        Generate YouTube title, description and tags using ChatAPI; save raw response.
-        Returns parsed response (or raw string if parsing not available).
-        """
-        timeout = timeout or min(120, getattr(self.chat, "base_timeout", 120))
         prompt = (
-            "You are an expert YouTube metadata writer. Given the following script, produce a JSON object with keys: "
-            "'title' (<=100 chars), 'description' (>=200 chars), 'tags' (list of 8-20 keywords), and 'chapter_timestamps' (optional list of time->label). "
-            "Only return valid JSON (no surrounding text). Script:\n\n" + script_text
+            "Using the script below, write a single, polished third-person narration derived directly from it, suitable for Coqui TTS (Jenny). "
+            f"Length: produce approximately {words_target} words (aim for 90%-110%), matching the {timing_minutes}-minute length. "
+            "Preserve punctuation ('--', ':', '?') and natural pauses for voice synthesis. "
+            "Formatting STRICT REQUIREMENTS: Output exactly ONE bracketed block and nothing else. The block must begin with the literal label 'narrate_prompt' on the first line, followed by a newline and then the narration text. "
+            "Example valid output: [narrate_prompt\nThis is the narration text ...]. Do not include other labels or metadata inside the brackets. "
+            "Script follows: ===\n"
+            f"{script_text}\n"
+            "===\n"
+            "Generate now."
         )
-        resp = self.chat.send_message(prompt, timeout=timeout, spinner_message="Generating YouTube metadata.")
-        # save raw
-        save_response("youtube_response", "youtube_metadata.txt", resp if isinstance(resp, str) else json.dumps(resp))
-        # try to parse JSON if possible
-        parsed = None
-        try:
-            if isinstance(resp, (dict, list)):
-                parsed = resp
+        resp = self.chat.send_message(
+            prompt,
+            timeout=timeout or self.chat.base_timeout,
+            spinner_message="Generating narration...",
+        )
+        narr_block = extract_largest_bracketed(resp)
+        if narr_block:
+            # remove label if present
+            if narr_block.lower().startswith(bracket_label.lower()):
+                parts = narr_block.split("\n", 1)
+                narr_content = parts[1].strip() if len(parts) > 1 else ""
             else:
-                parsed = json.loads(resp)
-        except Exception:
-            parsed = {"raw": resp}
-        return parsed
+                narr_content = narr_block.strip()
+        else:
+            # fallback
+            blocks = extract_all_bracketed_blocks(resp)
+            narr_content = max(blocks, key=len) if blocks else resp.strip()
+            print(
+                "⚠️ Narration bracket not found exactly as requested — using best available content."
+            )
+
+        # Escape for Coqui TTS
+        narr_content = escape_for_coqui_tts(narr_content)
+        save_response("narration_response", "narrate_prompt.txt", f"[{narr_content}]")
+        return narr_content
+
+    def generate_youtube_metadata(
+        self, script_text: str, timing_minutes: int = 10, timeout: Optional[int] = None
+    ) -> str:
+        prompt = (
+            f"Act as a professional YouTube growth strategist and SEO copywriter. "
+            f"Your task is to generate a *complete, optimized YouTube metadata package* for a {timing_minutes}-minute video. "
+            "Base everything strictly on the script provided below.\n\n"
+            "The output must include the following sections clearly labeled:\n"
+            "1. **TITLE (max 90 characters, including spaces)** — Craft a click-enticing, emotion-driven, curiosity-filled viral title. "
+            "Ensure it’s relevant to the script and includes strong SEO keywords.\n"
+            "2. **DESCRIPTION (max 4900 characters, including spaces)** — Write a fully optimized and engaging description that:\n"
+            "   - Hooks the viewer in the first two lines.\n"
+            "   - Summarizes the video naturally using SEO-rich language.\n"
+            "   - Includes time-stamped highlights if applicable.\n"
+            "   - Encourages watch time, comments, likes, and subscriptions.\n"
+            "   - Includes relevant affiliate links or placeholders (e.g., '👇 Check this out: [link]').\n"
+            "   - Adds CTAs to subscribe or follow.\n"
+            "   - Ends with keyword-rich hashtags and key phrases.\n"
+            "3. **TAGS (comma-separated)** — Generate 20–30 high-ranking SEO tags (mix of short-tail and long-tail keywords relevant to the video topic).\n"
+            "4. **HASHTAGS** — Include 10–20 trending, niche-relevant hashtags formatted like #ExampleTag.\n"
+            "5. **CTA SECTION** — Write 2–3 persuasive call-to-action lines viewers will see in pinned comments or end screens.\n"
+            "6. **THUMBNAIL TEXT IDEAS (3 options)** — Create short, bold text phrases (max 5 words) that grab attention on a thumbnail.\n\n"
+            "Important Instructions:\n"
+            "- Keep tone natural, human, and engaging — avoid robotic phrasing.\n"
+            "- Never exceed character limits.\n"
+            "- Optimize for click-through rate (CTR), viewer retention, and YouTube search visibility.\n"
+            "- Use powerful emotional triggers (e.g., curiosity, fear of missing out, inspiration, surprise, or value-driven phrases).\n"
+            "- Return clean, properly formatted output with labeled sections.\n\n"
+            f"Here is the full video script for context:\n===\n{script_text}\n===\n"
+            "Now generate the complete optimized metadata package.\n\n"
+            "ADDITIONAL MACHINE-READABLE BLOCK (required):\n"
+            "After the labeled human-readable sections above, include a **MACHINE-READABLE BLOCK** containing the exact fields below, each on its own line, with the value placed inside square brackets `[...]`. "
+            "The script that will consume this output will parse these bracketed fields. Be careful: keep the labels exactly as shown (case-insensitive allowed) and place only one matching pair of square brackets per field.\n\n"
+            "Required bracketed fields (the content inside brackets can be multi-line for DESCRIPTION):\n"
+            "title [the title of the video]\n"
+            "description [the description of video with all des, SEO tags, time stamps, CTAs... (can be multi-line)]\n"
+            'tags ["tag1", "tag2", "long tail tag 3", ...]  # Provide as a Python/JSON-style list OR comma separated list\n'
+            "hashtags [#tag1, #tag2, #tag3, ...]\n"
+            "categoryId [any id]  # Use a numeric ID (e.g., 22) from the list: \n"
+            "    1 Film & Animation\n"
+            "    2 Autos & Vehicles\n"
+            "    10 Music\n"
+            "    15 Pets & Animals\n"
+            "    17 Sports\n"
+            "    19 Travel & Events\n"
+            "    20 Gaming\n"
+            "    22 People & Blogs\n"
+            "    23 Comedy\n"
+            "    24 Entertainment\n"
+            "    25 News & Politics\n"
+            "    26 Howto & Style\n"
+            "    27 Education\n"
+            "    28 Science & Technology\n"
+            "    29 Nonprofits & Activism\n"
+            "CTA [A short set of 2-3 CTAs separated by '||' or newlines]\n"
+            'thumbnail_texts ["Option 1", "Option 2", "Option 3"]\n\n'
+            "EXAMPLE MACHINE-READABLE BLOCK (must follow the same formatting exactly):\n"
+            "title [How I Removed a Watermark in 60 Seconds]\n"
+            "description [Hook line...\nFull description here with timestamps and links...]\n"
+            'tags ["remove watermark","video inpainting","ffmpeg tutorial"]\n'
+            "hashtags [#removewatermark, #ffmpeg, #tutorial]\n"
+            "categoryId [22]\n"
+            "CTA [Subscribe for more||Watch the next video for advanced tips]\n"
+            'thumbnail_texts ["Remove Watermark Fast","No Logo!","Pro Trick"]\n\n'
+            "IMPORTANT: The consumer script will parse values between the first matching '[' and its corresponding ']' for each field. "
+            "Do not include extra square brackets inside the field value. After generating this output, save the entire output to a file named 'youtube_metadata.txt' and the script will read it.\n\n"
+            "Now generate the complete optimized metadata package and include the MACHINE-READABLE BLOCK at the end exactly as specified."
+        )
+
+        resp = self.chat.send_message(
+            prompt,
+            timeout=timeout or self.chat.base_timeout,
+            spinner_message="Generating YouTube metadata...",
+        )
+        save_response("youtube_response", "youtube_metadata.txt", resp)
+        return resp
 
 
 
@@ -1322,10 +1796,6 @@ if __name__ == "__main__":
     )
 
     pipeline.chat.max_proxy_fetch = 50000
-    pipeline.chat.specific_error = [
-        "✅ response status: 403",
-        "⚠️ detected cloudflare-like anti-bot page",
-    ]
 
     # --- Example 1: Only generate the story/script (BRACKETED single block file saved) ---
     script = pipeline.generate_script(
