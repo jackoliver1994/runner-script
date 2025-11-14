@@ -18,3 +18,10 @@ mega.py==1.0.8
 cryptography>=42.0.0
 python-dotenv>=1.0.1
 pyppeteer
+transformers==4.35.0
+accelerate
+safetensors
+torch
+sentencepiece
+huggingface-hub[cli]
+bitsandbytes
