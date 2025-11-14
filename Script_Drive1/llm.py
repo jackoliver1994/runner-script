@@ -1051,11 +1051,20 @@ class StoryPipeline:
         self.require_remote = bool(require_remote)
         self.allow_fallback = bool(allow_fallback)
 
-        # If user explicitly provided a local_model and did not allow fallback,
-        # treat that as intent for local-only unless remote explicitly required.
+        # If a local_model was provided but the caller did not explicitly allow fallback or
+        # require remote-only, prefer to allow fallback by default rather than enforce local-only.
+        # This avoids hard failures when a given model id is not available locally or on HF
+        # (e.g. shorthand names like "mistral-small-3.1" that may be private or require token).
+        # If callers want strict local-only behavior, they can pass require_local=True explicitly.
         if self.local_model and not self.allow_fallback and not self.require_remote:
-            self.require_local = True
+            # prefer safe fallback behavior by default
+            self.allow_fallback = True
+            self.require_local = False
             self.require_remote = False
+            print(
+                "ℹ️ local_model was provided but allow_fallback was not set — defaulting to allow remote fallback. "
+                "Pass require_local=True to insist on local-only behavior."
+            )
 
         if self.require_local and self.require_remote:
             raise ValueError(
@@ -2681,7 +2690,9 @@ class StoryPipeline:
 if __name__ == "__main__":
     start = time.time()
 
-    pipeline = StoryPipeline(local_model="mistral-small-3.1", local_device="cpu")
+    pipeline = StoryPipeline(
+        local_model="mistral-small-3.1", local_device="cpu", require_local=True
+    )
 
     # --- Example 1: Only generate the story/script (BRACKETED single block file saved) ---
     script = pipeline.generate_script(
