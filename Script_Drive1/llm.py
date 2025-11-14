@@ -2278,9 +2278,7 @@ class StoryPipeline:
 if __name__ == "__main__":
     start = time.time()
 
-    pipeline = StoryPipeline(
-        local_model="mistral-small-3.1", local_device="cpu", allow_fallback=True
-    )
+    pipeline = StoryPipeline(local_model="mistral-small-3.1", local_device="cpu")
 
     # --- Example 1: Only generate the story/script (BRACKETED single block file saved) ---
     script = pipeline.generate_script(
