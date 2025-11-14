@@ -172,15 +172,35 @@ class LocalLLM:
     def _ensure_transformers_and_deps(self):
         """
         Ensure transformers and a backend are installed (best-effort). May pip install.
+        Attempts to detect the common 'huggingface_hub' mismatch and auto-install compatible versions.
         """
         transformers_ok, numpy_ok, err = self._try_imports()
         if not transformers_ok:
             # try to install transformers + minimal extras
-            self._pip_install("transformers[torch]")
+            # pin to reasonably modern versions known to be mutually compatible
+            self._pip_install("huggingface-hub>=0.18.4")
+            self._pip_install("transformers[torch]>=4.35.2")
             self._pip_install("accelerate")
             self._pip_install("safetensors")
             # re-check
             transformers_ok, numpy_ok, err = self._try_imports()
+
+        # If transformers exists but the specific error about split_torch_state_dict_into_shards from huggingface_hub appears,
+        # attempt to upgrade/downgrade huggingface-hub to a compatible release.
+        if err and (
+            "split_torch_state_dict_into_shards" in str(err)
+            or "cannot import name 'split_torch_state_dict_into_shards'"
+            in str(err).lower()
+        ):
+            print(
+                "⚠️ Detected huggingface_hub/transformers mismatch; attempting to install compatible huggingface-hub & transformers versions."
+            )
+            try:
+                # choose versions that are commonly compatible (best-effort)
+                self._pip_install("huggingface-hub>=0.18.4")
+                self._pip_install("transformers[torch]>=4.35.2")
+            except Exception as e:
+                print("⚠️ Attempt to repair huggingface_hub/transformers failed:", e)
 
         if not numpy_ok and err:
             # attempt repair for numpy ABI mismatch
@@ -306,18 +326,46 @@ class ChatAPI:
         default_timeout: int = 100,
         local_model: Optional[str] = None,
         local_device: Optional[str] = None,
+        require_local: bool = False,
+        require_remote: bool = False,
+        allow_fallback: bool = False,
     ):
+        """
+        ChatAPI constructor.
+        - local_model: name or path for a local HF-compatible model (e.g. "mistral-small-3.1")
+        - require_local: if True, insist on local-only; if local init fails, raise immediately (no remote fallback).
+        - require_remote: if True, force remote-only usage even if local is available.
+        - allow_fallback: if True, allow fallback between local <-> remote; otherwise prefer single-mode:
+            * If local_model is provided and allow_fallback is False => treat as require_local by default.
+            * If no local_model provided, remote usage is used (require_remote=False).
+        """
         import requests  # expected to be available in original codebase
 
         self.requests = requests
         self.url = url
         self.headers = {"Content-Type": "application/json"}
         self.base_timeout = default_timeout
+
+        # Mode flags
+        self.require_local = bool(require_local)
+        self.require_remote = bool(require_remote)
+        self.allow_fallback = bool(allow_fallback)
+
+        # If caller provided a local_model and did not explicitly allow fallback,
+        # interpret that as they want local-only behavior (no silent remote fallback).
+        if local_model and not self.allow_fallback and not require_remote:
+            # prefer local-only by default when user explicitly asked for local_model
+            self.require_local = True
+            self.require_remote = False
+
+        # store wanted local model/device
         self.local_model = local_model
         self.local_device = local_device
         self.local_llm: Optional[LocalLLM] = None
 
-        if self.local_model:
+        # Attempt local model initialization only if local_model is non-empty AND
+        # we're not in strict remote-only mode.
+        if self.local_model and not self.require_remote:
             try:
                 print(
                     f"🔎 Attempting to initialize local model '{self.local_model}' on device='{self.local_device}'..."
@@ -326,13 +374,26 @@ class ChatAPI:
                     local_model=self.local_model, device=self.local_device
                 )
                 if not self.local_llm.is_ready():
-                    print(
-                        "⚠️ Local model was specified but failed to initialize. Will fall back to remote API."
-                    )
-                    self.local_llm = None
+                    # If local was explicitly required, raise; otherwise clear to allow remote (depending on allow_fallback)
+                    if self.require_local:
+                        raise RuntimeError(
+                            "Local model specified but failed to initialize and 'require_local' is set."
+                        )
+                    else:
+                        print(
+                            "⚠️ Local model specified but failed to initialize. Will fall back to remote API (if allowed)."
+                        )
+                        self.local_llm = None
             except Exception as e:
+                # If require_local is set, propagate the error to be visible to caller (no silent fallback).
                 print("⚠️ Error initializing LocalLLM:", e)
+                if self.require_local:
+                    raise
                 self.local_llm = None
+
+        # If user explicitly asked for remote only, and local existed, ensure we don't use it
+        if self.require_remote:
+            self.local_llm = None
 
     def send_message(
         self,
@@ -345,24 +406,51 @@ class ChatAPI:
         spinner_message: str = "Waiting for response...",
     ) -> str:
         """
-        If a ready local LLM exists, call it synchronously and return.
-        Otherwise, perform robust HTTP POST with retry/backoff (preserves infinite retry semantics).
+        send_message respects strict mode flags:
+         - If self.require_remote is True: always use remote API, do not call local.
+         - If self.require_local is True: attempt local; if local not available -> raise immediately.
+         - If neither strict flag is set: use local if available, otherwise remote (with fallback allowed).
         """
-        # LOCAL PATH
-        if self.local_llm is not None and self.local_llm.is_ready():
+
+        # Enforce strict remote-only mode
+        if getattr(self, "require_remote", False):
+            # Force remote path; never call local_llm even if available
+            use_local = False
+        else:
+            # If local is ready and remote not required, prefer local
+            use_local = bool(
+                getattr(self, "local_llm", None) and self.local_llm.is_ready()
+            )
+
+        # If local is required but not ready -> raise immediately (no fallback)
+        if getattr(self, "require_local", False) and not use_local:
+            raise RuntimeError(
+                "Local model was requested (require_local=True) but local LLM is not available/ready."
+            )
+
+        # LOCAL PATH: if allowed & available
+        if use_local:
             try:
                 print("➡️ Using local LLM for generation.")
                 return self.local_llm.generate(
                     message, timeout=timeout or self.base_timeout
                 )
             except Exception as e:
+                # If allow_fallback is True and local fails, fall back to remote; otherwise propagate
+                print("⚠️ Local LLM failed during generate:", e)
+                if not getattr(self, "allow_fallback", False):
+                    # If local was required, raise immediately
+                    if getattr(self, "require_local", False):
+                        raise RuntimeError(
+                            f"Local generation failed and fallback disabled: {e}"
+                        )
+                    # otherwise (user explicitly wanted local-only behavior), raise
+                    raise
                 print(
-                    "⚠️ Local LLM failed during generate — falling back to remote API. Error:",
-                    e,
+                    "ℹ️ allow_fallback=True — falling back to remote API after local failure."
                 )
-                # continue to remote fallback
 
-        # REMOTE PATH (preserve original behavior)
+        # REMOTE PATH: same as original robust implementation (preserve infinite retry)
         spinner = LoadingSpinner(spinner_message)
         attempt = 0
         timeout = timeout or self.base_timeout
@@ -412,6 +500,12 @@ class ChatAPI:
                         timeout = min(timeout + 100, 100000)
                         continue
                     else:
+                        # If remote-only is not allowed (i.e. user required local), then raise
+                        if getattr(self, "require_local", False):
+                            raise RuntimeError(
+                                f"Fatal client error from remote (require_local=True and remote returned client error): {msg}"
+                            )
+                        # otherwise, raise the client error
                         raise RuntimeError(f"Fatal client error (not retried): {msg}")
 
                 resp.raise_for_status()
@@ -488,9 +582,6 @@ class ChatAPI:
                     spinner.stop()
                 except Exception:
                     pass
-
-
-# ---------------------- End of replacement block ----------------------
 
 
 # ---------------------- UTILITIES ----------------------
@@ -2080,7 +2171,9 @@ class StoryPipeline:
 if __name__ == "__main__":
     start = time.time()
 
-    pipeline = StoryPipeline(local_model="mistral-small-3.1", local_device="cpu")
+    pipeline = StoryPipeline(
+        local_model="mistral-small-3.1", local_device="cpu", allow_fallback=True
+    )
 
     # --- Example 1: Only generate the story/script (BRACKETED single block file saved) ---
     script = pipeline.generate_script(
