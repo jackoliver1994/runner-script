@@ -79,13 +79,6 @@ except Exception:
 
 
 class LocalLLM:
-    """
-    Adapter to attempt use of a local HF-style model via transformers.
-    If transformers or dependencies are missing, tries to pip install them.
-    If a numpy ABI error (e.g. 'numpy.dtype size changed') occurs, attempts
-    a best-effort fix by reinstalling numpy (unless disabled by env var).
-    """
-
     def __init__(
         self,
         local_model: Optional[str] = None,
@@ -159,6 +152,7 @@ class LocalLLM:
             import transformers  # type: ignore
 
             transformers_ok = True
+            transformers_err = None
         except Exception as e:
             transformers_ok = False
             transformers_err = str(e)
@@ -171,11 +165,8 @@ class LocalLLM:
         except Exception as e:
             numpy_ok = False
             numpy_err = str(e)
-        return (
-            transformers_ok,
-            numpy_ok,
-            locals().get("transformers_err", None) or numpy_err,
-        )
+        # prefer reporting transformer import error if present, else numpy err
+        return transformers_ok, numpy_ok, transformers_err or numpy_err
 
     def _repair_numpy_if_needed(self, err_msg: str) -> bool:
         """
@@ -192,23 +183,19 @@ class LocalLLM:
 
         # Detect typical ABI message
         if (
-            "numpy.dtype size changed" in err_msg
-            or "binary incompatibility" in err_msg.lower()
+            "numpy.dtype size changed" in (err_msg or "")
+            or "binary incompatibility" in (err_msg or "").lower()
         ):
             print(
                 "⚠️ Detected numpy binary-compatibility error. Attempting to reinstall numpy (best-effort)."
             )
             # Try a safe reinstall: upgrade and force-reinstall numpy to get matching wheel
             try:
-                # Try to pick a commonly compatible version. If your environment requires
-                # another version, set it externally and retry manually.
                 target = "numpy"
-                # First attempt simple upgrade
                 self._pip_install(f"{target} --upgrade --force-reinstall")
-                # If still fails later, user must manually fix in environment.
                 return True
             except Exception as e:
-                print("⚠️ numpy reinstall attempt failed:", e)
+                print("⚠️ numpy reinstall attempt failed:", e, flush=True)
                 return True
         return False
 
@@ -287,67 +274,64 @@ class LocalLLM:
                 flush=True,
             )
 
-        def _init_pipeline(self):
-            """
-            Initialize the HF pipeline. Wrap in try/except to surface meaningful errors.
-            Keeps 'trust_remote_code' semantics so remote repos with custom code can load.
-            """
+    def _init_pipeline(self):
+        """
+        Initialize the HF pipeline. Wrap in try/except to surface meaningful errors.
+        Keeps 'trust_remote_code' semantics so remote repos with custom code can load.
+        """
+        try:
+            from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM  # type: ignore
+
+            kwargs = {"trust_remote_code": True}
+            if self.device:
+                if self.device.lower() == "cpu":
+                    # force CPU map to avoid CUDA attempts
+                    kwargs["device_map"] = "cpu"
+                elif self.device.lower() == "cuda":
+                    kwargs["device_map"] = "auto"
+
+            print(
+                f"🔁 Loading local model '{self.local_model}' (this may download weights)...",
+                flush=True,
+            )
             try:
-                from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM  # type: ignore
-
-                kwargs = {"trust_remote_code": True}
-                if self.device:
-                    if self.device.lower() == "cpu":
-                        # force CPU map to avoid CUDA attempts
-                        kwargs["device_map"] = "cpu"
-                    elif self.device.lower() == "cuda":
-                        kwargs["device_map"] = "auto"
-
-                print(
-                    f"🔁 Loading local model '{self.local_model}' (this may download weights)...",
-                    flush=True,
+                # preferred call (may download weights)
+                self.generator = pipeline(
+                    "text-generation", model=self.local_model, **kwargs
                 )
-                try:
-                    # preferred call (may download weights)
-                    self.generator = pipeline(
-                        "text-generation", model=self.local_model, **kwargs
-                    )
-                except Exception as e_pipeline:
-                    # fallback to explicit tokenizer + model loads to give more explicit errors
-                    print("ℹ️ pipeline() fallback triggered:", e_pipeline, flush=True)
-                    tokenizer = AutoTokenizer.from_pretrained(
-                        self.local_model, use_fast=True, trust_remote_code=True
-                    )
-                    model = AutoModelForCausalLM.from_pretrained(
-                        self.local_model, trust_remote_code=True
-                    )
+            except Exception as e_pipeline:
+                # fallback to explicit tokenizer + model loads to give more explicit errors
+                print("ℹ️ pipeline() fallback triggered:", e_pipeline, flush=True)
+                tokenizer = AutoTokenizer.from_pretrained(
+                    self.local_model, use_fast=True, trust_remote_code=True
+                )
+                model = AutoModelForCausalLM.from_pretrained(
+                    self.local_model, trust_remote_code=True
+                )
 
-                    def gen_fn(prompt, max_new_tokens=self.max_new_tokens):
-                        inputs = tokenizer(prompt, return_tensors="pt", truncation=True)
-                        outputs = model.generate(
-                            **inputs, max_new_tokens=max_new_tokens
-                        )
-                        return tokenizer.decode(outputs[0], skip_special_tokens=True)
+                def gen_fn(prompt, max_new_tokens=self.max_new_tokens):
+                    inputs = tokenizer(prompt, return_tensors="pt", truncation=True)
+                    outputs = model.generate(**inputs, max_new_tokens=max_new_tokens)
+                    return tokenizer.decode(outputs[0], skip_special_tokens=True)
 
-                    self.generator = SimpleNamespace(
-                        __call__=lambda prompt, **kw: [
-                            {
-                                "generated_text": gen_fn(
-                                    prompt,
-                                    kw.get("max_new_tokens", self.max_new_tokens),
-                                )
-                            }
-                        ]
-                    )
+                self.generator = SimpleNamespace(
+                    __call__=lambda prompt, **kw: [
+                        {
+                            "generated_text": gen_fn(
+                                prompt, kw.get("max_new_tokens", self.max_new_tokens)
+                            )
+                        }
+                    ]
+                )
 
-                self._ready = bool(self.generator is not None)
-                if self._ready:
-                    print("✅ Local generator ready.", flush=True)
-                else:
-                    print("⚠️ Local generator creation returned None.", flush=True)
-            except Exception as e:
-                # raise a clear runtime error so higher-level code can decide whether to fallback or abort
-                raise RuntimeError(f"Exception while initializing local pipeline: {e}")
+            self._ready = bool(self.generator is not None)
+            if self._ready:
+                print("✅ Local generator ready.", flush=True)
+            else:
+                print("⚠️ Local generator creation returned None.", flush=True)
+        except Exception as e:
+            # raise a clear runtime error so higher-level code can decide whether to fallback or abort
+            raise RuntimeError(f"Exception while initializing local pipeline: {e}")
 
     def _attempt_init_with_repair(self):
         """
@@ -360,12 +344,12 @@ class LocalLLM:
         except RuntimeError as e:
             # Check message for numpy ABI and attempt repair once if found
             err_text = str(e)
-            print(f"⚠️ {err_text}")
+            print(f"⚠️ {err_text}", flush=True)
             attempted = self._repair_numpy_if_needed(err_text)
             if attempted:
                 # reload python modules in a best-effort way
                 try:
-                    print("🔁 Re-importing environment after repair...")
+                    print("🔁 Re-importing environment after repair...", flush=True)
                     importlib.invalidate_caches()
                     # attempt to re-import critical libs
                     importlib.reload(importlib.import_module("importlib"))
@@ -376,7 +360,7 @@ class LocalLLM:
                     self._ensure_transformers_and_deps()
                     self._init_pipeline()
                 except Exception as e2:
-                    print(f"⚠️ Retry after repair also failed: {e2}")
+                    print(f"⚠️ Retry after repair also failed: {e2}", flush=True)
                     self._ready = False
                     self.generator = None
             else:
