@@ -2,20 +2,31 @@ name: Run short all script
 
 on:
   workflow_dispatch:
+    inputs:
+      install_local_llm:
+        description: 'Set true to install torch/transformers and enable local LLM initialization (heavy).'
+        required: false
+        default: 'false'
 
 jobs:
   run-script:
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    env:
+      R_HOURS: "6"
+      PYTHON_VERSION: "3.11"
+      NODE_VERSION: "18"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v4
         with:
-          python-version: "3.11"
+          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Show disk & inode (start)
         run: |
@@ -37,7 +48,6 @@ jobs:
       - id: find-pkg
         name: Find package.json and lockfile (if any)
         run: |
-          # Look for any package.json tracked in the repo; prefer root, then first match
           pkgpath=$(git ls-files | grep -E "(^|/)\bpackage.json$" | head -n1 || true)
           if [ -z "$pkgpath" ]; then
             echo "found=false" >> $GITHUB_OUTPUT
@@ -47,20 +57,15 @@ jobs:
             echo "No package.json found in repo."
             exit 0
           fi
-
           pkgdir=$(dirname "$pkgpath")
-          # if directory is empty, it's repo root — normalize to '.'
           if [ -z "$pkgdir" ] || [ "$pkgdir" = "." ]; then
             pkgdir="."
             lockbase="./"
           else
             lockbase="$pkgdir/"
           fi
-
           echo "found=true" >> $GITHUB_OUTPUT
           echo "pkg_dir=$pkgdir" >> $GITHUB_OUTPUT
-
-          # detect common lockfiles in the same dir as package.json
           if [ -f "$lockbase""package-lock.json" ]; then
             echo "has_lock=true" >> $GITHUB_OUTPUT
             echo "lock_path=$lockbase""package-lock.json" >> $GITHUB_OUTPUT
@@ -94,24 +99,22 @@ jobs:
         run: |
           sudo apt-get clean || true
           sudo rm -rf /var/lib/apt/lists/* || true
-          # If your workflow doesn't rely on preinstalled hosted tool versions, uncomment the next line to free several GB:
-          # sudo rm -rf /opt/hostedtoolcache/* || true
           echo "After cleanup:" && df -h
 
-      # If no package.json found, skip Node setup/install steps entirely
+      # Node setup - only if package.json present
       - name: Setup Node (with cache - lockfile detected)
         if: steps.find-pkg.outputs.found == 'true' && steps.find-pkg.outputs.has_lock == 'true'
         uses: actions/setup-node@v4
         with:
-          node-version: 18
+          node-version: ${{ env.NODE_VERSION }}
           cache: 'npm'
           cache-dependency-path: ${{ steps.find-pkg.outputs.lock_path }}
 
-      - name: Setup Node (no action cache - lockfile not found but package.json exists)
+      - name: Setup Node (no lockfile)
         if: steps.find-pkg.outputs.found == 'true' && steps.find-pkg.outputs.has_lock == 'false'
         uses: actions/setup-node@v4
         with:
-          node-version: 18
+          node-version: ${{ env.NODE_VERSION }}
 
       - name: Install node deps (using npm ci, lockfile found)
         if: steps.find-pkg.outputs.found == 'true' && steps.find-pkg.outputs.has_lock == 'true'
@@ -129,56 +132,63 @@ jobs:
           df -h
           du -sh $RUNNER_TEMP $RUNNER_WORKSPACE /mnt/* 2>/dev/null || true
 
-      - name: Install Python dependencies (pip)
+      - name: Install Python dependencies (light, always)
         run: |
           python -m pip install --upgrade pip setuptools wheel
-          pip install -r requirements.txt
-          pip install --upgrade requests cloudscraper imageio-ffmpeg pyppeteer
-          pip install --upgrade "huggingface-hub>=0.18.4" "transformers[torch]>=4.35.2" accelerate safetensors
-          # CPU PyTorch (recommended for GitHub Actions unless you have GPU runner)
-          pip install --upgrade --extra-index-url https://download.pytorch.org/whl/cpu torch
+          if [ -f requirements.txt ]; then pip install --prefer-binary -r requirements.txt ; fi
+          # small runtime extras used by script's non-LLM features:
+          pip install --prefer-binary --no-deps requests cloudscraper imageio-ffmpeg pyppeteer || true
 
-      - name: Install Playwright browsers
+      # Heavy local-LLM installs only if user asked (workflow_dispatch input)
+      - name: Install heavy local-LLM deps (torch/transformers) [optional]
+        if: ${{ github.event.inputs.install_local_llm == 'true' }}
         run: |
-          python -m playwright install
-          python -m playwright install-deps
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install --prefer-binary "huggingface-hub>=0.18.4" "transformers[torch]>=4.35.2" accelerate safetensors sentencepiece || true
+          # CPU PyTorch (recommended on GH runners); change if you have GPU runners
+          python -m pip install --upgrade --force-reinstall --extra-index-url https://download.pytorch.org/whl/cpu torch || true
+
+      - name: Install Playwright browsers (uses PLAYWRIGHT_BROWSERS_PATH)
+        run: |
+          python -m pip install --upgrade playwright || true
+          python -m playwright install --with-deps || true
 
       - name: Show disk after Playwright
         run: df -h
 
       - name: Run your script (llm)
+        working-directory: Script_Drive1
         env:
           R_HOURS: "6"
         run: |
-          cd Script_Drive1 || true
           python llm.py
 
       - name: Run your script (pollinations_image_genrate)
+        working-directory: Script_Drive1
         env:
           R_HOURS: "6"
         run: |
-          cd Script_Drive1 || true
           python pollinations_image_genrate.py
 
       - name: Run your script (Coqui_narration)
+        working-directory: Script_Drive1
         env:
           R_HOURS: "6"
         run: |
-          cd Script_Drive1 || true
           python Coqui_narration.py
 
       - name: Run your script (video_genrate)
+        working-directory: Script_Drive1
         env:
           R_HOURS: "6"
         run: |
-          cd Script_Drive1 || true
           python video_genrate.py
 
       - name: Run your script (remove_logo_from_video)
+        working-directory: Script_Drive1
         env:
           R_HOURS: "6"
         run: |
-          cd Script_Drive1 || true
           python remove_logo_from_video.py
 
       - name: Upload debug artifacts (if present)
@@ -195,10 +205,10 @@ jobs:
             Script_Drive1/narration_response/**
 
       - name: Run your script (all_scripts)
+        working-directory: Script_Drive1
         env:
           R_HOURS: "6"
         run: |
-          cd Script_Drive1 || true
           python all_scripts.py
 
       - name: Show disk (end)
