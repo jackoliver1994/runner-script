@@ -17,11 +17,6 @@ jobs:
         with:
           python-version: "3.11"
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 18
-          cache: 'npm'
-
       - name: Show disk & inode (start)
         run: |
           echo "=== start disk ==="
@@ -29,17 +24,32 @@ jobs:
           df -i
           du -sh /* 2>/dev/null | sort -h | tail -n 30
 
-      - name: Prepare big temp/cache dirs on /mnt
+      - name: Prepare big tmp/cache dirs on /mnt and persist envs
         run: |
           sudo mkdir -p /mnt/ci_tmp /mnt/pip_cache /mnt/npm_cache /mnt/playwright_browsers
           sudo chown $USER:$USER /mnt/ci_tmp /mnt/pip_cache /mnt/npm_cache /mnt/playwright_browsers
-          # persist envs for the rest of the job
           echo "TMPDIR=/mnt/ci_tmp" >> $GITHUB_ENV
           echo "PIP_CACHE_DIR=/mnt/pip_cache" >> $GITHUB_ENV
           echo "NPM_CONFIG_CACHE=/mnt/npm_cache" >> $GITHUB_ENV
           echo "PLAYWRIGHT_BROWSERS_PATH=/mnt/playwright_browsers" >> $GITHUB_ENV
-          # show space after creating dirs
           df -h
+
+      - id: check-lock
+        name: Detect JS lockfile (package-lock.json / yarn.lock / npm-shrinkwrap.json)
+        run: |
+          # check for common lockfile names inside Script_Drive1; adjust path if your package.json lives elsewhere
+          if [ -f "Script_Drive1/package-lock.json" ]; then
+            echo "lock_path=Script_Drive1/package-lock.json" >> $GITHUB_OUTPUT
+            echo "has_lock=true" >> $GITHUB_OUTPUT
+          elif [ -f "Script_Drive1/yarn.lock" ]; then
+            echo "lock_path=Script_Drive1/yarn.lock" >> $GITHUB_OUTPUT
+            echo "has_lock=true" >> $GITHUB_OUTPUT
+          elif [ -f "Script_Drive1/npm-shrinkwrap.json" ]; then
+            echo "lock_path=Script_Drive1/npm-shrinkwrap.json" >> $GITHUB_OUTPUT
+            echo "has_lock=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_lock=false" >> $GITHUB_OUTPUT
+          fi
 
       - name: Show TMPDIR / caches (verify)
         run: |
@@ -53,18 +63,39 @@ jobs:
         run: |
           sudo apt-get clean || true
           sudo rm -rf /var/lib/apt/lists/* || true
-          # remove hosted toolcache to free a few GB if your job doesn't need preinstalled tool versions
-          # keep this if you are NOT relying on preinstalled tool versions later in the job
-          sudo rm -rf /opt/hostedtoolcache/* || true
+          # If your workflow doesn't rely on preinstalled hosted tool versions, uncomment the next line to free several GB:
+          # sudo rm -rf /opt/hostedtoolcache/* || true
           echo "After cleanup:" && df -h
 
-      - name: Install node deps (use /mnt cache)
+      # --- Node setup: use setup-node with cache IF lockfile found, otherwise setup-node without cache ---
+      - name: Setup Node (with cache - lockfile detected)
+        if: steps.check-lock.outputs.has_lock == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: 'npm'
+          cache-dependency-path: ${{ steps.check-lock.outputs.lock_path }}
+
+      - name: Setup Node (no action cache - no lockfile)
+        if: steps.check-lock.outputs.has_lock == 'false'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      # --- Install node dependencies: use `npm ci` when lockfile exists, otherwise `npm install` ---
+      - name: Install node deps (using npm ci, lockfile found)
+        if: steps.check-lock.outputs.has_lock == 'true'
+        working-directory: Script_Drive1
         run: npm ci --prefer-offline --no-audit --no-fund --cache /mnt/npm_cache
+
+      - name: Install node deps (using npm install, no lockfile)
+        if: steps.check-lock.outputs.has_lock == 'false'
+        working-directory: Script_Drive1
+        run: npm install --prefer-offline --no-audit --no-fund --cache /mnt/npm_cache
 
       - name: Install Python deps (no pip cache, use /mnt tmp)
         run: |
           python -m pip install --upgrade pip setuptools wheel
-          # ensure pip uses provided TMPDIR and PIP_CACHE_DIR
           TMPDIR=/mnt/ci_tmp PIP_CACHE_DIR=/mnt/pip_cache pip install --no-cache-dir -r requirements.txt
 
       - name: Show disk after installs
@@ -73,11 +104,11 @@ jobs:
           df -h
           du -sh $RUNNER_TEMP $RUNNER_WORKSPACE /mnt/* 2>/dev/null || true
 
-      - name: Install Playwright browsers (uses PLAYWRIGHT_BROWSERS_PATH on /mnt)
+      - name: Install Playwright browsers (to /mnt)
         env:
           PLAYWRIGHT_BROWSERS_PATH: ${{ env.PLAYWRIGHT_BROWSERS_PATH }}
         run: |
-          # playwright will download browsers to PLAYWRIGHT_BROWSERS_PATH instead of default locations
+          # Playwright will download browsers to PLAYWRIGHT_BROWSERS_PATH
           playwright install --with-deps
           echo "Playwright browsers installed to: $PLAYWRIGHT_BROWSERS_PATH"
         shell: bash
