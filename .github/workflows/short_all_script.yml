@@ -34,22 +34,53 @@ jobs:
           echo "PLAYWRIGHT_BROWSERS_PATH=/mnt/playwright_browsers" >> $GITHUB_ENV
           df -h
 
-      - id: check-lock
-        name: Detect JS lockfile (package-lock.json / yarn.lock / npm-shrinkwrap.json)
+      - id: find-pkg
+        name: Find package.json and lockfile (if any)
         run: |
-          # check for common lockfile names inside Script_Drive1; adjust path if your package.json lives elsewhere
-          if [ -f "Script_Drive1/package-lock.json" ]; then
-            echo "lock_path=Script_Drive1/package-lock.json" >> $GITHUB_OUTPUT
+          # Look for any package.json tracked in the repo; prefer root, then first match
+          pkgpath=$(git ls-files | grep -E "(^|/)\bpackage.json$" | head -n1 || true)
+          if [ -z "$pkgpath" ]; then
+            echo "found=false" >> $GITHUB_OUTPUT
+            echo "pkg_dir=" >> $GITHUB_OUTPUT
+            echo "has_lock=false" >> $GITHUB_OUTPUT
+            echo "lock_path=" >> $GITHUB_OUTPUT
+            echo "No package.json found in repo."
+            exit 0
+          fi
+
+          pkgdir=$(dirname "$pkgpath")
+          # if directory is empty, it's repo root — normalize to '.'
+          if [ -z "$pkgdir" ] || [ "$pkgdir" = "." ]; then
+            pkgdir="."
+            lockbase="./"
+          else
+            lockbase="$pkgdir/"
+          fi
+
+          echo "found=true" >> $GITHUB_OUTPUT
+          echo "pkg_dir=$pkgdir" >> $GITHUB_OUTPUT
+
+          # detect common lockfiles in the same dir as package.json
+          if [ -f "$lockbase""package-lock.json" ]; then
             echo "has_lock=true" >> $GITHUB_OUTPUT
-          elif [ -f "Script_Drive1/yarn.lock" ]; then
-            echo "lock_path=Script_Drive1/yarn.lock" >> $GITHUB_OUTPUT
+            echo "lock_path=$lockbase""package-lock.json" >> $GITHUB_OUTPUT
+          elif [ -f "$lockbase""yarn.lock" ]; then
             echo "has_lock=true" >> $GITHUB_OUTPUT
-          elif [ -f "Script_Drive1/npm-shrinkwrap.json" ]; then
-            echo "lock_path=Script_Drive1/npm-shrinkwrap.json" >> $GITHUB_OUTPUT
+            echo "lock_path=$lockbase""yarn.lock" >> $GITHUB_OUTPUT
+          elif [ -f "$lockbase""npm-shrinkwrap.json" ]; then
             echo "has_lock=true" >> $GITHUB_OUTPUT
+            echo "lock_path=$lockbase""npm-shrinkwrap.json" >> $GITHUB_OUTPUT
           else
             echo "has_lock=false" >> $GITHUB_OUTPUT
+            echo "lock_path=" >> $GITHUB_OUTPUT
           fi
+
+      - name: Show found package.json info
+        run: |
+          echo "package.json found: ${{ steps.find-pkg.outputs.found }}"
+          echo "pkg_dir: '${{ steps.find-pkg.outputs.pkg_dir }}'"
+          echo "has_lock: '${{ steps.find-pkg.outputs.has_lock }}'"
+          echo "lock_path: '${{ steps.find-pkg.outputs.lock_path }}'"
 
       - name: Show TMPDIR / caches (verify)
         run: |
@@ -67,30 +98,29 @@ jobs:
           # sudo rm -rf /opt/hostedtoolcache/* || true
           echo "After cleanup:" && df -h
 
-      # --- Node setup: use setup-node with cache IF lockfile found, otherwise setup-node without cache ---
+      # If no package.json found, skip Node setup/install steps entirely
       - name: Setup Node (with cache - lockfile detected)
-        if: steps.check-lock.outputs.has_lock == 'true'
+        if: steps.find-pkg.outputs.found == 'true' && steps.find-pkg.outputs.has_lock == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: 18
           cache: 'npm'
-          cache-dependency-path: ${{ steps.check-lock.outputs.lock_path }}
+          cache-dependency-path: ${{ steps.find-pkg.outputs.lock_path }}
 
-      - name: Setup Node (no action cache - no lockfile)
-        if: steps.check-lock.outputs.has_lock == 'false'
+      - name: Setup Node (no action cache - lockfile not found but package.json exists)
+        if: steps.find-pkg.outputs.found == 'true' && steps.find-pkg.outputs.has_lock == 'false'
         uses: actions/setup-node@v4
         with:
           node-version: 18
 
-      # --- Install node dependencies: use `npm ci` when lockfile exists, otherwise `npm install` ---
       - name: Install node deps (using npm ci, lockfile found)
-        if: steps.check-lock.outputs.has_lock == 'true'
-        working-directory: Script_Drive1
+        if: steps.find-pkg.outputs.found == 'true' && steps.find-pkg.outputs.has_lock == 'true'
+        working-directory: ${{ steps.find-pkg.outputs.pkg_dir }}
         run: npm ci --prefer-offline --no-audit --no-fund --cache /mnt/npm_cache
 
       - name: Install node deps (using npm install, no lockfile)
-        if: steps.check-lock.outputs.has_lock == 'false'
-        working-directory: Script_Drive1
+        if: steps.find-pkg.outputs.found == 'true' && steps.find-pkg.outputs.has_lock == 'false'
+        working-directory: ${{ steps.find-pkg.outputs.pkg_dir }}
         run: npm install --prefer-offline --no-audit --no-fund --cache /mnt/npm_cache
 
       - name: Install Python deps (no pip cache, use /mnt tmp)
@@ -120,35 +150,35 @@ jobs:
         env:
           R_HOURS: "6"
         run: |
-          cd Script_Drive1
+          cd Script_Drive1 || true
           python llm.py
 
       - name: Run your script (pollinations_image_genrate)
         env:
           R_HOURS: "6"
         run: |
-          cd Script_Drive1
+          cd Script_Drive1 || true
           python pollinations_image_genrate.py
 
       - name: Run your script (Coqui_narration)
         env:
           R_HOURS: "6"
         run: |
-          cd Script_Drive1
+          cd Script_Drive1 || true
           python Coqui_narration.py
 
       - name: Run your script (video_genrate)
         env:
           R_HOURS: "6"
         run: |
-          cd Script_Drive1
+          cd Script_Drive1 || true
           python video_genrate.py
 
       - name: Run your script (remove_logo_from_video)
         env:
           R_HOURS: "6"
         run: |
-          cd Script_Drive1
+          cd Script_Drive1 || true
           python remove_logo_from_video.py
 
       - name: Upload debug artifacts (if present)
@@ -168,7 +198,7 @@ jobs:
         env:
           R_HOURS: "6"
         run: |
-          cd Script_Drive1
+          cd Script_Drive1 || true
           python all_scripts.py
 
       - name: Show disk (end)
