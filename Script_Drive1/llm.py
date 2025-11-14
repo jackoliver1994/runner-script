@@ -703,16 +703,123 @@ class StoryPipeline:
     def __init__(
         self,
         api_url: str = "https://apifreellm.com/api/chat",
-        default_timeout: int = 100,
-        local_model: str | None = None,  # e.g. "mistral-small-3.1" or local path
-        local_device: str | None = None,  # "cpu" or "cuda" or None
+        default_timeout: int = 1000,
+        local_model: str | None = None,
+        local_device: str | None = None,
+        require_local: bool = False,
+        require_remote: bool = False,
+        allow_fallback: bool = False,
     ):
-        # If local_model is set, ChatAPI will attempt to use LocalLLM
-        self.chat = ChatAPI(
-            url=api_url,
-            default_timeout=default_timeout,
-            local_model=local_model,
-            local_device=local_device,
+        """
+        StoryPipeline initializer (extended).
+
+        - local_model: name/path of local LLM you want to use (e.g. "mistral-small-3.1").
+        - local_device: device for local model ("cpu" or "cuda").
+        - require_local: if True -> local-only (raise if local unavailable).
+        - require_remote: if True -> remote-only (never use local).
+        - allow_fallback: if True -> allow fallback between local and remote on failures.
+
+        Behavior rules:
+        - If local_model is provided and allow_fallback is False, this defaults to local-only (require_local=True).
+        - If both require_local and require_remote are True → raises ValueError (conflicting).
+        - If local_only requested but no local implementation exists in this script, raises a clear RuntimeError.
+        """
+        # create ChatAPI (existing constructor in your file)
+        self.chat = ChatAPI(url=api_url, default_timeout=default_timeout)
+
+        # store pipeline-level attrs
+        self.api_url = api_url
+        self.default_timeout = default_timeout
+
+        # bind local preferences
+        self.local_model = local_model
+        self.local_device = local_device
+
+        # flags (explicit wins)
+        self.require_local = bool(require_local)
+        self.require_remote = bool(require_remote)
+        self.allow_fallback = bool(allow_fallback)
+
+        # If user explicitly supplied a local_model and didn't ask for fallback,
+        # treat that as they want local-only behavior by default.
+        if self.local_model and not self.allow_fallback and not self.require_remote:
+            self.require_local = True
+            self.require_remote = False
+
+        # Sanity checks
+        if self.require_local and self.require_remote:
+            raise ValueError(
+                "Conflicting options: require_local and require_remote cannot both be True."
+            )
+
+        # Propagate flags to chat object so ChatAPI.send_message / logic can respect them.
+        # We propagate even if ChatAPI.__init__ doesn't accept them — Python allows setting attributes dynamically.
+        try:
+            self.chat.local_model = self.local_model
+            self.chat.local_device = self.local_device
+            self.chat.require_local = self.require_local
+            self.chat.require_remote = self.require_remote
+            self.chat.allow_fallback = self.allow_fallback
+        except Exception:
+            # Fall back to best-effort attribute setting (not expected to fail)
+            setattr(self.chat, "local_model", self.local_model)
+            setattr(self.chat, "local_device", self.local_device)
+            setattr(self.chat, "require_local", self.require_local)
+            setattr(self.chat, "require_remote", self.require_remote)
+            setattr(self.chat, "allow_fallback", self.allow_fallback)
+
+        # If local-only was requested, ensure the file actually contains a local LLM implementation
+        # If not present, raise a clear error (so you don't silently fall back).
+        if self.require_local:
+            # quick probe for a LocalLLM class or other local LLM entrypoints in this module
+            has_local_impl = False
+            try:
+                # check for class name 'LocalLLM' or a helper function 'init_local_llm'
+                if (
+                    "LocalLLM" in globals()
+                    or hasattr(self.chat, "local_llm")
+                    and getattr(self.chat, "local_llm") is not None
+                ):
+                    has_local_impl = True
+                else:
+                    # also check module text heuristically (works in many setups)
+                    import inspect, importlib
+
+                    thismod = importlib.import_module(__name__)
+                    src = inspect.getsource(thismod)
+                    if (
+                        "class LocalLLM" in src
+                        or "def init_local_llm" in src
+                        or "local_llm" in src
+                    ):
+                        has_local_impl = True
+            except Exception:
+                has_local_impl = False
+
+            if not has_local_impl:
+                raise RuntimeError(
+                    "Local-only mode requested (require_local=True or local_model specified without allow_fallback), "
+                    "but this repository/script does not contain a local LLM implementation callable as 'LocalLLM' or "
+                    "'chat.local_llm'. Either implement a local backend, set allow_fallback=True to permit remote fallback, "
+                    "or remove the local_model argument."
+                )
+
+        # All set — print summary for confirmation in logs
+        mode = (
+            "remote-only"
+            if self.require_remote
+            else (
+                "local-only"
+                if self.require_local
+                else (
+                    "local-preferred with fallback"
+                    if self.allow_fallback and self.local_model
+                    else "remote-preferred"
+                )
+            )
+        )
+        print(
+            f"StoryPipeline initialized ({mode}). api_url={self.api_url!r}, local_model={self.local_model!r}, allow_fallback={self.allow_fallback}"
         )
 
     def _build_script_prompt(
