@@ -454,21 +454,29 @@ class ChatAPI:
         # we're not in strict remote-only mode.
         if self.local_model and not self.require_remote:
             try:
-                print(f"🔎 Attempting to initialize local model '{self.local_model}' on device='{self.local_device}'...")
-                self.local_llm = LocalLLM(local_model=self.local_model, device=self.local_device)
+                print(
+                    f"🔎 Attempting to initialize local model '{self.local_model}' on device='{self.local_device}'..."
+                )
+                self.local_llm = LocalLLM(
+                    local_model=self.local_model, device=self.local_device
+                )
                 if not self.local_llm.is_ready():
                     if self.require_local:
-                        raise RuntimeError("Local model specified but failed to initialize and 'require_local' is set.")
+                        raise RuntimeError(
+                            "Local model specified but failed to initialize and 'require_local' is set."
+                        )
                     else:
-                        print("⚠️ Local model specified but failed to initialize. Will fall back to remote API.")
+                        print(
+                            "⚠️ Local model specified but failed to initialize. Will fall back to remote API."
+                        )
                         self.local_llm = None
-                        if not self.local_llm: self._attempt_local_repair_and_retry()
+                        if not self.local_llm:
+                            self._attempt_local_repair_and_retry()
             except Exception as e:
                 print("⚠️ Error initializing LocalLLM:", e)
                 if self.require_local:
                     raise
                 self.local_llm = None
-
 
         # If user explicitly asked for remote only, and local existed, ensure we don't use it
         if self.require_remote:
@@ -495,19 +503,30 @@ class ChatAPI:
         - cloudscraper fallback on Cloudflare/403,
         - Playwright stealth fallback (if available and enabled),
         - optional curl impersonation fallback.
+
+        NOTE: This replaces the original block that used a f-string containing backslashes
+        inside an expression (caused the SyntaxError). The fix builds JS-safe strings
+        first (via json.dumps) and then constructs the JS snippet.
         """
         import requests
         import traceback
+        import subprocess
+        import json
+        import random
         from requests.exceptions import ProxyError as ReqProxyError, RequestException
 
         if specific_error is None:
-            specific_error = [
+            specific_error: list = [
                 "response status: 403",
                 "detected cloudflare-like anti-bot page",
+                "Response status=403 length=9245",
+                "Detected HTML challenge",
+                "Cloudflare-like content",
+                "Response status=403",
                 "cloudflare",
+                "detected cloudflare",
                 "access denied",
                 "anti-bot",
-                "enable javascript and cookies",
             ]
         specific_error = [s.lower() for s in specific_error]
 
@@ -558,6 +577,7 @@ class ChatAPI:
         if use_playwright_on_403:
             try:
                 from playwright.sync_api import sync_playwright
+
                 PLAYWRIGHT_AVAILABLE = True
             except Exception:
                 PLAYWRIGHT_AVAILABLE = False
@@ -567,184 +587,334 @@ class ChatAPI:
         while True:
             attempt += 1
             try:
-                log(f"Attempt #{attempt} — timeout={configured_timeout}s — proxy={current_proxy}")
+                log(
+                    f"Attempt #{attempt} — timeout={configured_timeout}s — proxy={current_proxy}"
+                )
                 # build headers + proxy tuple from instance helper (if present)
                 try:
                     if hasattr(self, "_pick_proxy_and_headers"):
                         prx, headers = self._pick_proxy_and_headers()
                         current_proxy = prx or current_proxy
                     else:
-                        headers = dict(getattr(self, "headers", {"Content-Type": "application/json"}))
+                        headers = dict(
+                            getattr(
+                                self, "headers", {"Content-Type": "application/json"}
+                            )
+                        )
                         # mild UA impersonation
-                        headers["User-Agent"] = headers.get("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36")
+                        headers["User-Agent"] = headers.get(
+                            "User-Agent",
+                            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+                        )
                 except Exception:
-                    headers = dict(getattr(self, "headers", {"Content-Type": "application/json"}))
+                    headers = dict(
+                        getattr(self, "headers", {"Content-Type": "application/json"})
+                    )
 
-                # prepare session with or without proxy
-                session = requests.Session()
+                # create session if needed and avoid env proxies
+                if session is None:
+                    session = requests.Session()
+                    try:
+                        session.trust_env = False
+                    except Exception:
+                        pass
+                    if current_proxy:
+                        p = str(current_proxy)
+                        if not (
+                            p.startswith("http://")
+                            or p.startswith("https://")
+                            or p.startswith("socks5://")
+                            or p.startswith("socks4://")
+                        ):
+                            p = "http://" + p
+                        session.proxies.update({"http": p, "https": p})
+
+                # perform HTTP request (wrapped so we can safely catch network-level errors)
                 try:
-                    session.trust_env = False
-                except Exception:
-                    pass
-                if current_proxy:
-                    session.proxies.update({"http": f"http://{current_proxy}", "https": f"http://{current_proxy}"})
+                    spinner and spinner.start()
+                    r = session.post(
+                        self.url,
+                        headers=headers,
+                        json={"message": message},
+                        timeout=(10, min(configured_timeout, 300)),
+                    )
+                    spinner and spinner.stop()
+                except Exception as e:
+                    spinner and spinner.stop()
+                    # network-level failure -> mark proxy bad when appropriate and retry
+                    log(
+                        f"⚠️ Network exception on attempt #{attempt}: {type(e).__name__} — {getattr(e, 'args', '')}"
+                    )
+                    log(traceback.format_exc())
+                    if current_proxy:
+                        _mark_bad_proxy_local(current_proxy)
+                        current_proxy = None
+                        try:
+                            # pick next proxy (best-effort)
+                            if getattr(self, "_proxy_pool", None):
+                                current_proxy = self._proxy_pool[
+                                    getattr(self, "_proxy_index", 0)
+                                    % max(1, len(self._proxy_pool))
+                                ]
+                                self._proxy_index = (
+                                    getattr(self, "_proxy_index", 0) + 1
+                                ) % max(1, len(self._proxy_pool))
+                                self._current_proxy = current_proxy
+                        except Exception:
+                            pass
+                    time.sleep(backoff + random.random())
+                    backoff = min(backoff * 2, max_backoff)
+                    continue
 
-                spinner and spinner.start()
-                resp = session.post(self.url, headers=headers, json={"message": message}, timeout=configured_timeout)
-                spinner and spinner.stop()
-
-                status = getattr(resp, "status_code", None)
-                body = getattr(resp, "text", "") or ""
+                # Normal response handling
+                status = getattr(r, "status_code", None)
+                body = getattr(r, "text", "") or ""
+                headers_resp = r.headers or {}
 
                 # detect cloudflare-like or specific error in body
                 lower_body = (body or "").lower()
-                matched_specific = any(tok in lower_body for tok in specific_error) or (status == 403)
+                matched_specific = any(tok in lower_body for tok in specific_error) or (
+                    status == 403
+                )
 
-                # If proxy-level failure detected via status or content -> mark proxy bad and rotate
-                if isinstance(resp, requests.Response) and status in (502, 503, 504) or matched_specific:
-                    log(f"⚠️ Detected problematic response (status={status}). matched_specific={matched_specific}")
-                    # mark and rotate proxy
+                # If proxy-level failure detected -> mark proxy bad and rotate
+                if (
+                    isinstance(r, requests.Response) and status in (502, 503, 504)
+                ) or matched_specific:
+                    log(
+                        f"⚠️ Detected problematic response (status={status}). matched_specific={matched_specific}"
+                    )
                     if current_proxy:
                         _mark_bad_proxy_local(current_proxy)
-                        # pick next proxy
-                        current_proxy = getattr(self, "_proxy_pool", [None])[getattr(self, "_proxy_index", 0) % max(1, len(getattr(self, "_proxy_pool", [None])))] if getattr(self, "_proxy_pool", None) else None
-                        self._current_proxy = current_proxy
-
-                    # If we detected a Cloudflare-ish HTML challenge try cloudscraper
-                    if matched_specific and use_cloudscraper_on_403 and cloudscraper is not None:
+                        current_proxy = None
+                        # try to pick new proxy
                         try:
-                            log("→ Detected 403/challenge; attempting cloudscraper fallback (using current proxy if present).")
+                            if getattr(self, "_proxy_pool", None):
+                                current_proxy = self._proxy_pool[
+                                    getattr(self, "_proxy_index", 0)
+                                    % max(1, len(self._proxy_pool))
+                                ]
+                                self._proxy_index = (
+                                    getattr(self, "_proxy_index", 0) + 1
+                                ) % max(1, len(self._proxy_pool))
+                                self._current_proxy = current_proxy
+                        except Exception:
+                            pass
+
+                    # cloudscraper fallback
+                    if (
+                        matched_specific
+                        and use_cloudscraper_on_403
+                        and cloudscraper is not None
+                    ):
+                        try:
+                            log(
+                                "→ Detected 403/challenge; attempting cloudscraper fallback (using current proxy if present)."
+                            )
                             cs = cloudscraper.create_scraper()
                             if current_proxy:
-                                cs.proxies.update({"http": f"http://{current_proxy}", "https": f"http://{current_proxy}"})
+                                p = str(current_proxy)
+                                if not (
+                                    p.startswith("http://")
+                                    or p.startswith("https://")
+                                    or p.startswith("socks5://")
+                                    or p.startswith("socks4://")
+                                ):
+                                    p = "http://" + p
+                                cs.proxies.update({"http": p, "https": p})
                             cs.headers.update(headers)
-                            cs_resp = cs.post(self.url, json={"message": message}, timeout=configured_timeout)
+                            cs_resp = cs.post(
+                                self.url,
+                                json={"message": message},
+                                timeout=(10, min(configured_timeout, 300)),
+                            )
                             if cs_resp.status_code == 200:
-                                log("✅ cloudscraper succeeded; returning cloudscraper response.")
+                                log(
+                                    "✅ cloudscraper succeeded; returning cloudscraper response."
+                                )
                                 try:
-                                    return cs_resp.json().get("response", cs_resp.text)
+                                    return cs_resp.json()
                                 except Exception:
                                     return cs_resp.text
                             else:
-                                log("⚠️ cloudscraper fallback returned status", cs_resp.status_code)
+                                log(
+                                    "⚠️ cloudscraper fallback returned status",
+                                    cs_resp.status_code,
+                                )
                         except Exception as e:
-                            log("⚠️ cloudscraper attempt failed:", e)
+                            log(
+                                "⚠️ cloudscraper attempt failed:", traceback.format_exc()
+                            )
+                            if current_proxy:
+                                _mark_bad_proxy_local(current_proxy)
+                                current_proxy = None
+                            time.sleep(min(backoff, 4) + random.random())
+                            backoff = min(backoff * 2, max_backoff)
+                            continue
 
                     # Playwright fallback (if enabled)
-                    if matched_specific and use_playwright_on_403 and PLAYWRIGHT_AVAILABLE:
+                    if (
+                        matched_specific
+                        and use_playwright_on_403
+                        and PLAYWRIGHT_AVAILABLE
+                    ):
                         try:
-                            log("→ Attempting Playwright stealth fetch to acquire cookies/session...")
-                            with sync_playwright() as pw:
-                                browser = pw.chromium.launch(headless=True, args=["--no-sandbox"])
-                                context = browser.new_context(user_agent=headers.get("User-Agent"))
+                            log(
+                                "→ Attempting Playwright stealth fetch to acquire cookies/session."
+                            )
+                            from playwright.sync_api import sync_playwright as _sync_pw
+
+                            with _sync_pw() as pw:
+                                browser = pw.chromium.launch(
+                                    headless=True, args=["--no-sandbox"]
+                                )
+                                context = browser.new_context(
+                                    user_agent=headers.get("User-Agent")
+                                )
                                 page = context.new_page()
                                 # navigate to base url to solve challenge
                                 page.goto(self.url, timeout=30000)
-                                # try sending the message via fetch inside the page (works around CF sometimes)
-                                fetch_script = f"""
-                                () => fetch("{self.url.replace('\"','\\\"')}", {{
-                                    method: "POST",
-                                    headers: {{ "Content-Type": "application/json" }},
-                                    body: JSON.stringify({{"message": {json.dumps(message)}}})
-                                }}).then(r => r.text()).then(t => t).catch(e => String(e));
-                                """
+
+                                # Build JS-escaped / JSON-safe pieces outside of the f-string expression.
+                                # json.dumps gives a JS-safe quoted string (includes surrounding quotes).
+                                js_url = json.dumps(self.url)
+                                js_body = json.dumps({"message": message})
+
+                                fetch_script = (
+                                    f"() => fetch({js_url}, {{"
+                                    f"method: 'POST', headers: {{ 'Content-Type': 'application/json' }},"
+                                    f"body: JSON.stringify({js_body})"
+                                    f"}}).then(r => r.text()).then(t => t).catch(e => String(e));"
+                                )
+
                                 result = page.evaluate(fetch_script)
                                 browser.close()
                                 if result:
-                                    log("✅ Playwright fetch returned content; returning it.")
-                                    return result
+                                    log(
+                                        "✅ Playwright fetch returned content; returning it."
+                                    )
+                                    # try to parse JSON before returning raw string
+                                    try:
+                                        return json.loads(result)
+                                    except Exception:
+                                        return result
                         except Exception as e:
-                            log("⚠️ Playwright fallback failed:", e)
+                            log("⚠️ Playwright fallback failed:", traceback.format_exc())
+                            # treat this as non-fatal and continue to other fallbacks / retry
 
                     # optional curl impersonation fallback (lightweight)
                     if matched_specific and use_curl_impersonate:
                         try:
-                            log("→ Attempting curl impersonation fallback (best-effort)...")
-                            ua = headers.get("User-Agent", "Mozilla/5.0 (X11; Linux x86_64)")
+                            log(
+                                "→ Attempting curl impersonation fallback (best-effort)."
+                            )
+                            ua = headers.get(
+                                "User-Agent", "Mozilla/5.0 (X11; Linux x86_64)"
+                            )
                             curl_cmd = [
                                 "curl",
                                 "-sS",
-                                "-X", "POST",
-                                "-H", f"Content-Type: application/json",
-                                "-H", f"User-Agent: {ua}",
-                                "-d", json.dumps({"message": message}),
+                                "-X",
+                                "POST",
+                                "-H",
+                                "Content-Type: application/json",
+                                "-H",
+                                f"User-Agent: {ua}",
+                                "-d",
+                                json.dumps({"message": message}),
                                 self.url,
                             ]
                             if current_proxy:
                                 curl_cmd.insert(-1, "--proxy")
                                 curl_cmd.insert(-1, f"http://{current_proxy}")
-                            out = subprocess.check_output(curl_cmd, stderr=subprocess.STDOUT, timeout=max(60, configured_timeout))
+                            out = subprocess.check_output(
+                                curl_cmd,
+                                stderr=subprocess.STDOUT,
+                                timeout=max(60, configured_timeout),
+                            )
                             out = out.decode("utf-8", errors="ignore")
                             if out:
-                                log("✅ curl fallback produced a response; returning it.")
+                                log(
+                                    "✅ curl fallback produced a response; returning it."
+                                )
                                 try:
-                                    return json.loads(out).get("response", out)
+                                    return json.loads(out)
                                 except Exception:
                                     return out
-                        except Exception as e:
-                            log("⚠️ curl fallback failed:", e)
+                        except Exception:
+                            log("⚠️ curl fallback failed:", traceback.format_exc())
 
                     # else backoff and loop to try next proxy / retry
-                    log(f"⚠️ Backing off {backoff:.1f}s and retrying...")
+                    log(f"⚠️ Backing off {backoff:.1f}s and retrying.")
                     time.sleep(backoff + random.uniform(0, 1.0))
                     backoff = min(backoff * 2, max_backoff)
-                    configured_timeout = min(configured_timeout + timeout_growth, max_timeout_cap)
+                    configured_timeout = min(
+                        configured_timeout + timeout_growth, max_timeout_cap
+                    )
                     continue
 
-                # Normal client error handling (400-499)
-                if 400 <= status < 500:
-                    try:
-                        payload = resp.json()
-                        err_msg = payload.get("error") or json.dumps(payload)
-                    except Exception:
-                        err_msg = body or f"HTTP {status}"
-                    msg = f"HTTP {status} - {err_msg}"
-                    # non-retryable clients unless configured
-                    raise RuntimeError(f"Fatal client error (not retried): {msg}")
-
-                # If status OK -> parse json and return success as before
-                resp.raise_for_status()
+                # If we get here, status code is not a 5xx/403 problematic case handled above.
+                # Try parsing JSON if possible
+                parsed = None
                 try:
-                    result = resp.json()
+                    ct = (headers_resp.get("Content-Type") or "").lower()
+                    if "application/json" in ct or (
+                        isinstance(body, str)
+                        and (
+                            body.strip().startswith("{") or body.strip().startswith("[")
+                        )
+                    ):
+                        parsed = json.loads(body) if body else {}
                 except Exception:
-                    result = {"status": "success", "response": resp.text}
+                    log("⚠️ Failed to parse JSON. Response snippet:")
+                    log((body or "")[:2000])
 
-                if isinstance(result, dict) and result.get("status") == "success":
-                    return result.get("response", "")
-                else:
-                    # Unexpected payload -> backoff and retry
-                    log("⚠️ Unexpected payload from API; backing off and retrying.")
-                    time.sleep(backoff + random.uniform(0, 1.0))
-                    backoff = min(backoff * 2, max_backoff)
-                    configured_timeout = min(configured_timeout + timeout_growth, max_timeout_cap)
-                    continue
-
-            except (ReqProxyError, RequestException) as e:
-                spinner and spinner.stop()
-                log(f"⚠️ Network/proxy error on attempt #{attempt}: {e}")
-                # mark proxy bad if proxy caused it
-                if current_proxy:
-                    _mark_bad_proxy_local(current_proxy)
-                    current_proxy = getattr(self, "_proxy_pool", [None])[getattr(self, "_proxy_index", 0) % max(1, len(getattr(self, "_proxy_pool", [None])))] if getattr(self, "_proxy_pool", None) else None
+                if parsed and (
+                    (isinstance(parsed, dict) and parsed.get("status") == "success")
+                    or ("message" in parsed and parsed.get("message"))
+                ):
+                    log("✅ API returned success. Returning parsed payload or body.")
                     self._current_proxy = current_proxy
-                time.sleep(backoff + random.uniform(0, 1.0))
-                backoff = min(backoff * 2, max_backoff)
-                configured_timeout = min(configured_timeout + timeout_growth, max_timeout_cap)
-                continue
+                    return parsed
+
+                # If raw body but contains anti-bot markers, rotate/ retry
+                if not parsed and body:
+                    low = (body or "").lower()
+                    if any(err_marker in low for err_marker in specific_error):
+                        log(
+                            f"→ Detected anti-bot / specific error marker in body (attempt {attempt}). Rotating proxy + retrying."
+                        )
+                        if current_proxy:
+                            _mark_bad_proxy_local(current_proxy)
+                            current_proxy = None
+                        time.sleep(backoff + random.random())
+                        backoff = min(backoff * 2, max_backoff)
+                        configured_timeout = min(
+                            configured_timeout + timeout_growth, max_timeout_cap
+                        )
+                        continue
+                    log("→ Returning raw body (non-JSON).")
+                    return body
+
+                # Last resort: return parsed or raw body
+                if parsed:
+                    return parsed
+                return body
 
             except Exception as e:
-                spinner and spinner.stop()
-                log(f"⚠️ Unexpected error on attempt #{attempt}: {traceback.format_exc()}")
-                time.sleep(backoff + random.uniform(0, 1.0))
+                log("⚠️ Unexpected error in send_message loop:", traceback.format_exc())
+                time.sleep(backoff + random.random())
                 backoff = min(backoff * 2, max_backoff)
-                configured_timeout = min(configured_timeout + timeout_growth, max_timeout_cap)
+                configured_timeout = min(
+                    configured_timeout + timeout_growth, max_timeout_cap
+                )
                 continue
-
             finally:
-                try:
-                    spinner and spinner.stop()
-                except Exception:
-                    pass
+                if spinner:
+                    try:
+                        spinner.stop()
+                    except Exception:
+                        pass
 
 
 # ---------------------- UTILITIES ----------------------
@@ -1068,7 +1238,9 @@ class StoryPipeline:
         - Returns True if re-init succeeded and self.local_llm is ready.
         """
         try:
-            print("ℹ️ Local init failed — attempting one automatic repair + re-initialize...")
+            print(
+                "ℹ️ Local init failed — attempting one automatic repair + re-initialize..."
+            )
             # Try to create a fresh LocalLLM instance (LocalLLM is expected to run its own repair/install attempts)
             tmp = LocalLLM(local_model=self.local_model, device=self.local_device)
             if hasattr(tmp, "is_ready") and tmp.is_ready():
