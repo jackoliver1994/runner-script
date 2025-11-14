@@ -516,17 +516,13 @@ class ChatAPI:
         from requests.exceptions import ProxyError as ReqProxyError, RequestException
 
         if specific_error is None:
-            specific_error: list = [
+            specific_error = [
                 "response status: 403",
                 "detected cloudflare-like anti-bot page",
-                "Response status=403 length=9245",
-                "Detected HTML challenge",
-                "Cloudflare-like content",
-                "Response status=403",
                 "cloudflare",
-                "detected cloudflare",
                 "access denied",
                 "anti-bot",
+                "enable javascript and cookies",
             ]
         specific_error = [s.lower() for s in specific_error]
 
@@ -1036,7 +1032,7 @@ class StoryPipeline:
     def __init__(
         self,
         api_url: str = "https://apifreellm.com/api/chat",
-        default_timeout: int = 1000,
+        default_timeout: int = 100,
         local_model: str | None = None,
         local_device: str | None = None,
         require_local: bool = False,
@@ -1044,100 +1040,129 @@ class StoryPipeline:
         allow_fallback: bool = False,
     ):
         """
-        StoryPipeline initializer (extended).
+        StoryPipeline initializer (robust, no-feature-removal).
 
-        - local_model: name/path of local LLM you want to use (e.g. "mistral-small-3.1").
+        - local_model: name/path of local LLM to use (e.g. "mistral-small-3.1").
         - local_device: device for local model ("cpu" or "cuda").
         - require_local: if True -> local-only (raise if local unavailable).
         - require_remote: if True -> remote-only (never use local).
         - allow_fallback: if True -> allow fallback between local and remote on failures.
 
-        Behavior rules:
-        - If local_model is provided and allow_fallback is False, this defaults to local-only (require_local=True).
-        - If both require_local and require_remote are True → raises ValueError (conflicting).
-        - If local_only requested but no local implementation exists in this script, raises a clear RuntimeError.
+        Behavior:
+        - If local_model is provided and allow_fallback is False and require_remote is False,
+        default to local-only behavior (require_local=True).
+        - If both require_local and require_remote are True -> raise ValueError.
+        - Attempts to pass local flags into ChatAPI constructor. If ChatAPI doesn't accept them,
+        the constructor falls back to post-construction attribute setting and a one-time
+        local re-init attempt via _attempt_local_repair_and_retry().
         """
-        # create ChatAPI (existing constructor in your file)
-        self.chat = ChatAPI(url=api_url, default_timeout=default_timeout)
-
-        # store pipeline-level attrs
+        # store pipeline-level attributes first
         self.api_url = api_url
         self.default_timeout = default_timeout
-
-        # bind local preferences
         self.local_model = local_model
         self.local_device = local_device
 
-        # flags (explicit wins)
+        # flags
         self.require_local = bool(require_local)
         self.require_remote = bool(require_remote)
         self.allow_fallback = bool(allow_fallback)
 
-        # If user explicitly supplied a local_model and didn't ask for fallback,
-        # treat that as they want local-only behavior by default.
+        # If user explicitly provided a local_model and did not allow fallback,
+        # treat that as intent for local-only unless remote explicitly required.
         if self.local_model and not self.allow_fallback and not self.require_remote:
             self.require_local = True
             self.require_remote = False
 
-        # Sanity checks
         if self.require_local and self.require_remote:
             raise ValueError(
                 "Conflicting options: require_local and require_remote cannot both be True."
             )
 
-        # Propagate flags to chat object so ChatAPI.send_message / logic can respect them.
-        # We propagate even if ChatAPI.__init__ doesn't accept them — Python allows setting attributes dynamically.
+        # Instantiate ChatAPI. Prefer to pass the local/flag args into ChatAPI constructor
+        # so ChatAPI can run its own local init logic in its __init__ if implemented.
         try:
-            self.chat.local_model = self.local_model
-            self.chat.local_device = self.local_device
-            self.chat.require_local = self.require_local
-            self.chat.require_remote = self.require_remote
-            self.chat.allow_fallback = self.allow_fallback
-        except Exception:
-            # Fall back to best-effort attribute setting (not expected to fail)
-            setattr(self.chat, "local_model", self.local_model)
-            setattr(self.chat, "local_device", self.local_device)
-            setattr(self.chat, "require_local", self.require_local)
-            setattr(self.chat, "require_remote", self.require_remote)
-            setattr(self.chat, "allow_fallback", self.allow_fallback)
-
-        # If local-only was requested, ensure the file actually contains a local LLM implementation
-        # If not present, raise a clear error (so you don't silently fall back).
-        if self.require_local:
-            # quick probe for a LocalLLM class or other local LLM entrypoints in this module
-            has_local_impl = False
+            # Prefer constructor signature supporting these extra args (if ChatAPI accepts them)
+            self.chat = ChatAPI(
+                url=self.api_url,
+                default_timeout=self.default_timeout,
+                local_model=self.local_model,
+                local_device=self.local_device,
+                require_local=self.require_local,
+                require_remote=self.require_remote,
+                allow_fallback=self.allow_fallback,
+            )
+        except TypeError:
+            # older ChatAPI may not accept those args — create basic instance then set attributes
+            self.chat = ChatAPI(url=self.api_url, default_timeout=self.default_timeout)
+            # set attributes on chat so send_message / other methods can read them
             try:
-                # check for class name 'LocalLLM' or a helper function 'init_local_llm'
-                if (
-                    "LocalLLM" in globals()
-                    or hasattr(self.chat, "local_llm")
-                    and getattr(self.chat, "local_llm") is not None
-                ):
-                    has_local_impl = True
-                else:
-                    # also check module text heuristically (works in many setups)
-                    import inspect, importlib
-
-                    thismod = importlib.import_module(__name__)
-                    src = inspect.getsource(thismod)
-                    if (
-                        "class LocalLLM" in src
-                        or "def init_local_llm" in src
-                        or "local_llm" in src
-                    ):
-                        has_local_impl = True
+                self.chat.local_model = self.local_model
+                self.chat.local_device = self.local_device
+                self.chat.require_local = self.require_local
+                self.chat.require_remote = self.require_remote
+                self.chat.allow_fallback = self.allow_fallback
             except Exception:
-                has_local_impl = False
+                # fallback to setattr for robustness
+                setattr(self.chat, "local_model", self.local_model)
+                setattr(self.chat, "local_device", self.local_device)
+                setattr(self.chat, "require_local", self.require_local)
+                setattr(self.chat, "require_remote", self.require_remote)
+                setattr(self.chat, "allow_fallback", self.allow_fallback)
 
-            if not has_local_impl:
+            # If local_model was requested, the ChatAPI may not have tried to init local LLM
+            # because it was constructed earlier. Attempt one best-effort repair + re-init here.
+            if self.local_model:
+                try:
+                    # if ChatAPI provides a helper, call it; else call pipeline helper that uses LocalLLM
+                    if hasattr(self.chat, "_attempt_local_repair_and_retry"):
+                        # prefer chat's own helper if present
+                        self.chat._attempt_local_repair_and_retry()
+                    else:
+                        # Use the pipeline-level helper to attempt one repair and init
+                        self._attempt_local_repair_and_retry()
+                except Exception as e:
+                    # If require_local is True, propagate the error; else continue and let fallback behavior decide
+                    if self.require_local:
+                        raise RuntimeError(
+                            f"Local model requested but automatic re-init failed: {e}"
+                        )
+
+        # Now, post-construction sanity: if require_local is set, ensure local_llm is present and ready
+        local_ready = False
+        try:
+            local_llm_obj = getattr(self.chat, "local_llm", None)
+            if (
+                local_llm_obj
+                and hasattr(local_llm_obj, "is_ready")
+                and local_llm_obj.is_ready()
+            ):
+                local_ready = True
+            # some implementations use a _ready flag
+            elif local_llm_obj and getattr(local_llm_obj, "_ready", False):
+                local_ready = True
+        except Exception:
+            local_ready = False
+
+        if self.require_local and not local_ready:
+            # If we reached here and require_local is True, local didn't initialize earlier.
+            # Attempt one additional best-effort repair/retry before failing hard.
+            try:
+                # try chat-level helper first
+                if hasattr(self.chat, "_attempt_local_repair_and_retry"):
+                    ok = self.chat._attempt_local_repair_and_retry()
+                else:
+                    ok = self._attempt_local_repair_and_retry()
+                if not ok:
+                    raise RuntimeError(
+                        "Local-only requested but local LLM not ready after repair attempt."
+                    )
+            except Exception as e:
+                # fail loudly — no silent fallback when require_local is True
                 raise RuntimeError(
-                    "Local-only mode requested (require_local=True or local_model specified without allow_fallback), "
-                    "but this repository/script does not contain a local LLM implementation callable as 'LocalLLM' or "
-                    "'chat.local_llm'. Either implement a local backend, set allow_fallback=True to permit remote fallback, "
-                    "or remove the local_model argument."
+                    f"Local-only requested but local LLM could not be initialized: {e}"
                 )
 
-        # All set — print summary for confirmation in logs
+        # Final log summary (keeps original logging behavior)
         mode = (
             "remote-only"
             if self.require_remote
@@ -1231,33 +1256,66 @@ class StoryPipeline:
         )
         return prompt
 
-    def _attempt_local_repair_and_retry(self):
+    def _attempt_local_repair_and_retry(self) -> bool:
         """
         Best-effort: attempt one auto-repair + re-init of the local model.
-        - This should be cheap if LocalLLM already implements its own repair logic.
-        - Returns True if re-init succeeded and self.local_llm is ready.
+        Reuses LocalLLM constructor (which may perform pip installs / fixes).
+        Returns True if re-init succeeded (self.chat.local_llm is ready); False otherwise.
+        This helper runs at most once when invoked by the constructor.
         """
         try:
             print(
-                "ℹ️ Local init failed — attempting one automatic repair + re-initialize..."
+                "ℹ️ Local init failed earlier — attempting one automatic repair + re-initialize...",
+                flush=True,
             )
-            # Try to create a fresh LocalLLM instance (LocalLLM is expected to run its own repair/install attempts)
-            tmp = LocalLLM(local_model=self.local_model, device=self.local_device)
-            if hasattr(tmp, "is_ready") and tmp.is_ready():
-                self.local_llm = tmp
-                print("✅ Local model initialized successfully on retry.")
-                return True
-            else:
-                # In case LocalLLM uses different readiness flag
-                ready_flag = getattr(tmp, "_ready", None)
-                if ready_flag:
-                    self.local_llm = tmp
-                    print("✅ Local model appears ready after retry.")
-                    return True
+            # If ChatAPI exposes a way to init local directly, prefer that.
+            if hasattr(self.chat, "init_local_llm"):
+                try:
+                    ok = self.chat.init_local_llm(
+                        local_model=self.local_model, device=self.local_device
+                    )
+                    if ok:
+                        return True
+                except Exception as e:
+                    print("⚠️ chat.init_local_llm raised:", e, flush=True)
+
+            # Try to construct a fresh LocalLLM and replace chat.local_llm if ready
+            tmp = None
+            try:
+                tmp = LocalLLM(local_model=self.local_model, device=self.local_device)
+            except Exception as e:
+                # Some LocalLLM constructors may do auto-repair and then raise; log and continue
+                print(
+                    "⚠️ LocalLLM constructor raised during repair attempt:",
+                    e,
+                    flush=True,
+                )
+
+            if tmp:
+                # check readiness
+                try:
+                    if hasattr(tmp, "is_ready") and tmp.is_ready():
+                        self.chat.local_llm = tmp
+                        print(
+                            "✅ LocalLLM initialized successfully on retry.", flush=True
+                        )
+                        return True
+                    elif getattr(tmp, "_ready", False):
+                        self.chat.local_llm = tmp
+                        print("✅ LocalLLM appears ready after retry.", flush=True)
+                        return True
+                except Exception as e:
+                    print("⚠️ error checking tmp.is_ready():", e, flush=True)
+
+            # No successful init
+            print(
+                "⚠️ Local repair + retry did not produce a ready local LLM.", flush=True
+            )
+            return False
+
         except Exception as e:
-            print("⚠️ Local repair + retry failed:", e)
-        # leave self.local_llm as None if not ready
-        return False
+            print("⚠️ Unexpected error during local repair + retry:", e, flush=True)
+            return False
 
     def generate_script(
         self,
