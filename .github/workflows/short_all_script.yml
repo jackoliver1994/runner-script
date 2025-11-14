@@ -17,26 +17,46 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Prepare big temp/cache dirs on /mnt
-        run: |
-          sudo mkdir -p /mnt/ci_tmp /mnt/pip_cache /mnt/npm_cache
-          sudo chown $USER:$USER /mnt/ci_tmp /mnt/pip_cache /mnt/npm_cache
-          echo "TMPDIR=/mnt/ci_tmp" >> $GITHUB_ENV
-          echo "PIP_CACHE_DIR=/mnt/pip_cache" >> $GITHUB_ENV
-          echo "NPM_CONFIG_CACHE=/mnt/npm_cache" >> $GITHUB_ENV
-          # show space after creating dirs
-          df -h
-
-      - name: Set TMPDIR for the job
-        run: |
-          export TMPDIR=/mnt/ci_tmp
-          echo "TMPDIR=$TMPDIR"
-        shell: bash
-
       - uses: actions/setup-node@v4
         with:
           node-version: 18
           cache: 'npm'
+
+      - name: Show disk & inode (start)
+        run: |
+          echo "=== start disk ==="
+          df -h
+          df -i
+          du -sh /* 2>/dev/null | sort -h | tail -n 30
+
+      - name: Prepare big temp/cache dirs on /mnt
+        run: |
+          sudo mkdir -p /mnt/ci_tmp /mnt/pip_cache /mnt/npm_cache /mnt/playwright_browsers
+          sudo chown $USER:$USER /mnt/ci_tmp /mnt/pip_cache /mnt/npm_cache /mnt/playwright_browsers
+          # persist envs for the rest of the job
+          echo "TMPDIR=/mnt/ci_tmp" >> $GITHUB_ENV
+          echo "PIP_CACHE_DIR=/mnt/pip_cache" >> $GITHUB_ENV
+          echo "NPM_CONFIG_CACHE=/mnt/npm_cache" >> $GITHUB_ENV
+          echo "PLAYWRIGHT_BROWSERS_PATH=/mnt/playwright_browsers" >> $GITHUB_ENV
+          # show space after creating dirs
+          df -h
+
+      - name: Show TMPDIR / caches (verify)
+        run: |
+          echo "TMPDIR=$TMPDIR"
+          echo "PIP_CACHE_DIR=$PIP_CACHE_DIR"
+          echo "NPM_CONFIG_CACHE=$NPM_CONFIG_CACHE"
+          echo "PLAYWRIGHT_BROWSERS_PATH=$PLAYWRIGHT_BROWSERS_PATH"
+        shell: bash
+
+      - name: Safe cleanup (free apt lists & optional hosted toolcache)
+        run: |
+          sudo apt-get clean || true
+          sudo rm -rf /var/lib/apt/lists/* || true
+          # remove hosted toolcache to free a few GB if your job doesn't need preinstalled tool versions
+          # keep this if you are NOT relying on preinstalled tool versions later in the job
+          sudo rm -rf /opt/hostedtoolcache/* || true
+          echo "After cleanup:" && df -h
 
       - name: Install node deps (use /mnt cache)
         run: npm ci --prefer-offline --no-audit --no-fund --cache /mnt/npm_cache
@@ -44,10 +64,26 @@ jobs:
       - name: Install Python deps (no pip cache, use /mnt tmp)
         run: |
           python -m pip install --upgrade pip setuptools wheel
+          # ensure pip uses provided TMPDIR and PIP_CACHE_DIR
           TMPDIR=/mnt/ci_tmp PIP_CACHE_DIR=/mnt/pip_cache pip install --no-cache-dir -r requirements.txt
 
-      - name: Install Playwright browsers
-        run: playwright install --with-deps
+      - name: Show disk after installs
+        run: |
+          echo "=== after installs ==="
+          df -h
+          du -sh $RUNNER_TEMP $RUNNER_WORKSPACE /mnt/* 2>/dev/null || true
+
+      - name: Install Playwright browsers (uses PLAYWRIGHT_BROWSERS_PATH on /mnt)
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ env.PLAYWRIGHT_BROWSERS_PATH }}
+        run: |
+          # playwright will download browsers to PLAYWRIGHT_BROWSERS_PATH instead of default locations
+          playwright install --with-deps
+          echo "Playwright browsers installed to: $PLAYWRIGHT_BROWSERS_PATH"
+        shell: bash
+
+      - name: Show disk after Playwright
+        run: df -h
 
       - name: Run your script (llm)
         env:
@@ -103,3 +139,18 @@ jobs:
         run: |
           cd Script_Drive1
           python all_scripts.py
+
+      - name: Show disk (end)
+        if: always()
+        run: |
+          echo "=== end disk ==="
+          df -h
+          du -sh /mnt/* 2>/dev/null || true
+          du -sh $RUNNER_TEMP $RUNNER_WORKSPACE || true
+
+      - name: Prune docker & builder (optional - frees space if docker used)
+        if: always()
+        run: |
+          docker system prune -af || true
+          docker builder prune -af || true
+          df -h
