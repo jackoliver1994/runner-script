@@ -572,31 +572,78 @@ class ChatAPI:
         if self.local_model and not self.require_remote:
             try:
                 print(
-                    f"🔎 Attempting to initialize local model '{self.local_model}' on device='{self.local_device}'..."
+                    f"🔎 Attempting to initialize local model '{self.local_model}' on device='{self.local_device}'."
                 )
-                self.local_llm = LocalLLM(
-                    local_model="/mnt/models/mistral-small-3.1.gguf",
-                    device="cpu",
-                    preferred_backends=["llama_cpp", "transformers"],
-                    require_local=True,
-                    hf_token=None,
-                    max_new_tokens=256,
+                # If the user provided a *path* to a binary model file (gguf/ggml/bin/pt/etc.)
+                # but the file is missing, fail clearly (or fall back to remote if not require_local).
+                BINARY_EXTS = {
+                    ".gguf",
+                    ".bin",
+                    ".safetensors",
+                    ".pt",
+                    ".ckpt",
+                    ".pth",
+                    ".ggml",
+                }
+                is_local_file = isinstance(self.local_model, str) and os.path.isfile(
+                    self.local_model
                 )
-                if not self.local_llm.is_ready():
+                file_ext = (
+                    os.path.splitext(self.local_model)[1].lower()
+                    if isinstance(self.local_model, str)
+                    else ""
+                )
+
+                if file_ext in BINARY_EXTS and not is_local_file:
+                    msg = f"Local model file not found on disk: {self.local_model!r}"
                     if self.require_local:
-                        raise RuntimeError(
-                            "Local model specified but failed to initialize and 'require_local' is set."
-                        )
+                        raise RuntimeError(msg)
                     else:
-                        print(
-                            "⚠️ Local model specified but failed to initialize. Will fall back to remote API."
-                        )
+                        print(f"⚠️ {msg} — falling back to remote API.")
                         self.local_llm = None
-                        if not self.local_llm:
-                            self._attempt_local_repair_and_retry()
+                else:
+                    # Respect flags passed into ChatAPI (do not hardcode path or require_local)
+                    # prefer local_backend if provided; otherwise try common backends order inside LocalLLM
+                    preferred = ["llama_cpp", "transformers"]
+                    if getattr(self, "local_backend", None):
+                        # put explicit backend first so user-requested backend is tried first
+                        preferred = [self.local_backend] + [
+                            b for b in preferred if b != self.local_backend
+                        ]
+
+                    self.local_llm = LocalLLM(
+                        local_model=self.local_model,
+                        device=self.local_device or "cpu",
+                        backend=getattr(self, "local_backend", None),
+                        preferred_backends=preferred,
+                        hf_token=getattr(self, "hf_token", None),
+                        max_new_tokens=256,
+                        require_local=bool(self.require_local),
+                        auto_try_others=not bool(self.require_local),
+                    )
+
+                    # If LocalLLM didn't initialize successfully and caller insisted on local-only -> raise
+                    if not getattr(self.local_llm, "is_ready", lambda: False)():
+                        if self.require_local:
+                            raise RuntimeError(
+                                "Local model specified but failed to initialize and 'require_local' is set."
+                            )
+                        else:
+                            print(
+                                "⚠️ Local model specified but failed to initialize. Will fall back to remote API."
+                            )
+                            # allow one repair attempt if available
+                            self.local_llm = None
+                            try:
+                                self._attempt_local_repair_and_retry()
+                            except Exception:
+                                # ignore: repair attempts may fail; we'll fallback to remote
+                                pass
+
             except Exception as e:
                 print("⚠️ Error initializing LocalLLM:", e)
                 if self.require_local:
+                    # re-raise to preserve strict behavior when require_local is requested
                     raise
                 self.local_llm = None
 
