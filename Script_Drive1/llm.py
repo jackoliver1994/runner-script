@@ -2915,7 +2915,7 @@ if __name__ == "__main__":
     start = time.time()
 
     pipeline = StoryPipeline(
-        local_model="/home/user/models/mistral-small-3.1",
+        local_model="mistralai/Mixtral-8x7B-v0.1",
         local_device="cpu",
         require_local=True,
         allow_fallback=False,
