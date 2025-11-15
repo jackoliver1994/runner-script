@@ -1173,6 +1173,97 @@ class StoryPipeline:
             f"StoryPipeline initialized ({mode}). api_url={self.api_url!r}, local_model={self.local_model!r}, allow_fallback={self.allow_fallback}"
         )
 
+    def _resp_to_text(self, resp) -> str:
+        """
+        Normalize various possible response shapes into a string safe for regex/parsing.
+        Handles: str, bytes, dict (OpenAI-like, nested 'message' structures, 'choices'),
+        lists of parts, and falls back to json.dumps or str().
+        """
+        try:
+            if resp is None:
+                return ""
+            # bytes -> decode
+            if isinstance(resp, (bytes, bytearray)):
+                try:
+                    return resp.decode("utf-8")
+                except Exception:
+                    return resp.decode("latin-1", errors="ignore")
+            # already a string
+            if isinstance(resp, str):
+                return resp
+
+            # dict-like: common keys first
+            if isinstance(resp, dict):
+                for k in ("response", "message", "text", "content", "result"):
+                    if k in resp and isinstance(resp[k], str):
+                        return resp[k]
+                # nested message.content style
+                if "message" in resp and isinstance(resp["message"], dict):
+                    inner = resp["message"]
+                    for k in ("content", "text"):
+                        if k in inner and isinstance(inner[k], str):
+                            return inner[k]
+                # OpenAI-like: choices -> first -> text / message/content
+                if (
+                    "choices" in resp
+                    and isinstance(resp["choices"], list)
+                    and resp["choices"]
+                ):
+                    first = resp["choices"][0]
+                    if isinstance(first, dict):
+                        for k in ("text", "message", "content"):
+                            if k in first and isinstance(first[k], str):
+                                return first[k]
+                        if "message" in first and isinstance(first["message"], dict):
+                            m = first["message"]
+                            if "content" in m:
+                                c = m["content"]
+                                if isinstance(c, str):
+                                    return c
+                                if isinstance(c, list):
+                                    parts = []
+                                    for item in c:
+                                        if isinstance(item, dict):
+                                            for kk in ("text", "content"):
+                                                if kk in item and isinstance(
+                                                    item[kk], str
+                                                ):
+                                                    parts.append(item[kk])
+                                        elif isinstance(item, str):
+                                            parts.append(item)
+                                    if parts:
+                                        return " ".join(parts)
+
+            # list-like: join string parts
+            if isinstance(resp, (list, tuple)):
+                parts = []
+                for item in resp:
+                    if isinstance(item, str):
+                        parts.append(item)
+                    elif isinstance(item, dict):
+                        # try same heuristics recursively for small nested dict
+                        s = self._resp_to_text(item)
+                        if s:
+                            parts.append(s)
+                    elif isinstance(item, (bytes, bytearray)):
+                        try:
+                            parts.append(item.decode("utf-8"))
+                        except Exception:
+                            parts.append(str(item))
+                if parts:
+                    return " ".join(parts)
+
+            # fallback: json.dumps if possible, else str()
+            try:
+                return json.dumps(resp, ensure_ascii=False)
+            except Exception:
+                return str(resp)
+        except Exception:
+            try:
+                return str(resp)
+            except Exception:
+                return ""
+
     def _build_script_prompt(
         self,
         niche: str,
@@ -1342,74 +1433,6 @@ class StoryPipeline:
 
         # Helper regex and utilities
         single_block_re = re.compile(r"^\s*\[[\s\S]*\]\s*$", flags=re.DOTALL)
-
-        def _resp_to_text(resp) -> str:
-            """
-            Normalize a response that may be a dict (parsed JSON) or a str into a text string.
-            Heuristics: prefer common keys ('response','message','text','content'), handle OpenAI-like 'choices',
-            otherwise json.dumps(resp) as a fallback.
-            """
-            try:
-                # If already a string-like, return as-is
-                if isinstance(resp, (str, bytes)):
-                    return resp.decode("utf-8") if isinstance(resp, bytes) else resp
-
-                # dict-like: try common keys
-                if isinstance(resp, dict):
-                    for k in ("response", "message", "text", "content", "result"):
-                        if k in resp and isinstance(resp[k], str):
-                            return resp[k]
-                    # nested message structures
-                    if "message" in resp and isinstance(resp["message"], dict):
-                        inner = resp["message"]
-                        for k in ("content", "text"):
-                            if k in inner and isinstance(inner[k], str):
-                                return inner[k]
-                    # OpenAI-like choices
-                    if (
-                        "choices" in resp
-                        and isinstance(resp["choices"], list)
-                        and resp["choices"]
-                    ):
-                        first = resp["choices"][0]
-                        if isinstance(first, dict):
-                            for k in ("text", "message", "content"):
-                                if k in first and isinstance(first[k], str):
-                                    return first[k]
-                            # nested message.content may be dict/list
-                            if "message" in first and isinstance(
-                                first["message"], dict
-                            ):
-                                m = first["message"]
-                                if "content" in m:
-                                    c = m["content"]
-                                    if isinstance(c, str):
-                                        return c
-                                    if isinstance(c, list):
-                                        # sometimes message.content is a list of dicts
-                                        parts = []
-                                        for item in c:
-                                            if isinstance(item, dict):
-                                                # pick 'text' or 'content' if present
-                                                for kk in ("text", "content"):
-                                                    if kk in item and isinstance(
-                                                        item[kk], str
-                                                    ):
-                                                        parts.append(item[kk])
-                                            elif isinstance(item, str):
-                                                parts.append(item)
-                                        if parts:
-                                            return " ".join(parts)
-                # fallback: try stringify
-                try:
-                    return json.dumps(resp, ensure_ascii=False)
-                except Exception:
-                    return str(resp)
-            except Exception:
-                try:
-                    return str(resp)
-                except Exception:
-                    return ""
 
         def _word_count(text: str) -> int:
             return len(re.findall(r"\w+", text or ""))
@@ -1658,7 +1681,7 @@ class StoryPipeline:
                     time.sleep(0.2)
                     continue
 
-                resp_text = _resp_to_text(resp)
+                resp_text = self._resp_to_text(resp)
 
                 # In strict mode we insist the model returns a bracketed block; otherwise we accept best candidate
                 if strict:
@@ -1706,7 +1729,7 @@ class StoryPipeline:
                             print(f"⚠️ Condense send_message failed: {e}")
                             break
 
-                        cond_resp_text = _resp_to_text(cond_resp)
+                        cond_resp_text = self._resp_to_text(cond_resp)
                         if strict and not single_block_re.match(cond_resp_text):
                             print(
                                 "⚠️ Strict mode: condense response not bracketed — retrying condense."
@@ -1791,7 +1814,7 @@ class StoryPipeline:
                 time.sleep(0.2)
                 continue
 
-            cont_resp_text = _resp_to_text(cont_resp)
+            cont_resp_text = self._resp_to_text(cont_resp)
             # In strict mode we accept only continuation text (model may return unbracketed continuation)
             cont_candidate = _extract_candidate(cont_resp_text)
             try:
@@ -1827,7 +1850,7 @@ class StoryPipeline:
                     time.sleep(0.2)
                     continue
 
-                gen_resp_text = _resp_to_text(gen_resp)
+                gen_resp_text = self._resp_to_text(gen_resp)
                 if strict and not single_block_re.match(gen_resp_text):
                     print("⚠️ Strict mode: append generation not bracketed — retrying.")
                     time.sleep(0.2)
@@ -2355,8 +2378,11 @@ class StoryPipeline:
                     time.sleep(1 + random.random())
                     continue
 
-                # extract candidate blocks
-                blocks = _extract_blocks(resp)
+                # normalize response safely
+                resp_text = self._resp_to_text(resp)
+
+                # extract candidate blocks (extractor expects a string)
+                blocks = _extract_blocks(resp_text)
 
                 if not blocks:
                     print(
@@ -2525,7 +2551,8 @@ class StoryPipeline:
                     time.sleep(1 + random.random())
                     para_cycle += 1
                     continue
-                blocks = _extract_blocks(resp)
+                resp_text = self._resp_to_text(resp)
+                blocks = _extract_blocks(resp_text)
                 added = 0
                 for blk in blocks:
                     if added >= need_now:
@@ -2673,7 +2700,8 @@ class StoryPipeline:
             timeout=timeout or self.chat.base_timeout,
             spinner_message="Generating narration...",
         )
-        narr_block = extract_largest_bracketed(resp)
+        resp_text = self._resp_to_text(resp)
+        narr_block = extract_largest_bracketed(resp_text)
         if narr_block:
             # remove label if present
             if narr_block.lower().startswith(bracket_label.lower()):
@@ -2731,8 +2759,9 @@ class StoryPipeline:
             timeout=timeout or self.chat.base_timeout,
             spinner_message="Generating YouTube metadata...",
         )
-        save_response("youtube_response", "youtube_metadata.txt", resp)
-        return resp
+        resp_text = self._resp_to_text(resp)
+        save_response("youtube_response", "youtube_metadata.txt", resp_text)
+        return resp_text
 
 
 # ---------------------- EXAMPLE USAGE ----------------------
