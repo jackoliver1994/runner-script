@@ -1065,6 +1065,7 @@ class StoryPipeline:
         local_model: str | None = None,
         local_device: str | None = None,
         local_backend: Optional[str] = None,
+        hf_token: Optional[str] = None,
         require_local: bool = False,
         require_remote: bool = False,
         allow_fallback: bool = False,
@@ -1092,6 +1093,7 @@ class StoryPipeline:
         self.local_model = local_model
         self.local_device = local_device
         self.local_backend = local_backend
+        self.hf_token = hf_token
 
         # flags
         self.require_local = bool(require_local)
@@ -1134,6 +1136,7 @@ class StoryPipeline:
                 local_device=self.local_device,
                 require_local=self.require_local,
                 local_backend=self.local_backend,
+                hf_token=self.hf_token,
                 require_remote=self.require_remote,
                 allow_fallback=self.allow_fallback,
             )
@@ -1166,18 +1169,21 @@ class StoryPipeline:
                         require_local=self.require_local,
                         auto_try_others=True,
                     )
-                    # If a readiness check is required, use is_ready() (ensure LocalLLM implements is_ready)
-                    if self.require_local and not self.local_llm.is_ready():
+                    # If require_local is True and local init didn't produce a ready LLM, raise
+                    if (
+                        self.require_local
+                        and not getattr(self.local_llm, "is_ready", lambda: False)()
+                    ):
                         raise RuntimeError(
                             "Local model specified but failed to initialize and 'require_local' is set."
                         )
                 except Exception as e:
-                    # preserve previous behavior: if require_local then re-raise, else fallback to remote
+                    # Preserve previous fallback behavior: if require_local -> re-raise; else log and keep local_llm=None
                     if self.require_local:
                         raise
                     else:
                         print(
-                            "⚠️ Local model initialization failed, falling back to remote API. Error:",
+                            "⚠️ Local model initialization failed — will fall back to remote API. Error:",
                             e,
                         )
                         self.local_llm = None
