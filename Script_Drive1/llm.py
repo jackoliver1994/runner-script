@@ -1198,7 +1198,12 @@ class StoryPipeline:
         # This avoids hard failures when a given model id is not available locally or on HF
         # (e.g. shorthand names like "mistral-small-3.1" that may be private or require token).
         # If callers want strict local-only behavior, they can pass require_local=True explicitly.
-        if self.local_model and not self.allow_fallback and not self.require_remote:
+        if (
+            self.local_model
+            and not self.allow_fallback
+            and not self.require_remote
+            and not self.require_local
+        ):
             # prefer safe fallback behavior by default
             self.allow_fallback = True
             self.require_local = False
