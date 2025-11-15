@@ -25,3 +25,5 @@ safetensors
 torch
 sentencepiece
 bitsandbytes
+huggingface_hub
+llama-cpp-python

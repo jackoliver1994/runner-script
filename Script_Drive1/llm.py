@@ -26,7 +26,7 @@ import difflib
 import subprocess
 import importlib
 from types import SimpleNamespace
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Any, Callable,
 from threading import Thread, Event
 from datetime import datetime
 
@@ -79,314 +79,379 @@ except Exception:
 
 
 class LocalLLM:
+    """
+    Generic LocalLLM adapter supporting multiple local backends:
+      - "llama_cpp" (llama-cpp-python, for ggml/.bin/.gguf)
+      - "vllm" (if installed and model available)
+      - "transformers" (HF transformers pipeline)
+      - "tgi" (text-generation-inference HTTP endpoint)
+      - "webui" (text-generation-webui HTTP endpoint)
+      - "subprocess" (generic CLI binary: llama.cpp, ggml runner, or any CLI that accepts prompt and returns text)
+    Behavior:
+      - If backend is specified, it will try only that backend (unless 'auto_try_others' True).
+      - If backend is None, it will auto-detect & try backends in order: llama_cpp -> vllm -> transformers -> tgi/http -> webui -> subprocess.
+      - If require_local=True, initialization failing will raise RuntimeError (no fallback).
+    Usage:
+      llm = LocalLLM(local_model="path-or-hf-id-or-gguf-file", device="cpu", backend=None, require_local=True, hf_token=os.getenv("HF_TOKEN"))
+      llm.is_ready(); llm.generate("Hello", max_new_tokens=128)
+    """
+
+    # default backend preference order if backend not explicitly provided
+    DEFAULT_BACKEND_ORDER = ["llama_cpp", "vllm", "transformers", "tgi_http", "webui_http", "subprocess"]
+
     def __init__(
         self,
         local_model: Optional[str] = None,
         device: Optional[str] = None,
-        max_new_tokens: int = 1024,
+        backend: Optional[str] = None,
+        preferred_backends: Optional[List[str]] = None,
+        hf_token: Optional[str] = None,
+        max_new_tokens: int = 512,
+        require_local: bool = False,
+        auto_try_others: bool = True,
+        cli_cmd_template: Optional[str] = None,  # for subprocess backend, e.g. "llama --model {model} --prompt '{prompt}'"
     ):
         self.local_model = local_model
-        self.device = device
+        self.device = device or os.environ.get("LOCAL_LLM_DEVICE", None)
+        self.backend = backend
+        self.preferred_backends = preferred_backends or []
+        self.hf_token = hf_token or os.environ.get("HF_TOKEN", None)
         self.max_new_tokens = max_new_tokens
-        self.generator = None
-        self._ready = False
-        if self.local_model:
-            self._attempt_init_with_repair()
+        self.require_local = require_local
+        self.auto_try_others = auto_try_others
+        self.cli_cmd_template = cli_cmd_template
+        self._backend_name: Optional[str] = None
+        self._generator: Optional[Callable[..., str]] = None
+        self._meta = {}
+        if local_model:
+            self._init_dynamic()
 
-    def _pip_install(self, package: str):
-        """
-        Robust pip installer used during runtime repair. Shows logs and tries a CPU torch wheel fallback.
-        NOTE: Installing large packages (torch) can be slow in CI and may fail on restricted runners.
-        """
-        import shlex
+    # ------- public helpers -------
+    def is_ready(self) -> bool:
+        return self._generator is not None
 
+    def info(self) -> dict:
+        return {"backend": self._backend_name, "model": self.local_model, **self._meta}
+
+    def generate(self, prompt: str, max_new_tokens: Optional[int] = None, timeout: Optional[int] = None, **kwargs) -> str:
+        """
+        Generate text synchronously; returns string. kwargs forwarded to backend-specific generator where supported.
+        """
+        if not self.is_ready():
+            raise RuntimeError("LocalLLM not ready. Backend init failed or model not found.")
         try:
-            print(f"📦 pip installing {package} ...", flush=True)
-            # split to handle things like "package==x.y" or "pkg[extra]"
-            cmd = [
-                sys.executable,
-                "-m",
-                "pip",
-                "install",
-                "--upgrade",
-                "--force-reinstall",
-            ] + shlex.split(package)
-            subprocess.check_call(cmd)
-            print(f"✅ Installed {package}", flush=True)
-        except Exception as e:
-            print(f"⚠️ pip install {package} failed: {e}", flush=True)
-            # Special-case: torch - try CPU wheel if device='cpu' and default install failed
-            if (
-                "torch" in package
-                and getattr(self, "device", None)
-                and self.device.lower() == "cpu"
-            ):
+            mnt = max_new_tokens or self.max_new_tokens
+            # call backend generator; each backend wrapper accepts prompt and max_new_tokens (try to be consistent)
+            out = self._generator(prompt, max_new_tokens=mnt, timeout=timeout or 300, **kwargs)
+            if isinstance(out, dict):
+                # try to extract usual fields
+                for k in ("generated_text", "text", "response", "result"):
+                    if k in out and isinstance(out[k], str):
+                        return out[k]
+                # openai-like choices
+                if "choices" in out and out["choices"]:
+                    first = out["choices"][0]
+                    if isinstance(first, dict):
+                        for k in ("text", "message", "content"):
+                            if k in first and isinstance(first[k], str):
+                                return first[k]
+                # fallback to json
+                return json.dumps(out, ensure_ascii=False)
+            if isinstance(out, (bytes, bytearray)):
                 try:
-                    print(
-                        "🔁 Attempting CPU-only torch wheel via PyTorch index (best-effort)...",
-                        flush=True,
-                    )
-                    fallback_cmd = [
-                        sys.executable,
-                        "-m",
-                        "pip",
-                        "install",
-                        "--upgrade",
-                        "--force-reinstall",
-                        "torch",
-                        "--index-url",
-                        "https://download.pytorch.org/whl/cpu",
-                    ]
-                    subprocess.check_call(fallback_cmd)
-                    print(
-                        "✅ Installed torch (cpu wheel) via PyTorch index.", flush=True
-                    )
-                except Exception as e2:
-                    print("⚠️ CPU torch fallback failed:", e2, flush=True)
-
-    def _try_imports(self):
-        """
-        Try to import needed libraries; return tuple(transformers_available, numpy_ok, error_message)
-        """
-        try:
-            import transformers  # type: ignore
-
-            transformers_ok = True
-            transformers_err = None
+                    return out.decode("utf-8")
+                except Exception:
+                    return out.decode("latin-1", errors="ignore")
+            return str(out)
         except Exception as e:
-            transformers_ok = False
-            transformers_err = str(e)
-        # Check numpy import separately to detect ABI issues
-        try:
-            import numpy as np  # type: ignore
+            # surface backend error clearly
+            raise RuntimeError(f"LocalLLM generation failed (backend={self._backend_name}): {e}")
 
-            numpy_ok = True
-            numpy_err = None
-        except Exception as e:
-            numpy_ok = False
-            numpy_err = str(e)
-        # prefer reporting transformer import error if present, else numpy err
-        return transformers_ok, numpy_ok, transformers_err or numpy_err
-
-    def _repair_numpy_if_needed(self, err_msg: str) -> bool:
+    # ------- initialization and backend probing -------
+    def _init_dynamic(self):
         """
-        If the error message suggests a numpy ABI mismatch, attempt a safe reinstall/repair.
-        Returns True if an attempt was made (even if it fails), False if not attempted.
-        Controlled by ENV var LOCAL_LLM_AUTO_FIX (set to '0' to skip auto-fix).
+        Try to initialize a backend based on explicit backend, preferred list, or autodetect.
         """
-        import os
+        # build try order
+        order: List[str] = []
+        if self.backend:
+            order.append(self.backend)
+        order += self.preferred_backends
+        # add default ones skipping duplicates
+        for b in self.DEFAULT_BACKEND_ORDER:
+            if b not in order:
+                order.append(b)
 
-        auto_fix = os.environ.get("LOCAL_LLM_AUTO_FIX", "1") != "0"
-        if not auto_fix:
-            print("ℹ️ LOCAL_LLM_AUTO_FIX=0 — skipping auto-repair of numpy.")
-            return False
-
-        # Detect typical ABI message
-        if (
-            "numpy.dtype size changed" in (err_msg or "")
-            or "binary incompatibility" in (err_msg or "").lower()
-        ):
-            print(
-                "⚠️ Detected numpy binary-compatibility error. Attempting to reinstall numpy (best-effort)."
-            )
-            # Try a safe reinstall: upgrade and force-reinstall numpy to get matching wheel
+        errors = {}
+        for b in order:
             try:
-                target = "numpy"
-                self._pip_install(f"{target} --upgrade --force-reinstall")
-                return True
+                ok = getattr(self, f"_try_init_{b}")()
+                if ok:
+                    self._backend_name = b
+                    print(f"✅ LocalLLM: initialized backend '{b}' for model='{self.local_model}'")
+                    return
             except Exception as e:
-                print("⚠️ numpy reinstall attempt failed:", e, flush=True)
-                return True
+                errors[b] = str(e)
+                print(f"⚠️ LocalLLM: backend '{b}' failed: {e}")
+                # continue trying next if allowed
+                continue
+
+        # none succeeded
+        msg = f"LocalLLM: failed to initialize any backend for model='{self.local_model}'. Tried: {order}. Errors: {errors}"
+        if self.require_local:
+            raise RuntimeError(msg)
+        else:
+            print("⚠️ " + msg)
+            # leave _generator None -> caller can fallback to remote API
+
+    # ---------- backend implementations ----------
+    def _try_init_llama_cpp(self) -> bool:
+        """Try llama-cpp-python: pip package 'llama_cpp' and model is local-file (.bin/.gguf/.bin.*) or folder."""
+        try:
+            mod = importlib.import_module("llama_cpp")
+        except Exception:
+            return False
+        # ensure model path exists (llama-cpp expects a file path)
+        if not self.local_model:
+            return False
+        if os.path.isfile(self.local_model) or os.path.isdir(self.local_model):
+            # init
+            from llama_cpp import Llama  # type: ignore
+
+            def gen(prompt, max_new_tokens=512, timeout=300, **kw):
+                llm = Llama(model_path=self.local_model, n_ctx=kw.get("n_ctx", 2048))
+                # create returns dict with 'choices' list & 'text' field (older/newer variants)
+                r = llm.create(prompt=prompt, max_tokens=max_new_tokens)
+                if isinstance(r, dict):
+                    # try several common locations
+                    if "choices" in r and r["choices"]:
+                        c = r["choices"][0]
+                        return c.get("text") or c.get("message") or r
+                    if "text" in r:
+                        return r["text"]
+                return str(r)
+            self._generator = gen
+            self._meta["notes"] = "llama_cpp (llama_cpp.Llama) using model_path"
+            return True
         return False
 
-    def _ensure_transformers_and_deps(self):
-        """
-        Ensure transformers and a compatible backend are installed.
-        Best-effort: pin huggingface-hub and transformers to compatible versions,
-        install torch explicitly (attempt CPU wheel if device=='cpu'), and common extras.
-        """
+    def _try_init_vllm(self) -> bool:
+        """Try vLLM if installed: 'vllm' package."""
         try:
-            transformers_ok, numpy_ok, err = self._try_imports()
+            mod = importlib.import_module("vllm")
         except Exception:
-            transformers_ok, numpy_ok, err = (False, False, None)
+            return False
+        if not self.local_model:
+            return False
+        # vllm usage: model = vllm.Model.from_pretrained(model_name_or_path)
+        from vllm import Model  # type: ignore
 
-        # If transformers not installed or import failed -> attempt to install compatible set
-        if not transformers_ok:
-            # First try a conservative, known-compatible set
-            try:
-                # pin huggingface-hub to eliminate split_torch_state_dict mismatch
-                self._pip_install("huggingface-hub>=0.18.4")
-                # install transformers with torch extras (this may pull a torch)
-                self._pip_install("transformers[torch]>=4.35.2")
-                # install accelerate/safetensors/sentencepiece
-                self._pip_install("accelerate")
-                self._pip_install("safetensors")
-                self._pip_install("sentencepiece")
-            except Exception as e:
-                print(
-                    "⚠️ Best-effort install of transformers extras failed:",
-                    e,
-                    flush=True,
-                )
+        model = Model.from_pretrained(self.local_model)
+        def gen(prompt, max_new_tokens=512, timeout=300, **kw):
+            # create a generation request and read the first output text
+            gen_kwargs = dict(max_tokens=max_new_tokens)
+            outputs = model.generate(prompt, **gen_kwargs)
+            # vLLM yields a generator of responses, join tokens
+            final = []
+            for r in outputs:
+                final.append(r.text)
+                break
+            return "".join(final)
+        self._generator = gen
+        self._meta["notes"] = "vLLM Model.from_pretrained"
+        self._meta["vllm_model"] = getattr(model, "name", None)
+        return True
 
-        # Ensure torch is present; try explicit cpu wheel if device == 'cpu'
+    def _try_init_transformers(self) -> bool:
+        """Try transformers pipeline('text-generation'). Accepts HF id or local folder."""
         try:
-            import torch  # type: ignore
-
-            torch_ok = True
+            transformers_mod = importlib.import_module("transformers")
         except Exception:
-            torch_ok = False
+            return False
+        from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM  # type: ignore
 
-        if not torch_ok:
-            try:
-                if getattr(self, "device", None) and self.device.lower() == "cpu":
-                    # Try CPU-specific wheel index (best-effort)
-                    self._pip_install(
-                        "torch --index-url https://download.pytorch.org/whl/cpu"
-                    )
-                else:
-                    # generic torch install (let pip choose CUDA vs CPU if available)
-                    self._pip_install("torch")
-            except Exception as e:
-                print("⚠️ Attempt to install torch failed:", e, flush=True)
+        kwargs = {"trust_remote_code": True}
+        # device map selection
+        if self.device:
+            if str(self.device).lower() == "cpu":
+                kwargs["device_map"] = "cpu"
+            elif str(self.device).lower() == "cuda":
+                kwargs["device_map"] = "auto"
 
-        # re-check imports to update error info
-        transformers_ok, numpy_ok, err = self._try_imports()
+        # use HF token for private repos
+        if self.hf_token:
+            # older transformers uses use_auth_token, some accept token param
+            kwargs["use_auth_token"] = self.hf_token
 
-        # If transformers exists but we still see the 'split_torch_state_dict_into_shards' error,
-        # force reinstall to a known combination that usually resolves the import mismatch.
-        if err and "split_torch_state_dict_into_shards" in str(err):
-            print(
-                "⚠️ Detected huggingface_hub/transformers mismatch; attempting pinned reinstall.",
-                flush=True,
-            )
-            try:
-                self._pip_install("huggingface-hub==0.18.4")
-                self._pip_install("transformers==4.35.2")
-            except Exception as e:
-                print("⚠️ Pin reinstall attempt failed:", e, flush=True)
-
-        # final re-check
-        transformers_ok, numpy_ok, err = self._try_imports()
-        if not transformers_ok:
-            print(
-                "⚠️ transformers still not importable after attempts. Local LLM will remain unavailable.",
-                flush=True,
-            )
-
-    def _init_pipeline(self):
-        """
-        Initialize the HF pipeline. Wrap in try/except to surface meaningful errors.
-        Keeps 'trust_remote_code' semantics so remote repos with custom code can load.
-        """
         try:
-            from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM  # type: ignore
-
-            kwargs = {"trust_remote_code": True}
-            if self.device:
-                if self.device.lower() == "cpu":
-                    # force CPU map to avoid CUDA attempts
-                    kwargs["device_map"] = "cpu"
-                elif self.device.lower() == "cuda":
-                    kwargs["device_map"] = "auto"
-
-            print(
-                f"🔁 Loading local model '{self.local_model}' (this may download weights)...",
-                flush=True,
-            )
+            # primary attempt using pipeline
+            generator = pipeline("text-generation", model=self.local_model, **kwargs)
+            # wrap to consistent signature
+            def gen(prompt, max_new_tokens=512, timeout=300, **kw):
+                out = generator(prompt, max_new_tokens=max_new_tokens, return_text=True)
+                if isinstance(out, list) and out:
+                    # expected ['generated_text'] or {'generated_text'}
+                    first = out[0]
+                    if isinstance(first, dict) and "generated_text" in first:
+                        return first["generated_text"]
+                    if isinstance(first, str):
+                        return first
+                    return json.dumps(first, ensure_ascii=False)
+                return str(out)
+            self._generator = gen
+            self._meta["notes"] = "transformers.pipeline text-generation"
+            return True
+        except Exception as e:
+            # fallback to explicit tokenizer+model
             try:
-                # preferred call (may download weights)
-                self.generator = pipeline(
-                    "text-generation", model=self.local_model, **kwargs
-                )
-            except Exception as e_pipeline:
-                # fallback to explicit tokenizer + model loads to give more explicit errors
-                print("ℹ️ pipeline() fallback triggered:", e_pipeline, flush=True)
-                tokenizer = AutoTokenizer.from_pretrained(
-                    self.local_model, use_fast=True, trust_remote_code=True
-                )
-                model = AutoModelForCausalLM.from_pretrained(
-                    self.local_model, trust_remote_code=True
-                )
-
-                def gen_fn(prompt, max_new_tokens=self.max_new_tokens):
+                tokenizer = AutoTokenizer.from_pretrained(self.local_model, use_fast=True, trust_remote_code=True, use_auth_token=self.hf_token)
+                model = AutoModelForCausalLM.from_pretrained(self.local_model, trust_remote_code=True, use_auth_token=self.hf_token)
+                def gen2(prompt, max_new_tokens=512, timeout=300, **kw):
                     inputs = tokenizer(prompt, return_tensors="pt", truncation=True)
                     outputs = model.generate(**inputs, max_new_tokens=max_new_tokens)
                     return tokenizer.decode(outputs[0], skip_special_tokens=True)
+                self._generator = gen2
+                self._meta["notes"] = "transformers AutoModel fallback"
+                return True
+            except Exception:
+                raise
 
-                self.generator = SimpleNamespace(
-                    __call__=lambda prompt, **kw: [
-                        {
-                            "generated_text": gen_fn(
-                                prompt, kw.get("max_new_tokens", self.max_new_tokens)
-                            )
-                        }
-                    ]
-                )
+    def _try_init_tgi_http(self) -> bool:
+        """Try a text-generation-inference HTTP endpoint (TGI). Expect env or use 'local_model' as base URL if it looks like URL."""
+        import requests  # ensure available
 
-            self._ready = bool(self.generator is not None)
-            if self._ready:
-                print("✅ Local generator ready.", flush=True)
-            else:
-                print("⚠️ Local generator creation returned None.", flush=True)
-        except Exception as e:
-            # raise a clear runtime error so higher-level code can decide whether to fallback or abort
-            raise RuntimeError(f"Exception while initializing local pipeline: {e}")
-
-    def _attempt_init_with_repair(self):
-        """
-        Attempt to initialize the pipeline, and if a numpy ABI error occurs, try to repair and retry once.
-        """
-        # Try once, if fails due to numpy ABI, attempt repair and try again (one retry)
-        self._ensure_transformers_and_deps()
+        # detect base url
+        base = None
+        # if local_model is full URL -> treat as endpoint
+        if isinstance(self.local_model, str) and (self.local_model.startswith("http://") or self.local_model.startswith("https://")):
+            base = self.local_model.rstrip("/")
+        else:
+            # common local default port for tgi
+            base = os.environ.get("TGI_URL", None) or "http://127.0.0.1:8080"
+        # test endpoint /generate
         try:
-            self._init_pipeline()
-        except RuntimeError as e:
-            # Check message for numpy ABI and attempt repair once if found
-            err_text = str(e)
-            print(f"⚠️ {err_text}", flush=True)
-            attempted = self._repair_numpy_if_needed(err_text)
-            if attempted:
-                # reload python modules in a best-effort way
+            test = requests.post(f"{base}/generate", json={"prompt": "hi"}, timeout=3)
+            if test.status_code not in (200,201,202):
+                # could still be a different API; accept only 200-ish
+                return False
+            def gen(prompt, max_new_tokens=512, timeout=300, **kw):
+                payload = {"prompt": prompt, "max_new_tokens": max_new_tokens}
+                resp = requests.post(f"{base}/generate", json=payload, timeout=timeout or 300)
                 try:
-                    print("🔁 Re-importing environment after repair...", flush=True)
-                    importlib.invalidate_caches()
-                    # attempt to re-import critical libs
-                    importlib.reload(importlib.import_module("importlib"))
+                    j = resp.json()
                 except Exception:
-                    pass
-                # one retry
-                try:
-                    self._ensure_transformers_and_deps()
-                    self._init_pipeline()
-                except Exception as e2:
-                    print(f"⚠️ Retry after repair also failed: {e2}", flush=True)
-                    self._ready = False
-                    self.generator = None
-            else:
-                # no repair attempted or not applicable
-                self._ready = False
-                self.generator = None
+                    return resp.text
+                # try common slots
+                if isinstance(j, dict):
+                    if "results" in j and j["results"]:
+                        return j["results"][0].get("text", json.dumps(j, ensure_ascii=False))
+                    for k in ("generated_text","text","response","result"):
+                        if k in j:
+                            return j[k]
+                    if "choices" in j and j["choices"]:
+                        c = j["choices"][0]
+                        return c.get("text") or c.get("message") or json.dumps(c, ensure_ascii=False)
+                return json.dumps(j, ensure_ascii=False)
+            self._generator = gen
+            self._meta["notes"] = f"tgi_http at {base}"
+            return True
+        except Exception:
+            return False
 
-    def is_ready(self) -> bool:
-        return bool(self._ready and self.generator is not None)
+    def _try_init_webui_http(self) -> bool:
+        """Try text-generation-webui HTTP endpoints (gradio). Common base: http://127.0.0.1:7860"""
+        import requests
+        base = os.environ.get("WEBUI_URL", None) or "http://127.0.0.1:7860"
+        # try /api/prompt or /api/v1/generate
+        try_urls = [f"{base}/api/prompt", f"{base}/api/v1/generate", f"{base}/run/predict"]
+        for u in try_urls:
+            try:
+                r = requests.get(u, timeout=3)
+                if r.status_code < 400:
+                    # build a wrapper based on the endpoint patterns
+                    def gen(prompt, max_new_tokens=512, timeout=300, **kw):
+                        # attempt different POST payloads depending on endpoint
+                        if u.endswith("/api/prompt"):
+                            payload = {"prompt": prompt}
+                            r = requests.post(u, json=payload, timeout=timeout)
+                            try:
+                                j = r.json()
+                                # parse heuristics
+                                if isinstance(j, dict):
+                                    if "data" in j and j["data"]:
+                                        return str(j["data"])
+                                return r.text
+                            except Exception:
+                                return r.text
+                        if u.endswith("/api/v1/generate"):
+                            payload = {"prompt": prompt}
+                            r = requests.post(u, json=payload, timeout=timeout)
+                            try:
+                                j = r.json()
+                                if isinstance(j, dict) and "results" in j:
+                                    return j["results"][0].get("text", r.text)
+                                return r.text
+                            except Exception:
+                                return r.text
+                        # fallback: POST then return text
+                        r = requests.post(u, json={"data": [prompt]}, timeout=timeout)
+                        return r.text
+                    self._generator = gen
+                    self._meta["notes"] = f"webui_http at {u}"
+                    return True
+            except Exception:
+                continue
+        return False
 
-    def generate(
-        self, prompt: str, timeout: int = 300, max_new_tokens: Optional[int] = None
-    ) -> str:
-        if not self.is_ready():
-            raise RuntimeError("LocalLLM not ready.")
-        max_tokens = max_new_tokens or self.max_new_tokens
+    def _try_init_subprocess(self) -> bool:
+        """
+        Generic subprocess backend: uses a CLI tool that accepts a prompt and prints output.
+        Requires cli_cmd_template or environment LOCAL_LLM_CLI. Template must include {model} and {prompt}.
+        Example: LOCAL_LLM_CLI="llama -m {model} -p '{prompt}' -n {max_new_tokens}"
+        """
+        cmd_template = self.cli_cmd_template or os.environ.get("LOCAL_LLM_CLI", None)
+        if not cmd_template:
+            return False
+        # quick test run (with short prompt)
         try:
-            out = self.generator(prompt, max_new_tokens=max_tokens)
-            if isinstance(out, list) and out:
-                return out[0].get("generated_text", "")
-            elif isinstance(out, str):
-                return out
-            else:
-                return str(out)
-        except Exception as e:
-            raise RuntimeError(f"Local generation failed: {e}")
+            test_cmd = cmd_template.format(model=self.local_model, prompt="Hello", max_new_tokens=8)
+            p = subprocess.run(test_cmd, shell=True, capture_output=True, timeout=5)
+            if p.returncode != 0:
+                # still accept? no
+                return False
+            def gen(prompt, max_new_tokens=512, timeout=300, **kw):
+                cmd = cmd_template.format(model=self.local_model, prompt=prompt, max_new_tokens=max_new_tokens)
+                p = subprocess.run(cmd, shell=True, capture_output=True, timeout=timeout)
+                out = p.stdout.decode("utf-8", errors="ignore")
+                return out.strip()
+            self._generator = gen
+            self._meta["notes"] = f"subprocess cmd_template"
+            return True
+        except Exception:
+            return False
+
+    # optional: allow user to list which backends are available in env
+    @staticmethod
+    def list_available_backends() -> List[str]:
+        av = []
+        for name in LocalLLM.DEFAULT_BACKEND_ORDER:
+            try:
+                if name == "llama_cpp":
+                    importlib.import_module("llama_cpp")
+                    av.append("llama_cpp")
+                elif name == "vllm":
+                    importlib.import_module("vllm")
+                    av.append("vllm")
+                elif name == "transformers":
+                    importlib.import_module("transformers")
+                    av.append("transformers")
+                elif name in ("tgi_http", "webui_http"):
+                    # HTTP backends are assumed available if 'requests' is present
+                    importlib.import_module("requests")
+                    av.append(name)
+            except Exception:
+                continue
+        return av
 
 
 # Backwards-compatible ChatAPI wrapper (keeps remote retry/backoff/infinite loop)
@@ -397,10 +462,12 @@ class ChatAPI:
         default_timeout: int = 100,
         local_model: Optional[str] = None,
         local_device: Optional[str] = None,
+        local_backend: Optional[str] = None,      # <-- added
+        hf_token: Optional[str] = None,           # <-- added
         require_local: bool = False,
         require_remote: bool = False,
         allow_fallback: bool = False,
-    ):
+        ):
         """
         ChatAPI constructor.
         - local_model: name or path for a local HF-compatible model (e.g. "mistral-small-3.1")
@@ -442,7 +509,12 @@ class ChatAPI:
                     f"🔎 Attempting to initialize local model '{self.local_model}' on device='{self.local_device}'..."
                 )
                 self.local_llm = LocalLLM(
-                    local_model=self.local_model, device=self.local_device
+                    local_model="/mnt/models/mistral-small-3.1.gguf",
+                    device="cpu",
+                    preferred_backends=["llama_cpp","transformers"],
+                    require_local=True,
+                    hf_token=None,
+                    max_new_tokens=256,
                 )
                 if not self.local_llm.is_ready():
                     if self.require_local:
@@ -500,13 +572,17 @@ class ChatAPI:
         from requests.exceptions import ProxyError as ReqProxyError, RequestException
 
         if specific_error is None:
-            specific_error = [
+            specific_error: list = [
                 "response status: 403",
                 "detected cloudflare-like anti-bot page",
-                "cloudflare",
-                "access denied",
-                "anti-bot",
-                "enable javascript and cookies",
+                "Response status=403 length=9245",
+                "Detected HTML challenge",
+                "Cloudflare-like content",
+                "Response status=403",
+                "cloudflare", 
+                "detected cloudflare", 
+                "access denied", 
+                "anti-bot"
             ]
         specific_error = [s.lower() for s in specific_error]
 
@@ -2737,8 +2813,7 @@ class StoryPipeline:
             "   - Summarizes the video naturally using SEO-rich language.\n"
             "   - Includes time-stamped highlights if applicable.\n"
             "   - Encourages watch time, comments, likes, and subscriptions.\n"
-            "   - Includes relevant affiliate links or placeholders (e.g., '👇 Check this out: [link]').\n"
-            "   - Adds social links and CTAs to subscribe or follow.\n"
+            "   - CTAs to subscribe or follow.\n"
             "   - Ends with keyword-rich hashtags and key phrases.\n"
             "3. **TAGS (comma-separated)** — Generate 20–30 high-ranking SEO tags (mix of short-tail and long-tail keywords relevant to the video topic).\n"
             "4. **HASHTAGS** — Include 10–20 trending, niche-relevant hashtags formatted like #ExampleTag.\n"
@@ -2769,7 +2844,7 @@ if __name__ == "__main__":
     start = time.time()
 
     pipeline = StoryPipeline(
-        local_model="mistral-small-3.1",
+        local_model="/home/user/models/mistral-small-3.1",
         local_device="cpu",
         require_local=True,
         allow_fallback=False,
