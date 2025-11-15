@@ -2842,7 +2842,6 @@ if __name__ == "__main__":
         hf_token=None,
         require_local=True,
         allow_fallback=False,
-        preferred_backends=["llama_cpp"],
     )
     # --- Example 1: Only generate the story/script (BRACKETED single block file saved) ---
     script = pipeline.generate_script(
