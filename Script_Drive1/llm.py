@@ -135,6 +135,28 @@ class LocalLLM:
         if local_model:
             self._init_dynamic()
 
+    def is_ready(self) -> bool:
+        """
+        Unified readiness check used by ChatAPI / StoryPipeline.
+        Returns True when the adapter has an initialized generator/backend or an explicit ready flag.
+        This works across the different LocalLLM variants present in the file.
+        """
+        try:
+            # Common ready indicators used in different implementations:
+            if getattr(self, "_ready", False):
+                return True
+            if getattr(self, "_generator", None) is not None:
+                return True
+            if getattr(self, "generator", None) is not None:
+                return True
+            # fallback: if a backend name/meta exists, assume initialized
+            if getattr(self, "_backend_name", None):
+                return True
+            # otherwise not ready
+            return False
+        except Exception:
+            return False
+
     # ------- public helpers -------
     def _init_dynamic(self):
         """
@@ -2796,6 +2818,7 @@ if __name__ == "__main__":
     pipeline = StoryPipeline(
         local_model="/mnt/models/mistral-small-3.1.gguf",
         local_device="cpu",
+        local_backend="llama_cpp",
         require_local=True,
         allow_fallback=False,
     )
