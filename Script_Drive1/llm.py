@@ -136,128 +136,50 @@ class LocalLLM:
             self._init_dynamic()
 
     # ------- public helpers -------
-    def is_ready(self) -> bool:
-        return self._generator is not None
-
-    def info(self) -> dict:
-        return {"backend": self._backend_name, "model": self.local_model, **self._meta}
-
-    def generate(
-        self,
-        prompt: str,
-        max_new_tokens: Optional[int] = None,
-        timeout: Optional[int] = None,
-        **kwargs,
-    ) -> str:
-        """
-        Generate text synchronously; returns string. kwargs forwarded to backend-specific generator where supported.
-        """
-        if not self.is_ready():
-            raise RuntimeError(
-                "LocalLLM not ready. Backend init failed or model not found."
-            )
-        try:
-            mnt = max_new_tokens or self.max_new_tokens
-            # call backend generator; each backend wrapper accepts prompt and max_new_tokens (try to be consistent)
-            out = self._generator(
-                prompt, max_new_tokens=mnt, timeout=timeout or 300, **kwargs
-            )
-            if isinstance(out, dict):
-                # try to extract usual fields
-                for k in ("generated_text", "text", "response", "result"):
-                    if k in out and isinstance(out[k], str):
-                        return out[k]
-                # openai-like choices
-                if "choices" in out and out["choices"]:
-                    first = out["choices"][0]
-                    if isinstance(first, dict):
-                        for k in ("text", "message", "content"):
-                            if k in first and isinstance(first[k], str):
-                                return first[k]
-                # fallback to json
-                return json.dumps(out, ensure_ascii=False)
-            if isinstance(out, (bytes, bytearray)):
-                try:
-                    return out.decode("utf-8")
-                except Exception:
-                    return out.decode("latin-1", errors="ignore")
-            return str(out)
-        except Exception as e:
-            # surface backend error clearly
-            raise RuntimeError(
-                f"LocalLLM generation failed (backend={self._backend_name}): {e}"
-            )
-
-    # ------- initialization and backend probing -------
     def _init_dynamic(self):
         """
         Try to initialize a backend based on explicit backend, preferred list, or autodetect.
         """
-        # build try order
+        # detect if the local_model is a file and if its extension suggests a gguf/ggml/ckpt binary
+        is_local_file = isinstance(self.local_model, str) and os.path.isfile(
+            self.local_model
+        )
+        file_ext = (
+            os.path.splitext(self.local_model)[1].lower() if is_local_file else ""
+        )
+
+        # file extensions that are *not* suitable for transformers pipeline as a repo id
+        BINARY_EXTS = {".gguf", ".bin", ".safetensors", ".pt", ".ckpt", ".pth", ".ggml"}
+
+        # build try order (start from explicit backend & preferred_backends)
         order: List[str] = []
         if self.backend:
             order.append(self.backend)
         order += self.preferred_backends
-        # add default ones skipping duplicates
+
+        # Append defaults skipping duplicates
         for b in self.DEFAULT_BACKEND_ORDER:
             if b not in order:
                 order.append(b)
 
-        errors = {}
-        for b in order:
-            try:
-                ok = getattr(self, f"_try_init_{b}")()
-                if ok:
-                    self._backend_name = b
-                    print(
-                        f"✅ LocalLLM: initialized backend '{b}' for model='{self.local_model}'"
-                    )
-                    return
-            except Exception as e:
-                errors[b] = str(e)
-                print(f"⚠️ LocalLLM: backend '{b}' failed: {e}")
-                # continue trying next if allowed
-                continue
-
-        # none succeeded
-        msg = f"LocalLLM: failed to initialize any backend for model='{self.local_model}'. Tried: {order}. Errors: {errors}"
-        if self.require_local:
-            raise RuntimeError(msg)
-        else:
-            print("⚠️ " + msg)
-            # leave _generator None -> caller can fallback to remote API
-
-    # ---------- backend implementations ----------
-    def _try_init_llama_cpp(self) -> bool:
-        """Try llama-cpp-python: pip package 'llama_cpp' and model is local-file (.bin/.gguf/.bin.*) or folder."""
+        # If model is a binary file (gguf, ggml, safetensors, ckpt etc.), bias to llama_cpp/subprocess.
+        # Also ensure we don't let transformers attempt to treat the file path as an HF repo id.
         try:
-            mod = importlib.import_module("llama_cpp")
+            if is_local_file and file_ext in BINARY_EXTS:
+                # move or insert llama_cpp to front
+                if "llama_cpp" in order:
+                    order.remove("llama_cpp")
+                order.insert(0, "llama_cpp")
+                # put subprocess high (useful if llama_cpp package not installed)
+                if "subprocess" in order:
+                    order.remove("subprocess")
+                order.insert(1, "subprocess")
+                # push transformers later so it won't try to use a binary file as repo id
+                if "transformers" in order:
+                    order.remove("transformers")
+                    order.append("transformers")
         except Exception:
-            return False
-        # ensure model path exists (llama-cpp expects a file path)
-        if not self.local_model:
-            return False
-        if os.path.isfile(self.local_model) or os.path.isdir(self.local_model):
-            # init
-            from llama_cpp import Llama  # type: ignore
-
-            def gen(prompt, max_new_tokens=512, timeout=300, **kw):
-                llm = Llama(model_path=self.local_model, n_ctx=kw.get("n_ctx", 2048))
-                # create returns dict with 'choices' list & 'text' field (older/newer variants)
-                r = llm.create(prompt=prompt, max_tokens=max_new_tokens)
-                if isinstance(r, dict):
-                    # try several common locations
-                    if "choices" in r and r["choices"]:
-                        c = r["choices"][0]
-                        return c.get("text") or c.get("message") or r
-                    if "text" in r:
-                        return r["text"]
-                return str(r)
-
-            self._generator = gen
-            self._meta["notes"] = "llama_cpp (llama_cpp.Llama) using model_path"
-            return True
-        return False
+            pass
 
     def _try_init_vllm(self) -> bool:
         """Try vLLM if installed: 'vllm' package."""
@@ -296,64 +218,21 @@ class LocalLLM:
             return False
         from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM  # type: ignore
 
-        kwargs = {"trust_remote_code": True}
-        # device map selection
-        if self.device:
-            if str(self.device).lower() == "cpu":
-                kwargs["device_map"] = "cpu"
-            elif str(self.device).lower() == "cuda":
-                kwargs["device_map"] = "auto"
-
-        # use HF token for private repos
-        if self.hf_token:
-            # older transformers uses use_auth_token, some accept token param
-            kwargs["use_auth_token"] = self.hf_token
-
-        try:
-            # primary attempt using pipeline
-            generator = pipeline("text-generation", model=self.local_model, **kwargs)
-
-            # wrap to consistent signature
-            def gen(prompt, max_new_tokens=512, timeout=300, **kw):
-                out = generator(prompt, max_new_tokens=max_new_tokens, return_text=True)
-                if isinstance(out, list) and out:
-                    # expected ['generated_text'] or {'generated_text'}
-                    first = out[0]
-                    if isinstance(first, dict) and "generated_text" in first:
-                        return first["generated_text"]
-                    if isinstance(first, str):
-                        return first
-                    return json.dumps(first, ensure_ascii=False)
-                return str(out)
-
-            self._generator = gen
-            self._meta["notes"] = "transformers.pipeline text-generation"
-            return True
-        except Exception as e:
-            # fallback to explicit tokenizer+model
-            try:
-                tokenizer = AutoTokenizer.from_pretrained(
-                    self.local_model,
-                    use_fast=True,
-                    trust_remote_code=True,
-                    use_auth_token=self.hf_token,
-                )
-                model = AutoModelForCausalLM.from_pretrained(
-                    self.local_model,
-                    trust_remote_code=True,
-                    use_auth_token=self.hf_token,
-                )
-
-                def gen2(prompt, max_new_tokens=512, timeout=300, **kw):
-                    inputs = tokenizer(prompt, return_tensors="pt", truncation=True)
-                    outputs = model.generate(**inputs, max_new_tokens=max_new_tokens)
-                    return tokenizer.decode(outputs[0], skip_special_tokens=True)
-
-                self._generator = gen2
-                self._meta["notes"] = "transformers AutoModel fallback"
-                return True
-            except Exception:
-                raise
+        # If local_model points to a single binary file (gguf/ggml/.bin/.pt/.ckpt/.safetensors),
+        # transformers.pipeline() will treat it as a repo-id and fail. Skip transformers in that case.
+        if isinstance(self.local_model, str) and os.path.isfile(self.local_model):
+            ext = os.path.splitext(self.local_model)[1].lower()
+            if ext in {
+                ".gguf",
+                ".ggml",
+                ".bin",
+                ".pt",
+                ".ckpt",
+                ".pth",
+                ".safetensors",
+            }:
+                # Not a directory or HF repo id - transformers can't load this directly.
+                return False
 
     def _try_init_tgi_http(self) -> bool:
         """Try a text-generation-inference HTTP endpoint (TGI). Expect env or use 'local_model' as base URL if it looks like URL."""
@@ -2915,7 +2794,7 @@ if __name__ == "__main__":
     start = time.time()
 
     pipeline = StoryPipeline(
-        local_model="mistralai/Mixtral-8x7B-v0.1",
+        local_model="/mnt/models/mistral-small-3.1.gguf",
         local_device="cpu",
         require_local=True,
         allow_fallback=False,
