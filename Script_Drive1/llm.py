@@ -579,12 +579,11 @@ class ChatAPI:
                     self.local_model.startswith("/") or os.path.sep in self.local_model
                 )
                 file_exists = False
-                if is_path_like:
+                if is_path_like and self.local_model:
                     file_exists = os.path.isfile(self.local_model)
 
                 if is_path_like and not file_exists:
                     msg = f"Local model file not found on disk: {self.local_model!r}"
-                    # If user insisted on local-only, error out with a helpful message
                     if self.require_local:
                         raise RuntimeError(
                             msg
@@ -594,8 +593,7 @@ class ChatAPI:
                         print(f"⚠️ {msg} — will fall back to remote API.")
                         self.local_llm = None
                 else:
-                    # Proceed: try to construct LocalLLM using the requested model argument,
-                    # device and backend preference (do not hardcode a path).
+                    # construct LocalLLM respecting flags and backend choices
                     self.local_llm = LocalLLM(
                         local_model=self.local_model,
                         device=self.local_device or "cpu",
@@ -607,6 +605,7 @@ class ChatAPI:
                         auto_try_others=not bool(self.require_local),
                     )
 
+                    # If the chosen LocalLLM failed to initialize
                     if not getattr(self.local_llm, "is_ready", lambda: False)():
                         if self.require_local:
                             raise RuntimeError(
@@ -617,7 +616,7 @@ class ChatAPI:
                                 "⚠️ Local model specified but failed to initialize. Will fall back to remote API."
                             )
                             self.local_llm = None
-                            # attempt one repair/retry if helper exists
+                            # one repair/retry attempt (best-effort)
                             try:
                                 self._attempt_local_repair_and_retry()
                             except Exception:
@@ -2897,13 +2896,29 @@ class StoryPipeline:
 if __name__ == "__main__":
     start = time.time()
 
+    # Read runtime overrides from environment so CI/workflow controls them
+    env_model = os.environ.get("LOCAL_MODEL_PATH", "/mnt/models/mistral-small-3.1.gguf")
+    env_device = os.environ.get("LOCAL_DEVICE", "cpu")
+    env_backend = os.environ.get("LOCAL_BACKEND", "llama_cpp")
+    env_require_local = os.environ.get("REQUIRE_LOCAL", "false").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    env_allow_fallback = os.environ.get("ALLOW_FALLBACK", "true").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    env_hf_token = os.environ.get("HF_TOKEN", None)
+
     pipeline = StoryPipeline(
-        local_model="/mnt/models/mistral-small-3.1.gguf",
-        local_device="cpu",
-        local_backend="llama_cpp",
-        hf_token=None,
-        require_local=True,
-        allow_fallback=False,
+        local_model=env_model,
+        local_device=env_device,
+        local_backend=env_backend,
+        hf_token=env_hf_token,
+        require_local=env_require_local,
+        allow_fallback=env_allow_fallback,
     )
     # --- Example 1: Only generate the story/script (BRACKETED single block file saved) ---
     script = pipeline.generate_script(
