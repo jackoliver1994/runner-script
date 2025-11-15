@@ -1,12 +1,32 @@
-name: Run short all script
+name: Run short all script (safe local-llm support)
 
 on:
   workflow_dispatch:
     inputs:
       install_local_llm:
-        description: 'Set true to install torch/transformers and enable local LLM initialization (heavy).'
+        description: 'true => install heavy LLM deps (llama-cpp, torch/transformers).'
         required: false
         default: 'false'
+      download_model:
+        description: 'true => attempt to download model file from HF anonymously (if public).'
+        required: false
+        default: 'true'
+      use_model_artifact:
+        description: 'true => upload downloaded model as artifact for reuse.'
+        required: false
+        default: 'true'
+      require_local:
+        description: 'true => enforce local-only (script will raise if local model missing).'
+        required: false
+        default: 'false'
+      model_repo:
+        description: 'Hugging Face repo id (used to build anonymous URL).'
+        required: false
+        default: 'mistralai/Mistral-small-3.1'
+      model_filename:
+        description: 'Filename in the repo to download.'
+        required: false
+        default: 'mistral-small-3.1.gguf'
 
 jobs:
   run-script:
@@ -28,175 +48,103 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Show disk & inode (start)
+      - name: Show disk & prepare /mnt
         run: |
           echo "=== start disk ==="
           df -h
-          df -i
-          du -sh /* 2>/dev/null | sort -h | tail -n 30
-
-      - name: Prepare big tmp/cache dirs on /mnt and persist envs
-        run: |
-          sudo mkdir -p /mnt/ci_tmp /mnt/pip_cache /mnt/npm_cache /mnt/playwright_browsers
-          sudo chown $USER:$USER /mnt/ci_tmp /mnt/pip_cache /mnt/npm_cache /mnt/playwright_browsers
+          sudo mkdir -p /mnt/models /mnt/ci_tmp /mnt/pip_cache /mnt/npm_cache /mnt/playwright_browsers
+          sudo chown $USER:$USER /mnt/models /mnt/ci_tmp /mnt/pip_cache /mnt/npm_cache /mnt/playwright_browsers
           echo "TMPDIR=/mnt/ci_tmp" >> $GITHUB_ENV
           echo "PIP_CACHE_DIR=/mnt/pip_cache" >> $GITHUB_ENV
           echo "NPM_CONFIG_CACHE=/mnt/npm_cache" >> $GITHUB_ENV
           echo "PLAYWRIGHT_BROWSERS_PATH=/mnt/playwright_browsers" >> $GITHUB_ENV
           df -h
 
-      - id: find-pkg
-        name: Find package.json and lockfile (if any)
-        run: |
-          pkgpath=$(git ls-files | grep -E "(^|/)\bpackage.json$" | head -n1 || true)
-          if [ -z "$pkgpath" ]; then
-            echo "found=false" >> $GITHUB_OUTPUT
-            echo "pkg_dir=" >> $GITHUB_OUTPUT
-            echo "has_lock=false" >> $GITHUB_OUTPUT
-            echo "lock_path=" >> $GITHUB_OUTPUT
-            echo "No package.json found in repo."
-            exit 0
-          fi
-          pkgdir=$(dirname "$pkgpath")
-          if [ -z "$pkgdir" ] || [ "$pkgdir" = "." ]; then
-            pkgdir="."
-            lockbase="./"
-          else
-            lockbase="$pkgdir/"
-          fi
-          echo "found=true" >> $GITHUB_OUTPUT
-          echo "pkg_dir=$pkgdir" >> $GITHUB_OUTPUT
-          if [ -f "$lockbase""package-lock.json" ]; then
-            echo "has_lock=true" >> $GITHUB_OUTPUT
-            echo "lock_path=$lockbase""package-lock.json" >> $GITHUB_OUTPUT
-          elif [ -f "$lockbase""yarn.lock" ]; then
-            echo "has_lock=true" >> $GITHUB_OUTPUT
-            echo "lock_path=$lockbase""yarn.lock" >> $GITHUB_OUTPUT
-          elif [ -f "$lockbase""npm-shrinkwrap.json" ]; then
-            echo "has_lock=true" >> $GITHUB_OUTPUT
-            echo "lock_path=$lockbase""npm-shrinkwrap.json" >> $GITHUB_OUTPUT
-          else
-            echo "has_lock=false" >> $GITHUB_OUTPUT
-            echo "lock_path=" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Show found package.json info
-        run: |
-          echo "package.json found: ${{ steps.find-pkg.outputs.found }}"
-          echo "pkg_dir: '${{ steps.find-pkg.outputs.pkg_dir }}'"
-          echo "has_lock: '${{ steps.find-pkg.outputs.has_lock }}'"
-          echo "lock_path: '${{ steps.find-pkg.outputs.lock_path }}'"
-
-      - name: Show TMPDIR / caches (verify)
-        run: |
-          echo "TMPDIR=$TMPDIR"
-          echo "PIP_CACHE_DIR=$PIP_CACHE_DIR"
-          echo "NPM_CONFIG_CACHE=$NPM_CONFIG_CACHE"
-          echo "PLAYWRIGHT_BROWSERS_PATH=$PLAYWRIGHT_BROWSERS_PATH"
-        shell: bash
-
-      - name: Safe cleanup (free apt lists & optional hosted toolcache)
-        run: |
-          sudo apt-get clean || true
-          sudo rm -rf /var/lib/apt/lists/* || true
-          echo "After cleanup:" && df -h
-
-      # Node setup - only if package.json present
-      - name: Setup Node (with cache - lockfile detected)
-        if: steps.find-pkg.outputs.found == 'true' && steps.find-pkg.outputs.has_lock == 'true'
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: 'npm'
-          cache-dependency-path: ${{ steps.find-pkg.outputs.lock_path }}
-
-      - name: Setup Node (no lockfile)
-        if: steps.find-pkg.outputs.found == 'true' && steps.find-pkg.outputs.has_lock == 'false'
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-
-      - name: Install node deps (using npm ci, lockfile found)
-        if: steps.find-pkg.outputs.found == 'true' && steps.find-pkg.outputs.has_lock == 'true'
-        working-directory: ${{ steps.find-pkg.outputs.pkg_dir }}
-        run: npm ci --prefer-offline --no-audit --no-fund --cache /mnt/npm_cache
-
-      - name: Install node deps (using npm install, no lockfile)
-        if: steps.find-pkg.outputs.found == 'true' && steps.find-pkg.outputs.has_lock == 'false'
-        working-directory: ${{ steps.find-pkg.outputs.pkg_dir }}
-        run: npm install --prefer-offline --no-audit --no-fund --cache /mnt/npm_cache
-
-      - name: Show disk after installs
-        run: |
-          echo "=== after installs ==="
-          df -h
-          du -sh $RUNNER_TEMP $RUNNER_WORKSPACE /mnt/* 2>/dev/null || true
-
-      - name: Install Python dependencies (light, always)
+      - name: Install light Python deps (always)
         run: |
           python -m pip install --upgrade pip setuptools wheel
           if [ -f requirements.txt ]; then pip install --prefer-binary -r requirements.txt ; fi
-          # small runtime extras used by script's non-LLM features:
-          pip install --prefer-binary --no-deps requests cloudscraper imageio-ffmpeg pyppeteer || true
-
-      # Heavy local-LLM installs only if user asked (workflow_dispatch input)
-      - name: Install heavy local-LLM deps (torch/transformers) [optional]
-        if: ${{ github.event.inputs.install_local_llm == 'true' }}
-        run: |
-          python -m pip install --upgrade pip setuptools wheel
-          python -m pip install --prefer-binary "huggingface-hub>=0.18.4" "transformers[torch]>=4.35.2" accelerate safetensors sentencepiece || true
-          # CPU PyTorch (recommended on GH runners); change if you have GPU runners
-          python -m pip install --upgrade --force-reinstall --extra-index-url https://download.pytorch.org/whl/cpu torch || true
-
-      - name: Install Playwright browsers (uses PLAYWRIGHT_BROWSERS_PATH)
-        run: |
-          python -m pip install --upgrade playwright || true
+          pip install --prefer-binary --no-deps requests cloudscraper imageio-ffmpeg playwright || true
           python -m playwright install --with-deps || true
 
-      - name: Show disk after Playwright
-        run: df -h
-
-      - name: Create models dir
-        run: sudo mkdir -p /mnt/models && sudo chown $USER: /mnt/models
-
-      - name: Download Mistral gguf (anonymous)
+      - name: Install heavy local-LLM deps (optional)
+        if: ${{ github.event.inputs.install_local_llm == 'true' }}
         run: |
-          wget -c "https://huggingface.co/mistralai/Mistral-small-3.1/resolve/main/mistral-small-3.1.gguf" -O /mnt/models/mistral-small-3.1.gguf
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake libgomp1 libopenblas-dev || true
+          python -m pip install --upgrade pip setuptools wheel
+          # Install llama-cpp-python (preferred for gguf), huggingface-hub and transformers
+          python -m pip install --prefer-binary "huggingface-hub>=0.18.4" "transformers[torch]>=4.35.2" accelerate safetensors sentencepiece || true
+          python -m pip install --prefer-binary --extra-index-url https://download.pytorch.org/whl/cpu torch || true
+          # llama-cpp-python can often be installed as a wheel; if not, pip will attempt to build it (needs cmake)
+          python -m pip install --prefer-binary "llama-cpp-python" || true
 
-      - name: Run your script (llm)
+      - name: Download model (anonymous if public)
+        id: download-model
+        if: ${{ github.event.inputs.download_model == 'true' }}
+        run: |
+          set -e
+          MODEL_DIR=/mnt/models
+          mkdir -p "$MODEL_DIR"
+          MODEL_FILE="${{ github.event.inputs.model_filename }}"
+          TARGET="$MODEL_DIR/$MODEL_FILE"
+          if [ -f "$TARGET" ]; then
+            echo "downloaded=true" >> $GITHUB_OUTPUT
+            echo "path=$TARGET" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          REPO="${{ github.event.inputs.model_repo }}"
+          URL="https://huggingface.co/${REPO}/resolve/main/${MODEL_FILE}"
+          echo "Attempting anonymous download from $URL"
+          # Use wget with resume
+          wget -c "$URL" -O "$TARGET" || true
+          if [ -f "$TARGET" ]; then
+            echo "downloaded=true" >> $GITHUB_OUTPUT
+            echo "path=$TARGET" >> $GITHUB_OUTPUT
+          else
+            echo "downloaded=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload model artifact (optional)
+        if: ${{ github.event.inputs.use_model_artifact == 'true' && steps.download-model.outputs.downloaded == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: llm-model-${{ github.run_id }}
+          path: ${{ steps.download-model.outputs.path }}
+
+      - name: Show model file (verify)
+        run: |
+          if [ -f "/mnt/models/${{ github.event.inputs.model_filename }}" ]; then
+            echo "Model present:" && ls -lh "/mnt/models/${{ github.event.inputs.model_filename }}"
+            file "/mnt/models/${{ github.event.inputs.model_filename }}" || true
+            sha256sum "/mnt/models/${{ github.event.inputs.model_filename }}" | cut -c1-64 || true
+          else
+            echo "Model not present at /mnt/models/${{ github.event.inputs.model_filename }}"
+          fi
+        continue-on-error: true
+
+      - name: Run your scripts (llm + pipeline)
         working-directory: Script_Drive1
         env:
+          REQUIRE_LOCAL: ${{ github.event.inputs.require_local }}
+          ALLOW_FALLBACK: ${{ github.event.inputs.require_local == 'true' && 'false' || 'true' }}
+          LOCAL_MODEL_PATH: "/mnt/models/${{ github.event.inputs.model_filename }}"
+          LOCAL_DEVICE: "cpu"
+          LOCAL_BACKEND: "llama_cpp"
+          HF_TOKEN: ${{ secrets.HF_TOKEN || '' }}   # optional, empty for anonymous
           R_HOURS: "6"
         run: |
+          echo "REQUIRE_LOCAL=$REQUIRE_LOCAL"
+          echo "ALLOW_FALLBACK=$ALLOW_FALLBACK"
+          echo "LOCAL_MODEL_PATH=$LOCAL_MODEL_PATH"
+          # Export to environment variables the Python code can read, or pass into StoryPipeline (it reads env/defaults)
+          export LOCAL_MODEL="$LOCAL_MODEL_PATH"
+          export LOCAL_BACKEND="$LOCAL_BACKEND"
+          export LOCAL_DEVICE="$LOCAL_DEVICE"
+          export REQUIRE_LOCAL="$REQUIRE_LOCAL"
+          export ALLOW_FALLBACK="$ALLOW_FALLBACK"
+          # Run the main script - llm.py reads env / args; defaults will fall back to remote if allowed
           python llm.py
-
-      - name: Run your script (pollinations_image_genrate)
-        working-directory: Script_Drive1
-        env:
-          R_HOURS: "6"
-        run: |
-          python pollinations_image_genrate.py
-
-      - name: Run your script (Coqui_narration)
-        working-directory: Script_Drive1
-        env:
-          R_HOURS: "6"
-        run: |
-          python Coqui_narration.py
-
-      - name: Run your script (video_genrate)
-        working-directory: Script_Drive1
-        env:
-          R_HOURS: "6"
-        run: |
-          python video_genrate.py
-
-      - name: Run your script (remove_logo_from_video)
-        working-directory: Script_Drive1
-        env:
-          R_HOURS: "6"
-        run: |
-          python remove_logo_from_video.py
 
       - name: Upload debug artifacts (if present)
         if: always()
@@ -211,24 +159,9 @@ jobs:
             Script_Drive1/youtube_response/**
             Script_Drive1/narration_response/**
 
-      - name: Run your script (all_scripts)
-        working-directory: Script_Drive1
-        env:
-          R_HOURS: "6"
-        run: |
-          python all_scripts.py
-
       - name: Show disk (end)
         if: always()
         run: |
           echo "=== end disk ==="
           df -h
           du -sh /mnt/* 2>/dev/null || true
-          du -sh $RUNNER_TEMP $RUNNER_WORKSPACE || true
-
-      - name: Prune docker & builder (optional - frees space if docker used)
-        if: always()
-        run: |
-          docker system prune -af || true
-          docker builder prune -af || true
-          df -h
