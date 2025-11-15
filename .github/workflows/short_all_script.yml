@@ -156,6 +156,13 @@ jobs:
       - name: Show disk after Playwright
         run: df -h
 
+      - name: Create models dir
+        run: sudo mkdir -p /mnt/models && sudo chown $USER: /mnt/models
+
+      - name: Download Mistral gguf (anonymous)
+        run: |
+          wget -c "https://huggingface.co/mistralai/Mistral-small-3.1/resolve/main/mistral-small-3.1.gguf" -O /mnt/models/mistral-small-3.1.gguf
+
       - name: Run your script (llm)
         working-directory: Script_Drive1
         env:
