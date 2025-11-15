@@ -233,15 +233,28 @@ class LocalLLM:
         return True
 
     def _try_init_transformers(self) -> bool:
-        """Try transformers pipeline('text-generation'). Accepts HF id or local folder."""
-        try:
-            transformers_mod = importlib.import_module("transformers")
-        except Exception:
-            return False
-        from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM  # type: ignore
+        """
+        Try to use HuggingFace transformers pipeline or a local model folder.
 
-        # If local_model points to a single binary file (gguf/ggml/.bin/.pt/.ckpt/.safetensors),
-        # transformers.pipeline() will treat it as a repo-id and fail. Skip transformers in that case.
+        Behavior:
+        - If `local_model` is a path to a GGUF/ggml/bin/safetensors file, return False (transformers can't load that).
+        - If `local_model` is a directory, load with from_pretrained().
+        - If `local_model` looks like a HF repo id (contains '/'), try to load remotely (honoring self.hf_token).
+        - Uses `trust_remote_code=True` for flexible model repos, but only when loading from HF.
+        Returns True on success and sets self._generator, otherwise False.
+        """
+        try:
+            import importlib, os, json
+
+            mod = importlib.import_module("transformers")
+        except Exception:
+            # transformers not installed
+            return False
+
+        if not self.local_model:
+            return False
+
+        # If user provided a local single-file model (gguf/bin/pt/safetensors) -> transformers can't load this
         if isinstance(self.local_model, str) and os.path.isfile(self.local_model):
             ext = os.path.splitext(self.local_model)[1].lower()
             if ext in {
@@ -253,8 +266,92 @@ class LocalLLM:
                 ".pth",
                 ".safetensors",
             }:
-                # Not a directory or HF repo id - transformers can't load this directly.
+                # transformers can't load single binary model files; let other backends handle this
                 return False
+
+        try:
+            # Lazy import heavy classes
+            from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM
+
+            hf_kwargs = {}
+            if getattr(self, "hf_token", None):
+                hf_kwargs["use_auth_token"] = self.hf_token
+
+            # If it's a local directory, load the model & tokenizer from that directory
+            if os.path.isdir(self.local_model):
+                try:
+                    model = AutoModelForCausalLM.from_pretrained(
+                        self.local_model, **hf_kwargs
+                    )
+                    tokenizer = AutoTokenizer.from_pretrained(
+                        self.local_model, **hf_kwargs
+                    )
+                    gen_pipe = pipeline(
+                        "text-generation",
+                        model=model,
+                        tokenizer=tokenizer,
+                        device=(
+                            0
+                            if (self.device and "cuda" in str(self.device).lower())
+                            else -1
+                        ),
+                    )
+                except Exception:
+                    # local folder might still require remote code - try with trust_remote_code
+                    gen_pipe = pipeline(
+                        "text-generation",
+                        model=self.local_model,
+                        tokenizer=self.local_model,
+                        trust_remote_code=True,
+                        **hf_kwargs,
+                    )
+            else:
+                # likely a HF repo id like 'mistralai/Mistral-Small-3.1-24B-Instruct-2503'
+                gen_pipe = pipeline(
+                    "text-generation",
+                    model=self.local_model,
+                    tokenizer=self.local_model,
+                    trust_remote_code=True,
+                    **hf_kwargs,
+                )
+
+            # Wrap pipeline into a consistent generator function
+            def gen(prompt, max_new_tokens=512, timeout=300, **kw):
+                args = {"max_new_tokens": max_new_tokens}
+                args.update(
+                    {
+                        k: kw[k]
+                        for k in ("do_sample", "temperature", "top_k", "top_p")
+                        if k in kw
+                    }
+                )
+                out = gen_pipe(prompt, **args)
+                if isinstance(out, list) and out:
+                    first = out[0]
+                    if isinstance(first, dict):
+                        for k in ("generated_text", "text", "content", "response"):
+                            if k in first and isinstance(first[k], str):
+                                return first[k]
+                        # fallback to stringify dictionary
+                        return json.dumps(first, ensure_ascii=False)
+                if isinstance(out, dict):
+                    for k in ("generated_text", "text", "content", "response"):
+                        if k in out and isinstance(out[k], str):
+                            return out[k]
+                    return json.dumps(out, ensure_ascii=False)
+                return str(out)
+
+        except Exception as e:
+            try:
+                print(f"⚠️ transformers backend init failed: {e}", flush=True)
+            except Exception:
+                pass
+            return False
+
+        # success
+        self._generator = gen
+        self._meta["notes"] = f"transformers pipeline (model={self.local_model})"
+        return True
 
     def _try_init_tgi_http(self) -> bool:
         """Try a text-generation-inference HTTP endpoint (TGI). Expect env or use 'local_model' as base URL if it looks like URL."""
@@ -1241,37 +1338,17 @@ class StoryPipeline:
             f"StoryPipeline initialized ({mode}). api_url={self.api_url!r}, local_model={self.local_model!r}, allow_fallback={self.allow_fallback}"
         )
 
-    def _resp_to_text(self, resp) -> str:
-        """
-        Normalize various possible response shapes into a string safe for regex/parsing.
-        Handles: str, bytes, dict (OpenAI-like, nested 'message' structures, 'choices'),
-        lists of parts, and falls back to json.dumps or str().
-        """
+    def resp_to_text(resp):
+        """Normalize responses that may be dicts (from cloudscraper/fallbacks) or strings."""
         try:
-            if resp is None:
-                return ""
-            # bytes -> decode
-            if isinstance(resp, (bytes, bytearray)):
-                try:
-                    return resp.decode("utf-8")
-                except Exception:
-                    return resp.decode("latin-1", errors="ignore")
-            # already a string
-            if isinstance(resp, str):
-                return resp
-
-            # dict-like: common keys first
+            if isinstance(resp, (str, bytes)):
+                return resp.decode("utf-8") if isinstance(resp, bytes) else resp
             if isinstance(resp, dict):
+                # common keys
                 for k in ("response", "message", "text", "content", "result"):
                     if k in resp and isinstance(resp[k], str):
                         return resp[k]
-                # nested message.content style
-                if "message" in resp and isinstance(resp["message"], dict):
-                    inner = resp["message"]
-                    for k in ("content", "text"):
-                        if k in inner and isinstance(inner[k], str):
-                            return inner[k]
-                # OpenAI-like: choices -> first -> text / message/content
+                # openai-like choices
                 if (
                     "choices" in resp
                     and isinstance(resp["choices"], list)
@@ -1282,55 +1359,14 @@ class StoryPipeline:
                         for k in ("text", "message", "content"):
                             if k in first and isinstance(first[k], str):
                                 return first[k]
-                        if "message" in first and isinstance(first["message"], dict):
-                            m = first["message"]
-                            if "content" in m:
-                                c = m["content"]
-                                if isinstance(c, str):
-                                    return c
-                                if isinstance(c, list):
-                                    parts = []
-                                    for item in c:
-                                        if isinstance(item, dict):
-                                            for kk in ("text", "content"):
-                                                if kk in item and isinstance(
-                                                    item[kk], str
-                                                ):
-                                                    parts.append(item[kk])
-                                        elif isinstance(item, str):
-                                            parts.append(item)
-                                    if parts:
-                                        return " ".join(parts)
-
-            # list-like: join string parts
-            if isinstance(resp, (list, tuple)):
-                parts = []
-                for item in resp:
-                    if isinstance(item, str):
-                        parts.append(item)
-                    elif isinstance(item, dict):
-                        # try same heuristics recursively for small nested dict
-                        s = self._resp_to_text(item)
-                        if s:
-                            parts.append(s)
-                    elif isinstance(item, (bytes, bytearray)):
-                        try:
-                            parts.append(item.decode("utf-8"))
-                        except Exception:
-                            parts.append(str(item))
-                if parts:
-                    return " ".join(parts)
-
-            # fallback: json.dumps if possible, else str()
+                # fallback
+                return json.dumps(resp, ensure_ascii=False)
+            return str(resp)
+        except Exception:
             try:
                 return json.dumps(resp, ensure_ascii=False)
             except Exception:
                 return str(resp)
-        except Exception:
-            try:
-                return str(resp)
-            except Exception:
-                return ""
 
     def _build_script_prompt(
         self,
