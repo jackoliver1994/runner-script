@@ -26,7 +26,7 @@ import difflib
 import subprocess
 import importlib
 from types import SimpleNamespace
-from typing import Optional, List, Dict, Any, Callable,
+from typing import Optional, List, Dict, Any, Callable
 from threading import Thread, Event
 from datetime import datetime
 
@@ -97,7 +97,14 @@ class LocalLLM:
     """
 
     # default backend preference order if backend not explicitly provided
-    DEFAULT_BACKEND_ORDER = ["llama_cpp", "vllm", "transformers", "tgi_http", "webui_http", "subprocess"]
+    DEFAULT_BACKEND_ORDER = [
+        "llama_cpp",
+        "vllm",
+        "transformers",
+        "tgi_http",
+        "webui_http",
+        "subprocess",
+    ]
 
     def __init__(
         self,
@@ -109,7 +116,9 @@ class LocalLLM:
         max_new_tokens: int = 512,
         require_local: bool = False,
         auto_try_others: bool = True,
-        cli_cmd_template: Optional[str] = None,  # for subprocess backend, e.g. "llama --model {model} --prompt '{prompt}'"
+        cli_cmd_template: Optional[
+            str
+        ] = None,  # for subprocess backend, e.g. "llama --model {model} --prompt '{prompt}'"
     ):
         self.local_model = local_model
         self.device = device or os.environ.get("LOCAL_LLM_DEVICE", None)
@@ -133,16 +142,26 @@ class LocalLLM:
     def info(self) -> dict:
         return {"backend": self._backend_name, "model": self.local_model, **self._meta}
 
-    def generate(self, prompt: str, max_new_tokens: Optional[int] = None, timeout: Optional[int] = None, **kwargs) -> str:
+    def generate(
+        self,
+        prompt: str,
+        max_new_tokens: Optional[int] = None,
+        timeout: Optional[int] = None,
+        **kwargs,
+    ) -> str:
         """
         Generate text synchronously; returns string. kwargs forwarded to backend-specific generator where supported.
         """
         if not self.is_ready():
-            raise RuntimeError("LocalLLM not ready. Backend init failed or model not found.")
+            raise RuntimeError(
+                "LocalLLM not ready. Backend init failed or model not found."
+            )
         try:
             mnt = max_new_tokens or self.max_new_tokens
             # call backend generator; each backend wrapper accepts prompt and max_new_tokens (try to be consistent)
-            out = self._generator(prompt, max_new_tokens=mnt, timeout=timeout or 300, **kwargs)
+            out = self._generator(
+                prompt, max_new_tokens=mnt, timeout=timeout or 300, **kwargs
+            )
             if isinstance(out, dict):
                 # try to extract usual fields
                 for k in ("generated_text", "text", "response", "result"):
@@ -165,7 +184,9 @@ class LocalLLM:
             return str(out)
         except Exception as e:
             # surface backend error clearly
-            raise RuntimeError(f"LocalLLM generation failed (backend={self._backend_name}): {e}")
+            raise RuntimeError(
+                f"LocalLLM generation failed (backend={self._backend_name}): {e}"
+            )
 
     # ------- initialization and backend probing -------
     def _init_dynamic(self):
@@ -188,7 +209,9 @@ class LocalLLM:
                 ok = getattr(self, f"_try_init_{b}")()
                 if ok:
                     self._backend_name = b
-                    print(f"✅ LocalLLM: initialized backend '{b}' for model='{self.local_model}'")
+                    print(
+                        f"✅ LocalLLM: initialized backend '{b}' for model='{self.local_model}'"
+                    )
                     return
             except Exception as e:
                 errors[b] = str(e)
@@ -230,6 +253,7 @@ class LocalLLM:
                     if "text" in r:
                         return r["text"]
                 return str(r)
+
             self._generator = gen
             self._meta["notes"] = "llama_cpp (llama_cpp.Llama) using model_path"
             return True
@@ -247,6 +271,7 @@ class LocalLLM:
         from vllm import Model  # type: ignore
 
         model = Model.from_pretrained(self.local_model)
+
         def gen(prompt, max_new_tokens=512, timeout=300, **kw):
             # create a generation request and read the first output text
             gen_kwargs = dict(max_tokens=max_new_tokens)
@@ -257,6 +282,7 @@ class LocalLLM:
                 final.append(r.text)
                 break
             return "".join(final)
+
         self._generator = gen
         self._meta["notes"] = "vLLM Model.from_pretrained"
         self._meta["vllm_model"] = getattr(model, "name", None)
@@ -286,6 +312,7 @@ class LocalLLM:
         try:
             # primary attempt using pipeline
             generator = pipeline("text-generation", model=self.local_model, **kwargs)
+
             # wrap to consistent signature
             def gen(prompt, max_new_tokens=512, timeout=300, **kw):
                 out = generator(prompt, max_new_tokens=max_new_tokens, return_text=True)
@@ -298,18 +325,30 @@ class LocalLLM:
                         return first
                     return json.dumps(first, ensure_ascii=False)
                 return str(out)
+
             self._generator = gen
             self._meta["notes"] = "transformers.pipeline text-generation"
             return True
         except Exception as e:
             # fallback to explicit tokenizer+model
             try:
-                tokenizer = AutoTokenizer.from_pretrained(self.local_model, use_fast=True, trust_remote_code=True, use_auth_token=self.hf_token)
-                model = AutoModelForCausalLM.from_pretrained(self.local_model, trust_remote_code=True, use_auth_token=self.hf_token)
+                tokenizer = AutoTokenizer.from_pretrained(
+                    self.local_model,
+                    use_fast=True,
+                    trust_remote_code=True,
+                    use_auth_token=self.hf_token,
+                )
+                model = AutoModelForCausalLM.from_pretrained(
+                    self.local_model,
+                    trust_remote_code=True,
+                    use_auth_token=self.hf_token,
+                )
+
                 def gen2(prompt, max_new_tokens=512, timeout=300, **kw):
                     inputs = tokenizer(prompt, return_tensors="pt", truncation=True)
                     outputs = model.generate(**inputs, max_new_tokens=max_new_tokens)
                     return tokenizer.decode(outputs[0], skip_special_tokens=True)
+
                 self._generator = gen2
                 self._meta["notes"] = "transformers AutoModel fallback"
                 return True
@@ -323,7 +362,10 @@ class LocalLLM:
         # detect base url
         base = None
         # if local_model is full URL -> treat as endpoint
-        if isinstance(self.local_model, str) and (self.local_model.startswith("http://") or self.local_model.startswith("https://")):
+        if isinstance(self.local_model, str) and (
+            self.local_model.startswith("http://")
+            or self.local_model.startswith("https://")
+        ):
             base = self.local_model.rstrip("/")
         else:
             # common local default port for tgi
@@ -331,12 +373,15 @@ class LocalLLM:
         # test endpoint /generate
         try:
             test = requests.post(f"{base}/generate", json={"prompt": "hi"}, timeout=3)
-            if test.status_code not in (200,201,202):
+            if test.status_code not in (200, 201, 202):
                 # could still be a different API; accept only 200-ish
                 return False
+
             def gen(prompt, max_new_tokens=512, timeout=300, **kw):
                 payload = {"prompt": prompt, "max_new_tokens": max_new_tokens}
-                resp = requests.post(f"{base}/generate", json=payload, timeout=timeout or 300)
+                resp = requests.post(
+                    f"{base}/generate", json=payload, timeout=timeout or 300
+                )
                 try:
                     j = resp.json()
                 except Exception:
@@ -344,14 +389,21 @@ class LocalLLM:
                 # try common slots
                 if isinstance(j, dict):
                     if "results" in j and j["results"]:
-                        return j["results"][0].get("text", json.dumps(j, ensure_ascii=False))
-                    for k in ("generated_text","text","response","result"):
+                        return j["results"][0].get(
+                            "text", json.dumps(j, ensure_ascii=False)
+                        )
+                    for k in ("generated_text", "text", "response", "result"):
                         if k in j:
                             return j[k]
                     if "choices" in j and j["choices"]:
                         c = j["choices"][0]
-                        return c.get("text") or c.get("message") or json.dumps(c, ensure_ascii=False)
+                        return (
+                            c.get("text")
+                            or c.get("message")
+                            or json.dumps(c, ensure_ascii=False)
+                        )
                 return json.dumps(j, ensure_ascii=False)
+
             self._generator = gen
             self._meta["notes"] = f"tgi_http at {base}"
             return True
@@ -361,9 +413,14 @@ class LocalLLM:
     def _try_init_webui_http(self) -> bool:
         """Try text-generation-webui HTTP endpoints (gradio). Common base: http://127.0.0.1:7860"""
         import requests
+
         base = os.environ.get("WEBUI_URL", None) or "http://127.0.0.1:7860"
         # try /api/prompt or /api/v1/generate
-        try_urls = [f"{base}/api/prompt", f"{base}/api/v1/generate", f"{base}/run/predict"]
+        try_urls = [
+            f"{base}/api/prompt",
+            f"{base}/api/v1/generate",
+            f"{base}/run/predict",
+        ]
         for u in try_urls:
             try:
                 r = requests.get(u, timeout=3)
@@ -396,6 +453,7 @@ class LocalLLM:
                         # fallback: POST then return text
                         r = requests.post(u, json={"data": [prompt]}, timeout=timeout)
                         return r.text
+
                     self._generator = gen
                     self._meta["notes"] = f"webui_http at {u}"
                     return True
@@ -414,16 +472,24 @@ class LocalLLM:
             return False
         # quick test run (with short prompt)
         try:
-            test_cmd = cmd_template.format(model=self.local_model, prompt="Hello", max_new_tokens=8)
+            test_cmd = cmd_template.format(
+                model=self.local_model, prompt="Hello", max_new_tokens=8
+            )
             p = subprocess.run(test_cmd, shell=True, capture_output=True, timeout=5)
             if p.returncode != 0:
                 # still accept? no
                 return False
+
             def gen(prompt, max_new_tokens=512, timeout=300, **kw):
-                cmd = cmd_template.format(model=self.local_model, prompt=prompt, max_new_tokens=max_new_tokens)
-                p = subprocess.run(cmd, shell=True, capture_output=True, timeout=timeout)
+                cmd = cmd_template.format(
+                    model=self.local_model, prompt=prompt, max_new_tokens=max_new_tokens
+                )
+                p = subprocess.run(
+                    cmd, shell=True, capture_output=True, timeout=timeout
+                )
                 out = p.stdout.decode("utf-8", errors="ignore")
                 return out.strip()
+
             self._generator = gen
             self._meta["notes"] = f"subprocess cmd_template"
             return True
@@ -462,12 +528,12 @@ class ChatAPI:
         default_timeout: int = 100,
         local_model: Optional[str] = None,
         local_device: Optional[str] = None,
-        local_backend: Optional[str] = None,      # <-- added
-        hf_token: Optional[str] = None,           # <-- added
+        local_backend: Optional[str] = None,  # <-- added
+        hf_token: Optional[str] = None,  # <-- added
         require_local: bool = False,
         require_remote: bool = False,
         allow_fallback: bool = False,
-        ):
+    ):
         """
         ChatAPI constructor.
         - local_model: name or path for a local HF-compatible model (e.g. "mistral-small-3.1")
@@ -511,7 +577,7 @@ class ChatAPI:
                 self.local_llm = LocalLLM(
                     local_model="/mnt/models/mistral-small-3.1.gguf",
                     device="cpu",
-                    preferred_backends=["llama_cpp","transformers"],
+                    preferred_backends=["llama_cpp", "transformers"],
                     require_local=True,
                     hf_token=None,
                     max_new_tokens=256,
@@ -579,10 +645,10 @@ class ChatAPI:
                 "Detected HTML challenge",
                 "Cloudflare-like content",
                 "Response status=403",
-                "cloudflare", 
-                "detected cloudflare", 
-                "access denied", 
-                "anti-bot"
+                "cloudflare",
+                "detected cloudflare",
+                "access denied",
+                "anti-bot",
             ]
         specific_error = [s.lower() for s in specific_error]
 
