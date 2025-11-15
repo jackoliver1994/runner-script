@@ -450,6 +450,8 @@ class ChatAPI:
         self.url = url
         self.headers = {"Content-Type": "application/json"}
         self.base_timeout = default_timeout
+        self.local_backend = local_backend
+        self.hf_token = hf_token
 
         # Mode flags
         self.require_local = bool(require_local)
@@ -1062,6 +1064,7 @@ class StoryPipeline:
         default_timeout: int = 100,
         local_model: str | None = None,
         local_device: str | None = None,
+        local_backend: Optional[str] = None,
         require_local: bool = False,
         require_remote: bool = False,
         allow_fallback: bool = False,
@@ -1088,6 +1091,7 @@ class StoryPipeline:
         self.default_timeout = default_timeout
         self.local_model = local_model
         self.local_device = local_device
+        self.local_backend = local_backend
 
         # flags
         self.require_local = bool(require_local)
@@ -1129,6 +1133,7 @@ class StoryPipeline:
                 local_model=self.local_model,
                 local_device=self.local_device,
                 require_local=self.require_local,
+                local_backend=self.local_backend,
                 require_remote=self.require_remote,
                 allow_fallback=self.allow_fallback,
             )
@@ -1150,23 +1155,32 @@ class StoryPipeline:
                 setattr(self.chat, "require_remote", self.require_remote)
                 setattr(self.chat, "allow_fallback", self.allow_fallback)
 
-            # If local_model was requested, the ChatAPI may not have tried to init local LLM
-            # because it was constructed earlier. Attempt one best-effort repair + re-init here.
+            # existing code that tries to initialize LocalLLM should receive backend and hf_token:
             if self.local_model:
                 try:
-                    # if ChatAPI provides a helper, call it; else call pipeline helper that uses LocalLLM
-                    if hasattr(self.chat, "_attempt_local_repair_and_retry"):
-                        # prefer chat's own helper if present
-                        self.chat._attempt_local_repair_and_retry()
-                    else:
-                        # Use the pipeline-level helper to attempt one repair and init
-                        self._attempt_local_repair_and_retry()
-                except Exception as e:
-                    # If require_local is True, propagate the error; else continue and let fallback behavior decide
-                    if self.require_local:
+                    self.local_llm = LocalLLM(
+                        local_model=self.local_model,
+                        device=self.local_device,
+                        backend=self.local_backend,
+                        hf_token=self.hf_token,
+                        require_local=self.require_local,
+                        auto_try_others=True,
+                    )
+                    # If a readiness check is required, use is_ready() (ensure LocalLLM implements is_ready)
+                    if self.require_local and not self.local_llm.is_ready():
                         raise RuntimeError(
-                            f"Local model requested but automatic re-init failed: {e}"
+                            "Local model specified but failed to initialize and 'require_local' is set."
                         )
+                except Exception as e:
+                    # preserve previous behavior: if require_local then re-raise, else fallback to remote
+                    if self.require_local:
+                        raise
+                    else:
+                        print(
+                            "⚠️ Local model initialization failed, falling back to remote API. Error:",
+                            e,
+                        )
+                        self.local_llm = None
 
         # Now, post-construction sanity: if require_local is set, ensure local_llm is present and ready
         local_ready = False
@@ -2819,10 +2833,11 @@ if __name__ == "__main__":
         local_model="/mnt/models/mistral-small-3.1.gguf",
         local_device="cpu",
         local_backend="llama_cpp",
+        hf_token=None,
         require_local=True,
         allow_fallback=False,
+        preferred_backends=["llama_cpp"],
     )
-
     # --- Example 1: Only generate the story/script (BRACKETED single block file saved) ---
     script = pipeline.generate_script(
         niche="Preschool-early-elementary children",
