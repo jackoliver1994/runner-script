@@ -27,6 +27,14 @@ on:
         description: 'Filename in the repo to download.'
         required: false
         default: 'mistral-small-3.1.gguf'
+      use_hf_token:
+        description: "true => use the repository secret 'HF_TOKEN' for authenticated downloads (recommended)."
+        required: false
+        default: 'true'
+      hf_token_public:
+        description: "OPTIONAL (not recommended): paste a token here. Visible in UI/logs. Prefer repository secret + use_hf_token=true."
+        required: false
+        default: ''
 
 jobs:
   run-script:
@@ -73,17 +81,20 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential cmake libgomp1 libopenblas-dev || true
           python -m pip install --upgrade pip setuptools wheel
-          # Install llama-cpp-python (preferred for gguf), huggingface-hub and transformers
           python -m pip install --prefer-binary "huggingface-hub>=0.18.4" "transformers[torch]>=4.35.2" accelerate safetensors sentencepiece || true
           python -m pip install --prefer-binary --extra-index-url https://download.pytorch.org/whl/cpu torch || true
-          # llama-cpp-python can often be installed as a wheel; if not, pip will attempt to build it (needs cmake)
           python -m pip install --prefer-binary "llama-cpp-python" || true
 
-      - name: Download model (anonymous if public)
+      - name: Download model (anonymous then authenticated if needed)
         id: download-model
         if: ${{ github.event.inputs.download_model == 'true' }}
+        env:
+          INPUT_USE_HF_TOKEN: ${{ github.event.inputs.use_hf_token }}
+          INPUT_HF_TOKEN_PUBLIC: ${{ github.event.inputs.hf_token_public }}
+          # repo secret is available but only used if INPUT_USE_HF_TOKEN == 'true'
+          REPO_HF_TOKEN: ${{ secrets.HF_TOKEN || '' }}
         run: |
-          set -e
+          set -euo pipefail
           MODEL_DIR=/mnt/models
           mkdir -p "$MODEL_DIR"
           MODEL_FILE="${{ github.event.inputs.model_filename }}"
@@ -93,17 +104,40 @@ jobs:
             echo "path=$TARGET" >> $GITHUB_OUTPUT
             exit 0
           fi
+
           REPO="${{ github.event.inputs.model_repo }}"
           URL="https://huggingface.co/${REPO}/resolve/main/${MODEL_FILE}"
           echo "Attempting anonymous download from $URL"
-          # Use wget with resume
           wget -c "$URL" -O "$TARGET" || true
           if [ -f "$TARGET" ]; then
             echo "downloaded=true" >> $GITHUB_OUTPUT
             echo "path=$TARGET" >> $GITHUB_OUTPUT
-          else
-            echo "downloaded=false" >> $GITHUB_OUTPUT
+            exit 0
           fi
+
+          # Determine HF token to use (prefer repo secret if instructed)
+          HF_TOKEN=""
+          if [ "${INPUT_USE_HF_TOKEN:-false}" = "true" ] && [ -n "${REPO_HF_TOKEN:-}" ]; then
+            echo "Using HF token from repository secrets (recommended)."
+            HF_TOKEN="${REPO_HF_TOKEN}"
+          elif [ -n "${INPUT_HF_TOKEN_PUBLIC:-}" ]; then
+            echo "Using HF token provided in workflow_dispatch input (NOT RECOMMENDED; visible in UI)."
+            HF_TOKEN="${INPUT_HF_TOKEN_PUBLIC}"
+          else
+            echo "No HF token available; anonymous download already attempted and failed."
+          fi
+
+          if [ -n "${HF_TOKEN:-}" ]; then
+            echo "Retrying authenticated download..."
+            curl -L -H "Authorization: Bearer ${HF_TOKEN}" "$URL" -o "$TARGET" || true
+            if [ -f "$TARGET" ]; then
+              echo "downloaded=true" >> $GITHUB_OUTPUT
+              echo "path=$TARGET" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+          fi
+
+          echo "downloaded=false" >> $GITHUB_OUTPUT
 
       - name: Upload model artifact (optional)
         if: ${{ github.event.inputs.use_model_artifact == 'true' && steps.download-model.outputs.downloaded == 'true' }}
@@ -127,23 +161,40 @@ jobs:
         working-directory: Script_Drive1
         env:
           REQUIRE_LOCAL: ${{ github.event.inputs.require_local }}
-          ALLOW_FALLBACK: ${{ github.event.inputs.require_local == 'true' && 'false' || 'true' }}
           LOCAL_MODEL_PATH: "/mnt/models/${{ github.event.inputs.model_filename }}"
           LOCAL_DEVICE: "cpu"
           LOCAL_BACKEND: "llama_cpp"
-          HF_TOKEN: ${{ secrets.HF_TOKEN || '' }}   # optional, empty for anonymous
+          # HF token selection: we still expose repo secret here but only used if INPUT_USE_HF_TOKEN == 'true'
+          REPO_HF_TOKEN: ${{ secrets.HF_TOKEN || '' }}
+          INPUT_USE_HF_TOKEN: ${{ github.event.inputs.use_hf_token }}
+          INPUT_HF_TOKEN_PUBLIC: ${{ github.event.inputs.hf_token_public }}
           R_HOURS: "6"
         run: |
+          # Compute ALLOW_FALLBACK from REQUIRE_LOCAL
+          if [ "${REQUIRE_LOCAL:-false}" = "true" ]; then
+            ALLOW_FALLBACK=false
+          else
+            ALLOW_FALLBACK=true
+          fi
+
+          # Decide HF_TOKEN (prefer repo secret when requested)
+          HF_TOKEN=""
+          if [ "${INPUT_USE_HF_TOKEN:-false}" = "true" ] && [ -n "${REPO_HF_TOKEN:-}" ]; then
+            HF_TOKEN="${REPO_HF_TOKEN}"
+          elif [ -n "${INPUT_HF_TOKEN_PUBLIC:-}" ]; then
+            HF_TOKEN="${INPUT_HF_TOKEN_PUBLIC}"
+          fi
+
           echo "REQUIRE_LOCAL=$REQUIRE_LOCAL"
           echo "ALLOW_FALLBACK=$ALLOW_FALLBACK"
           echo "LOCAL_MODEL_PATH=$LOCAL_MODEL_PATH"
-          # Export to environment variables the Python code can read, or pass into StoryPipeline (it reads env/defaults)
+          # Export so Python code can read them
           export LOCAL_MODEL="$LOCAL_MODEL_PATH"
           export LOCAL_BACKEND="$LOCAL_BACKEND"
           export LOCAL_DEVICE="$LOCAL_DEVICE"
           export REQUIRE_LOCAL="$REQUIRE_LOCAL"
           export ALLOW_FALLBACK="$ALLOW_FALLBACK"
-          # Run the main script - llm.py reads env / args; defaults will fall back to remote if allowed
+          export HF_TOKEN="$HF_TOKEN"
           python llm.py
 
       - name: Upload debug artifacts (if present)
