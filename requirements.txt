@@ -1,34 +1,42 @@
-numpy
+# Build & wheel helpers (install first in CI/local before the rest)
 setuptools>=65.0
 wheel
 cython
+
+# Ensure numpy is present BEFORE packages that need it at build time
+numpy>=1.25
+
+# Core ML / runtime deps
+torch
+transformers[torch]>=4.35.2
+huggingface_hub>=0.18.4
+safetensors
+bitsandbytes
+sentencepiece
+accelerate
+
+# Audio / media / numeric
+librosa
+soundfile
+scipy
+numba
+pyworld
+
+# Utilities & others
 opencv-python-headless
 Pillow
 pandas
 matplotlib
 tqdm
-soundfile
-librosa
-scipy
-numba
 ffmpeg-python
 imageio-ffmpeg
 requests>=2.30.0
 cloudscraper>=1.2.68
 playwright>=1.39.0
-huggingface-hub>=0.18.4
-transformers[torch]>=4.35.2
 mega.py==1.0.8
 cryptography>=42.0.0
 python-dotenv>=1.0.1
 pyppeteer
-accelerate
-safetensors
-torch
-sentencepiece
-bitsandbytes
-pyworld
 psutil
-huggingface_hub
 llama-cpp-python
 TTS
