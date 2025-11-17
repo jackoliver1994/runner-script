@@ -32,8 +32,12 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Show disk before
-        run: df -h && du -sh .
+      - name: Show disk and largest dirs before
+        run: |
+          df -h
+          sudo du -xh / | sort -h -r | head -30
+          sudo du -xh /opt | sort -h -r | head -10
+          docker system df || true
 
       - name: Install dependencies
         run: |
@@ -43,8 +47,12 @@ jobs:
       - name: Install Playwright browsers
         run: playwright install --with-deps
 
-      - name: Show disk after
-        run: df -h && du -sh .
+      - name: Show disk and largest dirs after
+        run: |
+          df -h
+          sudo du -xh / | sort -h -r | head -30
+          sudo du -xh /opt | sort -h -r | head -10
+          docker system df || true
 
       - name: Show environment (debug)
         run: |
@@ -117,6 +125,13 @@ jobs:
         run: |
           cd Script_Drive1
           python all_scripts.py
+
+      - name: Show disk and largest dirs
+        run: |
+          df -h
+          sudo du -xh / | sort -h -r | head -30
+          sudo du -xh /opt | sort -h -r | head -10
+          docker system df || true
 
       - name: Cleanup workspace and temp files (Linux/macOS)
         if: always()
