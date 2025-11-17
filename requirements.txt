@@ -1,10 +1,21 @@
+# ensure numpy is installed early
+numpy==1.25.3
+
+# pin numba & llvmlite to avoid long dependency resolution
+llvmlite==0.38.1
+numba==0.55.2
+
+# pyworld pinned (source build will use preinstalled numpy)
+pyworld==0.2.10
+
+# recommended TTS pin (choose whichever version you use)
+TTS
+
+
 # Build & wheel helpers (install first in CI/local before the rest)
 setuptools>=65.0
 wheel
 cython
-
-# Ensure numpy is present BEFORE packages that need it at build time
-numpy>=1.25
 
 # Core ML / runtime deps
 torch
@@ -19,8 +30,6 @@ accelerate
 librosa
 soundfile
 scipy
-numba
-pyworld
 
 # Utilities & others
 opencv-python-headless
@@ -39,4 +48,3 @@ python-dotenv>=1.0.1
 pyppeteer
 psutil
 llama-cpp-python
-TTS
