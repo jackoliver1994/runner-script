@@ -1,50 +1,29 @@
-# ensure numpy is installed early
-numpy==1.25.3
-
-# pin numba & llvmlite to avoid long dependency resolution
-llvmlite==0.38.1
-numba==0.55.2
-
-# pyworld pinned (source build will use preinstalled numpy)
-pyworld==0.2.10
-
-# recommended TTS pin (choose whichever version you use)
-TTS
-
-
-# Build & wheel helpers (install first in CI/local before the rest)
-setuptools>=65.0
-wheel
-cython
-
-# Core ML / runtime deps
-torch
-transformers[torch]>=4.35.2
-huggingface_hub>=0.18.4
-safetensors
-bitsandbytes
-sentencepiece
-accelerate
-
-# Audio / media / numeric
-librosa
-soundfile
-scipy
-
-# Utilities & others
-opencv-python-headless
 Pillow
+numpy
 pandas
 matplotlib
+opencv-python-headless
 tqdm
+TTS
+soundfile
+librosa
+scipy
+numba
 ffmpeg-python
 imageio-ffmpeg
 requests>=2.30.0
 cloudscraper>=1.2.68
 playwright>=1.39.0
+huggingface-hub>=0.18.4
+transformers[torch]>=4.35.2
 mega.py==1.0.8
 cryptography>=42.0.0
 python-dotenv>=1.0.1
 pyppeteer
-psutil
+accelerate
+safetensors
+torch
+sentencepiece
+bitsandbytes
+huggingface_hub
 llama-cpp-python
