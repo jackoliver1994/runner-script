@@ -1,4 +1,4 @@
-name: Run short all script (safe local-llm support)
+name: Run short all script
 
 on:
   workflow_dispatch:
