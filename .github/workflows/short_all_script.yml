@@ -35,6 +35,9 @@ jobs:
       - name: Show disk before
         run: df -h && du -sh .
 
+      - name: Install psutil
+        run: python -m pip install psutil==5.9.5
+
       - name: Show environment (debug)
         run: |
           echo "HF_TOKEN set? -> ${HF_TOKEN:+YES}"
