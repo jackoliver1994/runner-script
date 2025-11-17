@@ -7,7 +7,6 @@ Pillow
 pandas
 matplotlib
 tqdm
-TTS
 soundfile
 librosa
 scipy
@@ -32,3 +31,4 @@ pyworld
 psutil
 huggingface_hub
 llama-cpp-python
+TTS
