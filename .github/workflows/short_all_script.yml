@@ -1,200 +1,71 @@
-name: Run short all script (safe local-llm support)
+name: Test & download GGUF model
 
 on:
   workflow_dispatch:
     inputs:
-      install_local_llm:
-        description: 'true => install heavy LLM deps (llama-cpp, torch/transformers).'
-        required: false
-        default: 'false'
-      download_model:
-        description: 'true => attempt to download model file from HF anonymously (if public).'
-        required: false
-        default: 'true'
-      use_model_artifact:
-        description: 'true => upload downloaded model as artifact for reuse.'
-        required: false
-        default: 'true'
-      require_local:
-        description: 'true => enforce local-only (script will raise if local model missing).'
-        required: false
-        default: 'false'
-      model_repo:
-        description: 'Hugging Face repo id (used to build anonymous URL).'
-        required: false
-        default: 'mistralai/Mistral-small-3.1'
-      model_filename:
-        description: 'Filename in the repo to download.'
-        required: false
-        default: 'mistral-small-3.1.gguf'
-      use_hf_token:
-        description: "true => use the repository secret 'HF_TOKEN' for authenticated downloads (recommended)."
-        required: false
-        default: 'true'
-      hf_token_public:
-        description: "OPTIONAL (not recommended): paste a token here. Visible in UI/logs. Prefer repository secret + use_hf_token=true."
-        required: false
-        default: ''
+      hf_key:
+        description: 'Hugging Face token (runtime input). This will be passed to the job as HF_TOKEN.'
+        required: true
+        type: string
 
 jobs:
-  run-script:
+  download-and-test:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
     env:
-      R_HOURS: "6"
-      PYTHON_VERSION: "3.11"
-      NODE_VERSION: "18"
+      # HF token is set dynamically from the workflow dispatch input (hf_key)
+      HF_TOKEN: ${{ github.event.inputs.hf_key }}
+
+      # MODEL_DEST_PATH and REPO_ID are set here (not dynamic). Change paths if you like.
+      MODEL_DEST_PATH: ${{ github.workspace }}/models/mistral-small-3.1.gguf
+      REPO_ID: ggml-org/Mistral-Small-3.1-24B-Instruct-2503-GGUF
+      USE_AUTH: "true"
+      SELECT_STRATEGY: "auto"
+      VERBOSE: "true"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
+          python-version: "3.10"
 
-      - name: Show disk & prepare /mnt
+      - name: Install dependencies
         run: |
-          echo "=== start disk ==="
-          df -h
-          sudo mkdir -p /mnt/models /mnt/ci_tmp /mnt/pip_cache /mnt/npm_cache /mnt/playwright_browsers
-          sudo chown $USER:$USER /mnt/models /mnt/ci_tmp /mnt/pip_cache /mnt/npm_cache /mnt/playwright_browsers
-          echo "TMPDIR=/mnt/ci_tmp" >> $GITHUB_ENV
-          echo "PIP_CACHE_DIR=/mnt/pip_cache" >> $GITHUB_ENV
-          echo "NPM_CONFIG_CACHE=/mnt/npm_cache" >> $GITHUB_ENV
-          echo "PLAYWRIGHT_BROWSERS_PATH=/mnt/playwright_browsers" >> $GITHUB_ENV
-          df -h
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Install light Python deps (always)
+      - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip setuptools wheel
-          if [ -f requirements.txt ]; then pip install --prefer-binary -r requirements.txt ; fi
-          pip install --prefer-binary --no-deps requests cloudscraper imageio-ffmpeg playwright || true
-          python -m playwright install --with-deps || true
+          python -m pip install --upgrade pip
+          pip install huggingface_hub psutil || true
+          # try to install llama-cpp-python (optional). May fail if system requirements missing; that's OK.
+          pip install "llama-cpp-python" || true
+          # install optional torch only if needed (commented out because it can be large)
+          # pip install torch || true
 
-      - name: Install heavy local-LLM deps (optional)
-        if: ${{ github.event.inputs.install_local_llm == 'true' }}
+      - name: Show environment (debug)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential cmake libgomp1 libopenblas-dev || true
-          python -m pip install --upgrade pip setuptools wheel
-          python -m pip install --prefer-binary "huggingface-hub>=0.18.4" "transformers[torch]>=4.35.2" accelerate safetensors sentencepiece || true
-          python -m pip install --prefer-binary --extra-index-url https://download.pytorch.org/whl/cpu torch || true
-          python -m pip install --prefer-binary "llama-cpp-python" || true
+          echo "HF_TOKEN set? -> ${HF_TOKEN:+YES}"
+          echo "MODEL_DEST_PATH -> $MODEL_DEST_PATH"
+          echo "REPO_ID -> $REPO_ID"
+          echo "SELECT_STRATEGY -> $SELECT_STRATEGY"
+          python -c "import psutil,sys; print('Total RAM GB:', psutil.virtual_memory().total/1024**3 if 'psutil' in sys.modules else 'psutil missing')"
 
-      - name: Download model (anonymous then authenticated if needed)
-        id: download-model
-        if: ${{ github.event.inputs.download_model == 'true' }}
+      - name: Run download & test script
+        run: |
+          python3 test_local_llm.py
         env:
-          INPUT_USE_HF_TOKEN: ${{ github.event.inputs.use_hf_token }}
-          INPUT_HF_TOKEN_PUBLIC: ${{ github.event.inputs.hf_token_public }}
-          # repo secret is available but only used if INPUT_USE_HF_TOKEN == 'true'
-          REPO_HF_TOKEN: ${{ secrets.HF_TOKEN || '' }}
-        run: |
-          set -euo pipefail
-          MODEL_DIR=/mnt/models
-          mkdir -p "$MODEL_DIR"
-          MODEL_FILE="${{ github.event.inputs.model_filename }}"
-          TARGET="$MODEL_DIR/$MODEL_FILE"
-          if [ -f "$TARGET" ]; then
-            echo "downloaded=true" >> $GITHUB_OUTPUT
-            echo "path=$TARGET" >> $GITHUB_OUTPUT
-            exit 0
-          fi
+          HF_TOKEN: ${{ github.event.inputs.hf_key }}
+          MODEL_DEST_PATH: ${{ github.workspace }}/models/mistral-small-3.1.gguf
+          REPO_ID: ggml-org/Mistral-Small-3.1-24B-Instruct-2503-GGUF
 
-          REPO="${{ github.event.inputs.model_repo }}"
-          URL="https://huggingface.co/${REPO}/resolve/main/${MODEL_FILE}"
-          echo "Attempting anonymous download from $URL"
-          wget -c "$URL" -O "$TARGET" || true
-          if [ -f "$TARGET" ]; then
-            echo "downloaded=true" >> $GITHUB_OUTPUT
-            echo "path=$TARGET" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-
-          # Determine HF token to use (prefer repo secret if instructed)
-          HF_TOKEN=""
-          if [ "${INPUT_USE_HF_TOKEN:-false}" = "true" ] && [ -n "${REPO_HF_TOKEN:-}" ]; then
-            echo "Using HF token from repository secrets (recommended)."
-            HF_TOKEN="${REPO_HF_TOKEN}"
-          elif [ -n "${INPUT_HF_TOKEN_PUBLIC:-}" ]; then
-            echo "Using HF token provided in workflow_dispatch input (NOT RECOMMENDED; visible in UI)."
-            HF_TOKEN="${INPUT_HF_TOKEN_PUBLIC}"
-          else
-            echo "No HF token available; anonymous download already attempted and failed."
-          fi
-
-          if [ -n "${HF_TOKEN:-}" ]; then
-            echo "Retrying authenticated download..."
-            curl -L -H "Authorization: Bearer ${HF_TOKEN}" "$URL" -o "$TARGET" || true
-            if [ -f "$TARGET" ]; then
-              echo "downloaded=true" >> $GITHUB_OUTPUT
-              echo "path=$TARGET" >> $GITHUB_OUTPUT
-              exit 0
-            fi
-          fi
-
-          echo "downloaded=false" >> $GITHUB_OUTPUT
-
-      - name: Upload model artifact (optional)
-        if: ${{ github.event.inputs.use_model_artifact == 'true' && steps.download-model.outputs.downloaded == 'true' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: llm-model-${{ github.run_id }}
-          path: ${{ steps.download-model.outputs.path }}
-
-      - name: Show model file (verify)
-        run: |
-          if [ -f "/mnt/models/${{ github.event.inputs.model_filename }}" ]; then
-            echo "Model present:" && ls -lh "/mnt/models/${{ github.event.inputs.model_filename }}"
-            file "/mnt/models/${{ github.event.inputs.model_filename }}" || true
-            sha256sum "/mnt/models/${{ github.event.inputs.model_filename }}" | cut -c1-64 || true
-          else
-            echo "Model not present at /mnt/models/${{ github.event.inputs.model_filename }}"
-          fi
-        continue-on-error: true
-
-      - name: Run your scripts (llm + pipeline)
-        working-directory: Script_Drive1
+      - name: Run your script (llm)
         env:
-          REQUIRE_LOCAL: ${{ github.event.inputs.require_local }}
-          LOCAL_MODEL_PATH: "/mnt/models/${{ github.event.inputs.model_filename }}"
-          LOCAL_DEVICE: "cpu"
-          LOCAL_BACKEND: "llama_cpp"
-          # HF token selection: we still expose repo secret here but only used if INPUT_USE_HF_TOKEN == 'true'
-          REPO_HF_TOKEN: ${{ secrets.HF_TOKEN || '' }}
-          INPUT_USE_HF_TOKEN: ${{ github.event.inputs.use_hf_token }}
-          INPUT_HF_TOKEN_PUBLIC: ${{ github.event.inputs.hf_token_public }}
           R_HOURS: "6"
         run: |
-          # Compute ALLOW_FALLBACK from REQUIRE_LOCAL
-          if [ "${REQUIRE_LOCAL:-false}" = "true" ]; then
-            ALLOW_FALLBACK=false
-          else
-            ALLOW_FALLBACK=true
-          fi
-
-          # Decide HF_TOKEN (prefer repo secret when requested)
-          HF_TOKEN=""
-          if [ "${INPUT_USE_HF_TOKEN:-false}" = "true" ] && [ -n "${REPO_HF_TOKEN:-}" ]; then
-            HF_TOKEN="${REPO_HF_TOKEN}"
-          elif [ -n "${INPUT_HF_TOKEN_PUBLIC:-}" ]; then
-            HF_TOKEN="${INPUT_HF_TOKEN_PUBLIC}"
-          fi
-
-          echo "REQUIRE_LOCAL=$REQUIRE_LOCAL"
-          echo "ALLOW_FALLBACK=$ALLOW_FALLBACK"
-          echo "LOCAL_MODEL_PATH=$LOCAL_MODEL_PATH"
-          # Export so Python code can read them
-          export LOCAL_MODEL="$LOCAL_MODEL_PATH"
-          export LOCAL_BACKEND="$LOCAL_BACKEND"
-          export LOCAL_DEVICE="$LOCAL_DEVICE"
-          export REQUIRE_LOCAL="$REQUIRE_LOCAL"
-          export ALLOW_FALLBACK="$ALLOW_FALLBACK"
-          export HF_TOKEN="$HF_TOKEN"
+          cd Script_Drive
           python llm.py
 
       - name: Upload debug artifacts (if present)
@@ -209,10 +80,4 @@ jobs:
             Script_Drive1/*.log
             Script_Drive1/youtube_response/**
             Script_Drive1/narration_response/**
-
-      - name: Show disk (end)
-        if: always()
-        run: |
-          echo "=== end disk ==="
-          df -h
-          du -sh /mnt/* 2>/dev/null || true
+      

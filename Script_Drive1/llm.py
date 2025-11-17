@@ -23,10 +23,7 @@ import re
 import ast
 import math
 import difflib
-import subprocess
-import importlib
-from types import SimpleNamespace
-from typing import Optional, List, Dict, Any, Callable
+from typing import Optional, List, Dict
 from threading import Thread, Event
 from datetime import datetime
 
@@ -61,1007 +58,157 @@ class LoadingSpinner:
             self.thread.join()
 
 
-# ---------------------- LOCAL LLM ADAPTER + CHAT API HANDLER (REPLACEMENT) ----------------------
-
-try:
-    LoadingSpinner  # type: ignore
-except Exception:
-
-    class LoadingSpinner:
-        def __init__(self, msg=""):
-            self.msg = msg
-
-        def start(self):
-            pass
-
-        def stop(self):
-            pass
-
-
-class LocalLLM:
-    """
-    Generic LocalLLM adapter supporting multiple local backends:
-      - "llama_cpp" (llama-cpp-python, for ggml/.bin/.gguf)
-      - "vllm" (if installed and model available)
-      - "transformers" (HF transformers pipeline)
-      - "tgi" (text-generation-inference HTTP endpoint)
-      - "webui" (text-generation-webui HTTP endpoint)
-      - "subprocess" (generic CLI binary: llama.cpp, ggml runner, or any CLI that accepts prompt and returns text)
-    Behavior:
-      - If backend is specified, it will try only that backend (unless 'auto_try_others' True).
-      - If backend is None, it will auto-detect & try backends in order: llama_cpp -> vllm -> transformers -> tgi/http -> webui -> subprocess.
-      - If require_local=True, initialization failing will raise RuntimeError (no fallback).
-    Usage:
-      llm = LocalLLM(local_model="path-or-hf-id-or-gguf-file", device="cpu", backend=None, require_local=True, hf_token=os.getenv("HF_TOKEN"))
-      llm.is_ready(); llm.generate("Hello", max_new_tokens=128)
-    """
-
-    # default backend preference order if backend not explicitly provided
-    DEFAULT_BACKEND_ORDER = [
-        "llama_cpp",
-        "vllm",
-        "transformers",
-        "tgi_http",
-        "webui_http",
-        "subprocess",
-    ]
-
-    def __init__(
-        self,
-        local_model: Optional[str] = None,
-        device: Optional[str] = None,
-        backend: Optional[str] = None,
-        preferred_backends: Optional[List[str]] = None,
-        hf_token: Optional[str] = None,
-        max_new_tokens: int = 512,
-        require_local: bool = False,
-        auto_try_others: bool = True,
-        cli_cmd_template: Optional[
-            str
-        ] = None,  # for subprocess backend, e.g. "llama --model {model} --prompt '{prompt}'"
-    ):
-        self.local_model = local_model
-        self.device = device or os.environ.get("LOCAL_LLM_DEVICE", None)
-        self.backend = backend
-        self.preferred_backends = preferred_backends or []
-        self.hf_token = hf_token or os.environ.get("HF_TOKEN", None)
-        self.max_new_tokens = max_new_tokens
-        self.require_local = require_local
-        self.auto_try_others = auto_try_others
-        self.cli_cmd_template = cli_cmd_template
-        self._backend_name: Optional[str] = None
-        self._generator: Optional[Callable[..., str]] = None
-        self._meta = {}
-        if local_model:
-            self._init_dynamic()
-
-    def is_ready(self) -> bool:
-        """
-        Unified readiness check used by ChatAPI / StoryPipeline.
-        Returns True when the adapter has an initialized generator/backend or an explicit ready flag.
-        This works across the different LocalLLM variants present in the file.
-        """
-        try:
-            # Common ready indicators used in different implementations:
-            if getattr(self, "_ready", False):
-                return True
-            if getattr(self, "_generator", None) is not None:
-                return True
-            if getattr(self, "generator", None) is not None:
-                return True
-            # fallback: if a backend name/meta exists, assume initialized
-            if getattr(self, "_backend_name", None):
-                return True
-            # otherwise not ready
-            return False
-        except Exception:
-            return False
-
-    # ------- public helpers -------
-    def _init_dynamic(self):
-        """
-        Try to initialize a backend based on explicit backend, preferred list, or autodetect.
-        """
-        # detect if the local_model is a file and if its extension suggests a gguf/ggml/ckpt binary
-        is_local_file = isinstance(self.local_model, str) and os.path.isfile(
-            self.local_model
-        )
-        file_ext = (
-            os.path.splitext(self.local_model)[1].lower() if is_local_file else ""
-        )
-
-        # file extensions that are *not* suitable for transformers pipeline as a repo id
-        BINARY_EXTS = {".gguf", ".bin", ".safetensors", ".pt", ".ckpt", ".pth", ".ggml"}
-
-        # build try order (start from explicit backend & preferred_backends)
-        order: List[str] = []
-        if self.backend:
-            order.append(self.backend)
-        order += self.preferred_backends
-
-        # Append defaults skipping duplicates
-        for b in self.DEFAULT_BACKEND_ORDER:
-            if b not in order:
-                order.append(b)
-
-        # If model is a binary file (gguf, ggml, safetensors, ckpt etc.), bias to llama_cpp/subprocess.
-        # Also ensure we don't let transformers attempt to treat the file path as an HF repo id.
-        try:
-            if is_local_file and file_ext in BINARY_EXTS:
-                # move or insert llama_cpp to front
-                if "llama_cpp" in order:
-                    order.remove("llama_cpp")
-                order.insert(0, "llama_cpp")
-                # put subprocess high (useful if llama_cpp package not installed)
-                if "subprocess" in order:
-                    order.remove("subprocess")
-                order.insert(1, "subprocess")
-                # push transformers later so it won't try to use a binary file as repo id
-                if "transformers" in order:
-                    order.remove("transformers")
-                    order.append("transformers")
-        except Exception:
-            pass
-
-    def _try_init_vllm(self) -> bool:
-        """Try vLLM if installed: 'vllm' package."""
-        try:
-            mod = importlib.import_module("vllm")
-        except Exception:
-            return False
-        if not self.local_model:
-            return False
-        # vllm usage: model = vllm.Model.from_pretrained(model_name_or_path)
-        from vllm import Model  # type: ignore
-
-        model = Model.from_pretrained(self.local_model)
-
-        def gen(prompt, max_new_tokens=512, timeout=300, **kw):
-            # create a generation request and read the first output text
-            gen_kwargs = dict(max_tokens=max_new_tokens)
-            outputs = model.generate(prompt, **gen_kwargs)
-            # vLLM yields a generator of responses, join tokens
-            final = []
-            for r in outputs:
-                final.append(r.text)
-                break
-            return "".join(final)
-
-        self._generator = gen
-        self._meta["notes"] = "vLLM Model.from_pretrained"
-        self._meta["vllm_model"] = getattr(model, "name", None)
-        return True
-
-    def _try_init_transformers(self) -> bool:
-        """
-        Try to use HuggingFace transformers pipeline or a local model folder.
-
-        Behavior:
-        - If `local_model` is a path to a GGUF/ggml/bin/safetensors file, return False (transformers can't load that).
-        - If `local_model` is a directory, load with from_pretrained().
-        - If `local_model` looks like a HF repo id (contains '/'), try to load remotely (honoring self.hf_token).
-        - Uses `trust_remote_code=True` for flexible model repos, but only when loading from HF.
-        Returns True on success and sets self._generator, otherwise False.
-        """
-        try:
-            import importlib, os, json
-
-            mod = importlib.import_module("transformers")
-        except Exception:
-            # transformers not installed
-            return False
-
-        if not self.local_model:
-            return False
-
-        # If user provided a local single-file model (gguf/bin/pt/safetensors) -> transformers can't load this
-        if isinstance(self.local_model, str) and os.path.isfile(self.local_model):
-            ext = os.path.splitext(self.local_model)[1].lower()
-            if ext in {
-                ".gguf",
-                ".ggml",
-                ".bin",
-                ".pt",
-                ".ckpt",
-                ".pth",
-                ".safetensors",
-            }:
-                # transformers can't load single binary model files; let other backends handle this
-                return False
-
-        try:
-            # Lazy import heavy classes
-            from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM
-
-            hf_kwargs = {}
-            if getattr(self, "hf_token", None):
-                hf_kwargs["use_auth_token"] = self.hf_token
-
-            # If it's a local directory, load the model & tokenizer from that directory
-            if os.path.isdir(self.local_model):
-                try:
-                    model = AutoModelForCausalLM.from_pretrained(
-                        self.local_model, **hf_kwargs
-                    )
-                    tokenizer = AutoTokenizer.from_pretrained(
-                        self.local_model, **hf_kwargs
-                    )
-                    gen_pipe = pipeline(
-                        "text-generation",
-                        model=model,
-                        tokenizer=tokenizer,
-                        device=(
-                            0
-                            if (self.device and "cuda" in str(self.device).lower())
-                            else -1
-                        ),
-                    )
-                except Exception:
-                    # local folder might still require remote code - try with trust_remote_code
-                    gen_pipe = pipeline(
-                        "text-generation",
-                        model=self.local_model,
-                        tokenizer=self.local_model,
-                        trust_remote_code=True,
-                        **hf_kwargs,
-                    )
-            else:
-                # likely a HF repo id like 'mistralai/Mistral-Small-3.1-24B-Instruct-2503'
-                gen_pipe = pipeline(
-                    "text-generation",
-                    model=self.local_model,
-                    tokenizer=self.local_model,
-                    trust_remote_code=True,
-                    **hf_kwargs,
-                )
-
-            # Wrap pipeline into a consistent generator function
-            def gen(prompt, max_new_tokens=512, timeout=300, **kw):
-                args = {"max_new_tokens": max_new_tokens}
-                args.update(
-                    {
-                        k: kw[k]
-                        for k in ("do_sample", "temperature", "top_k", "top_p")
-                        if k in kw
-                    }
-                )
-                out = gen_pipe(prompt, **args)
-                if isinstance(out, list) and out:
-                    first = out[0]
-                    if isinstance(first, dict):
-                        for k in ("generated_text", "text", "content", "response"):
-                            if k in first and isinstance(first[k], str):
-                                return first[k]
-                        # fallback to stringify dictionary
-                        return json.dumps(first, ensure_ascii=False)
-                if isinstance(out, dict):
-                    for k in ("generated_text", "text", "content", "response"):
-                        if k in out and isinstance(out[k], str):
-                            return out[k]
-                    return json.dumps(out, ensure_ascii=False)
-                return str(out)
-
-        except Exception as e:
-            try:
-                print(f"⚠️ transformers backend init failed: {e}", flush=True)
-            except Exception:
-                pass
-            return False
-
-        # success
-        self._generator = gen
-        self._meta["notes"] = f"transformers pipeline (model={self.local_model})"
-        return True
-
-    def _try_init_tgi_http(self) -> bool:
-        """Try a text-generation-inference HTTP endpoint (TGI). Expect env or use 'local_model' as base URL if it looks like URL."""
-        import requests  # ensure available
-
-        # detect base url
-        base = None
-        # if local_model is full URL -> treat as endpoint
-        if isinstance(self.local_model, str) and (
-            self.local_model.startswith("http://")
-            or self.local_model.startswith("https://")
-        ):
-            base = self.local_model.rstrip("/")
-        else:
-            # common local default port for tgi
-            base = os.environ.get("TGI_URL", None) or "http://127.0.0.1:8080"
-        # test endpoint /generate
-        try:
-            test = requests.post(f"{base}/generate", json={"prompt": "hi"}, timeout=3)
-            if test.status_code not in (200, 201, 202):
-                # could still be a different API; accept only 200-ish
-                return False
-
-            def gen(prompt, max_new_tokens=512, timeout=300, **kw):
-                payload = {"prompt": prompt, "max_new_tokens": max_new_tokens}
-                resp = requests.post(
-                    f"{base}/generate", json=payload, timeout=timeout or 300
-                )
-                try:
-                    j = resp.json()
-                except Exception:
-                    return resp.text
-                # try common slots
-                if isinstance(j, dict):
-                    if "results" in j and j["results"]:
-                        return j["results"][0].get(
-                            "text", json.dumps(j, ensure_ascii=False)
-                        )
-                    for k in ("generated_text", "text", "response", "result"):
-                        if k in j:
-                            return j[k]
-                    if "choices" in j and j["choices"]:
-                        c = j["choices"][0]
-                        return (
-                            c.get("text")
-                            or c.get("message")
-                            or json.dumps(c, ensure_ascii=False)
-                        )
-                return json.dumps(j, ensure_ascii=False)
-
-            self._generator = gen
-            self._meta["notes"] = f"tgi_http at {base}"
-            return True
-        except Exception:
-            return False
-
-    def _try_init_webui_http(self) -> bool:
-        """Try text-generation-webui HTTP endpoints (gradio). Common base: http://127.0.0.1:7860"""
-        import requests
-
-        base = os.environ.get("WEBUI_URL", None) or "http://127.0.0.1:7860"
-        # try /api/prompt or /api/v1/generate
-        try_urls = [
-            f"{base}/api/prompt",
-            f"{base}/api/v1/generate",
-            f"{base}/run/predict",
-        ]
-        for u in try_urls:
-            try:
-                r = requests.get(u, timeout=3)
-                if r.status_code < 400:
-                    # build a wrapper based on the endpoint patterns
-                    def gen(prompt, max_new_tokens=512, timeout=300, **kw):
-                        # attempt different POST payloads depending on endpoint
-                        if u.endswith("/api/prompt"):
-                            payload = {"prompt": prompt}
-                            r = requests.post(u, json=payload, timeout=timeout)
-                            try:
-                                j = r.json()
-                                # parse heuristics
-                                if isinstance(j, dict):
-                                    if "data" in j and j["data"]:
-                                        return str(j["data"])
-                                return r.text
-                            except Exception:
-                                return r.text
-                        if u.endswith("/api/v1/generate"):
-                            payload = {"prompt": prompt}
-                            r = requests.post(u, json=payload, timeout=timeout)
-                            try:
-                                j = r.json()
-                                if isinstance(j, dict) and "results" in j:
-                                    return j["results"][0].get("text", r.text)
-                                return r.text
-                            except Exception:
-                                return r.text
-                        # fallback: POST then return text
-                        r = requests.post(u, json={"data": [prompt]}, timeout=timeout)
-                        return r.text
-
-                    self._generator = gen
-                    self._meta["notes"] = f"webui_http at {u}"
-                    return True
-            except Exception:
-                continue
-        return False
-
-    def _try_init_subprocess(self) -> bool:
-        """
-        Generic subprocess backend: uses a CLI tool that accepts a prompt and prints output.
-        Requires cli_cmd_template or environment LOCAL_LLM_CLI. Template must include {model} and {prompt}.
-        Example: LOCAL_LLM_CLI="llama -m {model} -p '{prompt}' -n {max_new_tokens}"
-        """
-        cmd_template = self.cli_cmd_template or os.environ.get("LOCAL_LLM_CLI", None)
-        if not cmd_template:
-            return False
-        # quick test run (with short prompt)
-        try:
-            test_cmd = cmd_template.format(
-                model=self.local_model, prompt="Hello", max_new_tokens=8
-            )
-            p = subprocess.run(test_cmd, shell=True, capture_output=True, timeout=5)
-            if p.returncode != 0:
-                # still accept? no
-                return False
-
-            def gen(prompt, max_new_tokens=512, timeout=300, **kw):
-                cmd = cmd_template.format(
-                    model=self.local_model, prompt=prompt, max_new_tokens=max_new_tokens
-                )
-                p = subprocess.run(
-                    cmd, shell=True, capture_output=True, timeout=timeout
-                )
-                out = p.stdout.decode("utf-8", errors="ignore")
-                return out.strip()
-
-            self._generator = gen
-            self._meta["notes"] = f"subprocess cmd_template"
-            return True
-        except Exception:
-            return False
-
-    # optional: allow user to list which backends are available in env
-    @staticmethod
-    def list_available_backends() -> List[str]:
-        av = []
-        for name in LocalLLM.DEFAULT_BACKEND_ORDER:
-            try:
-                if name == "llama_cpp":
-                    importlib.import_module("llama_cpp")
-                    av.append("llama_cpp")
-                elif name == "vllm":
-                    importlib.import_module("vllm")
-                    av.append("vllm")
-                elif name == "transformers":
-                    importlib.import_module("transformers")
-                    av.append("transformers")
-                elif name in ("tgi_http", "webui_http"):
-                    # HTTP backends are assumed available if 'requests' is present
-                    importlib.import_module("requests")
-                    av.append(name)
-            except Exception:
-                continue
-        return av
-
-
-# Backwards-compatible ChatAPI wrapper (keeps remote retry/backoff/infinite loop)
+# ---------------------- CHAT API HANDLER ----------------------
 class ChatAPI:
     def __init__(
-        self,
-        url: str = "https://apifreellm.com/api/chat",
-        default_timeout: int = 100,
-        local_model: Optional[str] = None,
-        local_device: Optional[str] = None,
-        local_backend: Optional[str] = None,  # <-- added
-        hf_token: Optional[str] = None,  # <-- added
-        require_local: bool = False,
-        require_remote: bool = False,
-        allow_fallback: bool = False,
+        self, url: str = "https://apifreellm.com/api/chat", default_timeout: int = 100
     ):
-        """
-        ChatAPI constructor.
-        - local_model: name or path for a local HF-compatible model (e.g. "mistral-small-3.1")
-        - require_local: if True, insist on local-only; if local init fails, raise immediately (no remote fallback).
-        - require_remote: if True, force remote-only usage even if local is available.
-        - allow_fallback: if True, allow fallback between local <-> remote; otherwise prefer single-mode:
-            * If local_model is provided and allow_fallback is False => treat as require_local by default.
-            * If no local_model provided, remote usage is used (require_remote=False).
-        """
-        import requests  # expected to be available in original codebase
-
-        self.requests = requests
         self.url = url
         self.headers = {"Content-Type": "application/json"}
         self.base_timeout = default_timeout
-        self.local_backend = local_backend
-        self.hf_token = hf_token
-
-        # Mode flags
-        self.require_local = bool(require_local)
-        self.require_remote = bool(require_remote)
-        self.allow_fallback = bool(allow_fallback)
-
-        # If caller provided a local_model and did not explicitly allow fallback,
-        # interpret that as they want local-only behavior (no silent remote fallback).
-        if local_model and not self.allow_fallback and not require_remote:
-            # prefer local-only by default when user explicitly asked for local_model
-            self.require_local = True
-            self.require_remote = False
-
-        # store wanted local model/device
-        self.local_model = local_model
-        self.local_device = local_device
-        self.local_llm: Optional[LocalLLM] = None
-
-        # we're not in strict remote-only mode.
-        if self.local_model and not self.require_remote:
-            try:
-                print(
-                    f"🔎 Attempting to initialize local model '{self.local_model}' on device='{self.local_device}'."
-                )
-
-                # If user supplied a path-like local_model, check file existence first
-                is_path_like = isinstance(self.local_model, str) and (
-                    self.local_model.startswith("/") or os.path.sep in self.local_model
-                )
-                file_exists = False
-                if is_path_like and self.local_model:
-                    file_exists = os.path.isfile(self.local_model)
-
-                if is_path_like and not file_exists:
-                    msg = f"Local model file not found on disk: {self.local_model!r}"
-                    if self.require_local:
-                        raise RuntimeError(
-                            msg
-                            + "\n\nSuggestions:\n - place the model file at that path,\n - or set require_local=False (allow remote fallback),\n - or set local_model to a HF repo id and provide hf_token to enable remote download."
-                        )
-                    else:
-                        print(f"⚠️ {msg} — will fall back to remote API.")
-                        self.local_llm = None
-                else:
-                    # construct LocalLLM respecting flags and backend choices
-                    self.local_llm = LocalLLM(
-                        local_model=self.local_model,
-                        device=self.local_device or "cpu",
-                        backend=getattr(self, "local_backend", None),
-                        preferred_backends=["llama_cpp", "transformers"],
-                        hf_token=getattr(self, "hf_token", None),
-                        max_new_tokens=256,
-                        require_local=bool(self.require_local),
-                        auto_try_others=not bool(self.require_local),
-                    )
-
-                    # If the chosen LocalLLM failed to initialize
-                    if not getattr(self.local_llm, "is_ready", lambda: False)():
-                        if self.require_local:
-                            raise RuntimeError(
-                                "Local model specified but failed to initialize and 'require_local' is set."
-                            )
-                        else:
-                            print(
-                                "⚠️ Local model specified but failed to initialize. Will fall back to remote API."
-                            )
-                            self.local_llm = None
-                            # one repair/retry attempt (best-effort)
-                            try:
-                                self._attempt_local_repair_and_retry()
-                            except Exception:
-                                pass
-
-            except Exception as e:
-                print("⚠️ Error initializing LocalLLM:", e)
-                if self.require_local:
-                    # re-raise to preserve strict behavior when require_local is requested
-                    raise
-                self.local_llm = None
 
     def send_message(
         self,
         message: str,
-        timeout: int = None,
-        spinner_message: str = "Waiting for response.",
-        initial_backoff: float = 2.0,
+        timeout: Optional[int] = None,
+        retry_forever: bool = True,
+        retry_on_client_errors: bool = False,
+        initial_backoff: float = 1.0,
         max_backoff: float = 8.0,
-        timeout_growth: int = 100,
-        max_timeout_cap: int = 1000000,
-        use_cloudscraper_on_403: bool = True,
-        use_playwright_on_403: bool = False,
-        use_curl_impersonate: bool = True,
-        proxy: str = None,
-        specific_error: list = None,
-    ):
+        spinner_message: str = "Waiting for response...",
+    ) -> str:
         """
-        Robust send_message preserving infinite retry semantics and adding:
-        - proxy rotation when proxies fail,
-        - cloudscraper fallback on Cloudflare/403,
-        - Playwright stealth fallback (if available and enabled),
-        - optional curl impersonation fallback.
-
-        NOTE: This replaces the original block that used a f-string containing backslashes
-        inside an expression (caused the SyntaxError). The fix builds JS-safe strings
-        first (via json.dumps) and then constructs the JS snippet.
+        Robust POST with backoff and optional per-call timeout.
+        Returns the raw response text or raises RuntimeError on fatal client error.
         """
-        import requests
-        import traceback
-        import subprocess
-        import json
-        import random
-        from requests.exceptions import ProxyError as ReqProxyError, RequestException
-
-        if specific_error is None:
-            specific_error: list = [
-                "response status: 403",
-                "detected cloudflare-like anti-bot page",
-                "Response status=403 length=9245",
-                "Detected HTML challenge",
-                "Cloudflare-like content",
-                "Response status=403",
-                "cloudflare",
-                "detected cloudflare",
-                "access denied",
-                "anti-bot",
-            ]
-        specific_error = [s.lower() for s in specific_error]
-
-        def log(*args, **kwargs):
-            ts = time.strftime("%H:%M:%S")
-            kwargs.setdefault("flush", True)
-            print(f"[{ts}]", *args, **kwargs)
-
-        configured_timeout = int(timeout or getattr(self, "base_timeout", 60))
-        configured_timeout = min(configured_timeout, max_timeout_cap)
+        spinner = LoadingSpinner(spinner_message)
         attempt = 0
+        timeout = timeout or self.base_timeout
         backoff = initial_backoff
-
-        # pick initial proxy (argument overrides instance)
-        current_proxy = proxy or getattr(self, "_current_proxy", None)
-
-        # local helper to mark bad proxy
-        def _mark_bad_proxy_local(p):
-            try:
-                if not p:
-                    return
-                pool = getattr(self, "_proxy_pool", None)
-                if pool and p in pool:
-                    pool = [x for x in pool if x != p]
-                    self._proxy_pool = pool
-                    log("🗑️ Removed bad proxy from pool:", p, "remaining:", len(pool))
-                if getattr(self, "_current_proxy", None) == p:
-                    self._current_proxy = None
-            except Exception:
-                pass
-
-        # spinner
-        spinner = None
-        if spinner_message:
-            try:
-                spinner = LoadingSpinner(spinner_message)
-                spinner.start()
-            except Exception:
-                pass
-
-        # optional imports
-        try:
-            import cloudscraper
-        except Exception:
-            cloudscraper = None
-
-        PLAYWRIGHT_AVAILABLE = False
-        if use_playwright_on_403:
-            try:
-                from playwright.sync_api import sync_playwright
-
-                PLAYWRIGHT_AVAILABLE = True
-            except Exception:
-                PLAYWRIGHT_AVAILABLE = False
-
-        session = None
+        start_time = time.monotonic()
 
         while True:
             attempt += 1
             try:
-                log(
-                    f"Attempt #{attempt} — timeout={configured_timeout}s — proxy={current_proxy}"
+                print(f"\nAttempt #{attempt} — timeout={timeout}s — sending request...")
+                spinner.start()
+                resp = requests.post(
+                    self.url,
+                    headers=self.headers,
+                    json={"message": message},
+                    timeout=timeout,
                 )
-                # build headers + proxy tuple from instance helper (if present)
-                try:
-                    if hasattr(self, "_pick_proxy_and_headers"):
-                        prx, headers = self._pick_proxy_and_headers()
-                        current_proxy = prx or current_proxy
-                    else:
-                        headers = dict(
-                            getattr(
-                                self, "headers", {"Content-Type": "application/json"}
-                            )
-                        )
-                        # mild UA impersonation
-                        headers["User-Agent"] = headers.get(
-                            "User-Agent",
-                            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-                        )
-                except Exception:
-                    headers = dict(
-                        getattr(self, "headers", {"Content-Type": "application/json"})
+                spinner.stop()
+
+                status = resp.status_code
+
+                if status == 429 or 500 <= status < 600:
+                    print(
+                        f"⚠️ Server/Rate error HTTP {status}. Backing off {backoff:.1f}s and retrying..."
                     )
-
-                # create session if needed and avoid env proxies
-                if session is None:
-                    session = requests.Session()
-                    try:
-                        session.trust_env = False
-                    except Exception:
-                        pass
-                    if current_proxy:
-                        p = str(current_proxy)
-                        if not (
-                            p.startswith("http://")
-                            or p.startswith("https://")
-                            or p.startswith("socks5://")
-                            or p.startswith("socks4://")
-                        ):
-                            p = "http://" + p
-                        session.proxies.update({"http": p, "https": p})
-
-                # perform HTTP request (wrapped so we can safely catch network-level errors)
-                try:
-                    spinner and spinner.start()
-                    r = session.post(
-                        self.url,
-                        headers=headers,
-                        json={"message": message},
-                        timeout=(10, min(configured_timeout, 300)),
-                    )
-                    spinner and spinner.stop()
-                except Exception as e:
-                    spinner and spinner.stop()
-                    # network-level failure -> mark proxy bad when appropriate and retry
-                    log(
-                        f"⚠️ Network exception on attempt #{attempt}: {type(e).__name__} — {getattr(e, 'args', '')}"
-                    )
-                    log(traceback.format_exc())
-                    if current_proxy:
-                        _mark_bad_proxy_local(current_proxy)
-                        current_proxy = None
-                        try:
-                            # pick next proxy (best-effort)
-                            if getattr(self, "_proxy_pool", None):
-                                current_proxy = self._proxy_pool[
-                                    getattr(self, "_proxy_index", 0)
-                                    % max(1, len(self._proxy_pool))
-                                ]
-                                self._proxy_index = (
-                                    getattr(self, "_proxy_index", 0) + 1
-                                ) % max(1, len(self._proxy_pool))
-                                self._current_proxy = current_proxy
-                        except Exception:
-                            pass
-                    time.sleep(backoff + random.random())
-                    backoff = min(backoff * 2, max_backoff)
-                    continue
-
-                # Normal response handling
-                status = getattr(r, "status_code", None)
-                body = getattr(r, "text", "") or ""
-                headers_resp = r.headers or {}
-
-                # detect cloudflare-like or specific error in body
-                lower_body = (body or "").lower()
-                matched_specific = any(tok in lower_body for tok in specific_error) or (
-                    status == 403
-                )
-
-                # If proxy-level failure detected -> mark proxy bad and rotate
-                if (
-                    isinstance(r, requests.Response) and status in (502, 503, 504)
-                ) or matched_specific:
-                    log(
-                        f"⚠️ Detected problematic response (status={status}). matched_specific={matched_specific}"
-                    )
-                    if current_proxy:
-                        _mark_bad_proxy_local(current_proxy)
-                        current_proxy = None
-                        # try to pick new proxy
-                        try:
-                            if getattr(self, "_proxy_pool", None):
-                                current_proxy = self._proxy_pool[
-                                    getattr(self, "_proxy_index", 0)
-                                    % max(1, len(self._proxy_pool))
-                                ]
-                                self._proxy_index = (
-                                    getattr(self, "_proxy_index", 0) + 1
-                                ) % max(1, len(self._proxy_pool))
-                                self._current_proxy = current_proxy
-                        except Exception:
-                            pass
-
-                    # cloudscraper fallback
-                    if (
-                        matched_specific
-                        and use_cloudscraper_on_403
-                        and cloudscraper is not None
-                    ):
-                        try:
-                            log(
-                                "→ Detected 403/challenge; attempting cloudscraper fallback (using current proxy if present)."
-                            )
-                            cs = cloudscraper.create_scraper()
-                            if current_proxy:
-                                p = str(current_proxy)
-                                if not (
-                                    p.startswith("http://")
-                                    or p.startswith("https://")
-                                    or p.startswith("socks5://")
-                                    or p.startswith("socks4://")
-                                ):
-                                    p = "http://" + p
-                                cs.proxies.update({"http": p, "https": p})
-                            cs.headers.update(headers)
-                            cs_resp = cs.post(
-                                self.url,
-                                json={"message": message},
-                                timeout=(10, min(configured_timeout, 300)),
-                            )
-                            if cs_resp.status_code == 200:
-                                log(
-                                    "✅ cloudscraper succeeded; returning cloudscraper response."
-                                )
-                                try:
-                                    return cs_resp.json()
-                                except Exception:
-                                    return cs_resp.text
-                            else:
-                                log(
-                                    "⚠️ cloudscraper fallback returned status",
-                                    cs_resp.status_code,
-                                )
-                        except Exception as e:
-                            log(
-                                "⚠️ cloudscraper attempt failed:", traceback.format_exc()
-                            )
-                            if current_proxy:
-                                _mark_bad_proxy_local(current_proxy)
-                                current_proxy = None
-                            time.sleep(min(backoff, 4) + random.random())
-                            backoff = min(backoff * 2, max_backoff)
-                            continue
-
-                    # Playwright fallback (if enabled)
-                    if (
-                        matched_specific
-                        and use_playwright_on_403
-                        and PLAYWRIGHT_AVAILABLE
-                    ):
-                        try:
-                            log(
-                                "→ Attempting Playwright stealth fetch to acquire cookies/session."
-                            )
-                            from playwright.sync_api import sync_playwright as _sync_pw
-
-                            with _sync_pw() as pw:
-                                browser = pw.chromium.launch(
-                                    headless=True, args=["--no-sandbox"]
-                                )
-                                context = browser.new_context(
-                                    user_agent=headers.get("User-Agent")
-                                )
-                                page = context.new_page()
-                                # navigate to base url to solve challenge
-                                page.goto(self.url, timeout=30000)
-
-                                # Build JS-escaped / JSON-safe pieces outside of the f-string expression.
-                                # json.dumps gives a JS-safe quoted string (includes surrounding quotes).
-                                js_url = json.dumps(self.url)
-                                js_body = json.dumps({"message": message})
-
-                                fetch_script = (
-                                    f"() => fetch({js_url}, {{"
-                                    f"method: 'POST', headers: {{ 'Content-Type': 'application/json' }},"
-                                    f"body: JSON.stringify({js_body})"
-                                    f"}}).then(r => r.text()).then(t => t).catch(e => String(e));"
-                                )
-
-                                result = page.evaluate(fetch_script)
-                                browser.close()
-                                if result:
-                                    log(
-                                        "✅ Playwright fetch returned content; returning it."
-                                    )
-                                    # try to parse JSON before returning raw string
-                                    try:
-                                        return json.loads(result)
-                                    except Exception:
-                                        return result
-                        except Exception as e:
-                            log("⚠️ Playwright fallback failed:", traceback.format_exc())
-                            # treat this as non-fatal and continue to other fallbacks / retry
-
-                    # optional curl impersonation fallback (lightweight)
-                    if matched_specific and use_curl_impersonate:
-                        try:
-                            log(
-                                "→ Attempting curl impersonation fallback (best-effort)."
-                            )
-                            ua = headers.get(
-                                "User-Agent", "Mozilla/5.0 (X11; Linux x86_64)"
-                            )
-                            curl_cmd = [
-                                "curl",
-                                "-sS",
-                                "-X",
-                                "POST",
-                                "-H",
-                                "Content-Type: application/json",
-                                "-H",
-                                f"User-Agent: {ua}",
-                                "-d",
-                                json.dumps({"message": message}),
-                                self.url,
-                            ]
-                            if current_proxy:
-                                curl_cmd.insert(-1, "--proxy")
-                                curl_cmd.insert(-1, f"http://{current_proxy}")
-                            out = subprocess.check_output(
-                                curl_cmd,
-                                stderr=subprocess.STDOUT,
-                                timeout=max(60, configured_timeout),
-                            )
-                            out = out.decode("utf-8", errors="ignore")
-                            if out:
-                                log(
-                                    "✅ curl fallback produced a response; returning it."
-                                )
-                                try:
-                                    return json.loads(out)
-                                except Exception:
-                                    return out
-                        except Exception:
-                            log("⚠️ curl fallback failed:", traceback.format_exc())
-
-                    # else backoff and loop to try next proxy / retry
-                    log(f"⚠️ Backing off {backoff:.1f}s and retrying.")
                     time.sleep(backoff + random.uniform(0, 1.0))
                     backoff = min(backoff * 2, max_backoff)
-                    configured_timeout = min(
-                        configured_timeout + timeout_growth, max_timeout_cap
-                    )
+                    timeout = min(timeout + 100, 100000)
                     continue
 
-                # If we get here, status code is not a 5xx/403 problematic case handled above.
-                # Try parsing JSON if possible
-                parsed = None
-                try:
-                    ct = (headers_resp.get("Content-Type") or "").lower()
-                    if "application/json" in ct or (
-                        isinstance(body, str)
-                        and (
-                            body.strip().startswith("{") or body.strip().startswith("[")
-                        )
-                    ):
-                        parsed = json.loads(body) if body else {}
-                except Exception:
-                    log("⚠️ Failed to parse JSON. Response snippet:")
-                    log((body or "")[:2000])
+                if 400 <= status < 500:
+                    # client error - optionally retry
+                    try:
+                        payload = resp.json()
+                        error_msg = payload.get("error") or json.dumps(payload)
+                    except Exception:
+                        error_msg = resp.text or f"HTTP {status}"
+                    msg = f"HTTP {status} - {error_msg}"
 
-                if parsed and (
-                    (isinstance(parsed, dict) and parsed.get("status") == "success")
-                    or ("message" in parsed and parsed.get("message"))
-                ):
-                    log("✅ API returned success. Returning parsed payload or body.")
-                    self._current_proxy = current_proxy
-                    return parsed
-
-                # If raw body but contains anti-bot markers, rotate/ retry
-                if not parsed and body:
-                    low = (body or "").lower()
-                    if any(err_marker in low for err_marker in specific_error):
-                        log(
-                            f"→ Detected anti-bot / specific error marker in body (attempt {attempt}). Rotating proxy + retrying."
+                    if retry_on_client_errors:
+                        print(
+                            f"⚠️ Client error {msg} — retrying because retry_on_client_errors=True. Backoff {backoff:.1f}s..."
                         )
-                        if current_proxy:
-                            _mark_bad_proxy_local(current_proxy)
-                            current_proxy = None
-                        time.sleep(backoff + random.random())
+                        time.sleep(backoff + random.uniform(0, 1.0))
                         backoff = min(backoff * 2, max_backoff)
-                        configured_timeout = min(
-                            configured_timeout + timeout_growth, max_timeout_cap
-                        )
+                        timeout = min(timeout + 100, 100000)
                         continue
-                    log("→ Returning raw body (non-JSON).")
-                    return body
+                    else:
+                        raise RuntimeError(f"Fatal client error (not retried): {msg}")
 
-                # Last resort: return parsed or raw body
-                if parsed:
-                    return parsed
-                return body
+                # non-error status
+                resp.raise_for_status()
+                try:
+                    result = resp.json()
+                except json.JSONDecodeError as e:
+                    print(
+                        f"⚠️ Invalid JSON received (will retry): {e}. Backing off {backoff:.1f}s..."
+                    )
+                    time.sleep(backoff + random.uniform(0, 1.0))
+                    backoff = min(backoff * 2, max_backoff)
+                    timeout = min(timeout + 100, 100000)
+                    continue
+
+                # Expecting JSON with {status: "success", response: "..."} per original code
+                if isinstance(result, dict) and result.get("status") == "success":
+                    content = result.get("response", "")
+                    if content is None:
+                        content = ""
+                    elapsed = int(time.monotonic() - start_time)
+                    print(f"✅ Success on attempt #{attempt} (elapsed {elapsed}s).")
+                    return content
+                else:
+                    # Could be different schema; we'll try fallback to string form
+                    err = (
+                        result.get("error")
+                        if isinstance(result, dict)
+                        else f"Unexpected body: {result}"
+                    )
+                    print(
+                        f"⚠️ API returned error or unexpected payload: {err}. Backing off {backoff:.1f}s and retrying..."
+                    )
+                    time.sleep(backoff + random.uniform(0, 1.0))
+                    backoff = min(backoff * 2, max_backoff)
+                    timeout = min(timeout + 100, 100000)
+                    continue
+
+            except requests.exceptions.Timeout as e:
+                spinner.stop()
+                print(
+                    f"\n⚠️ Timeout on attempt #{attempt}: {e}. Backing off {backoff:.1f}s and retrying..."
+                )
+                time.sleep(backoff + random.uniform(0, 1.0))
+                backoff = min(backoff * 2, max_backoff)
+                timeout = min(timeout + 100, 100000)
+                continue
+
+            except (
+                requests.exceptions.ConnectionError,
+                requests.exceptions.RequestException,
+            ) as e:
+                spinner.stop()
+                print(
+                    f"\n⚠️ Network error on attempt #{attempt}: {e}. Backing off {backoff:.1f}s and retrying..."
+                )
+                time.sleep(backoff + random.uniform(0, 1.0))
+                backoff = min(backoff * 2, max_backoff)
+                timeout = min(timeout + 100, 100000)
+                continue
+
+            except RuntimeError:
+                spinner.stop()
+                raise
 
             except Exception as e:
-                log("⚠️ Unexpected error in send_message loop:", traceback.format_exc())
-                time.sleep(backoff + random.random())
-                backoff = min(backoff * 2, max_backoff)
-                configured_timeout = min(
-                    configured_timeout + timeout_growth, max_timeout_cap
+                spinner.stop()
+                print(
+                    f"\n⚠️ Unexpected error on attempt #{attempt}: {e}. Backing off {backoff:.1f}s and retrying..."
                 )
+                time.sleep(backoff + random.uniform(0, 1.0))
+                backoff = min(backoff * 2, max_backoff)
+                timeout = min(timeout + 100, 100000)
                 continue
+
             finally:
-                if spinner:
-                    try:
-                        spinner.stop()
-                    except Exception:
-                        pass
+                try:
+                    spinner.stop()
+                except Exception:
+                    pass
 
 
 # ---------------------- UTILITIES ----------------------
@@ -1184,214 +331,8 @@ class StoryPipeline:
         self,
         api_url: str = "https://apifreellm.com/api/chat",
         default_timeout: int = 100,
-        local_model: str | None = None,
-        local_device: str | None = None,
-        local_backend: Optional[str] = None,
-        hf_token: Optional[str] = None,
-        require_local: bool = False,
-        require_remote: bool = False,
-        allow_fallback: bool = False,
     ):
-        """
-        StoryPipeline initializer (robust, no-feature-removal).
-
-        - local_model: name/path of local LLM to use (e.g. "mistral-small-3.1").
-        - local_device: device for local model ("cpu" or "cuda").
-        - require_local: if True -> local-only (raise if local unavailable).
-        - require_remote: if True -> remote-only (never use local).
-        - allow_fallback: if True -> allow fallback between local and remote on failures.
-
-        Behavior:
-        - If local_model is provided and allow_fallback is False and require_remote is False,
-        default to local-only behavior (require_local=True).
-        - If both require_local and require_remote are True -> raise ValueError.
-        - Attempts to pass local flags into ChatAPI constructor. If ChatAPI doesn't accept them,
-        the constructor falls back to post-construction attribute setting and a one-time
-        local re-init attempt via _attempt_local_repair_and_retry().
-        """
-        # store pipeline-level attributes first
-        self.api_url = api_url
-        self.default_timeout = default_timeout
-        self.local_model = local_model
-        self.local_device = local_device
-        self.local_backend = local_backend
-        self.hf_token = hf_token
-
-        # flags
-        self.require_local = bool(require_local)
-        self.require_remote = bool(require_remote)
-        self.allow_fallback = bool(allow_fallback)
-
-        # If a local_model was provided but the caller did not explicitly allow fallback or
-        # require remote-only, prefer to allow fallback by default rather than enforce local-only.
-        # This avoids hard failures when a given model id is not available locally or on HF
-        # (e.g. shorthand names like "mistral-small-3.1" that may be private or require token).
-        # If callers want strict local-only behavior, they can pass require_local=True explicitly.
-        if (
-            self.local_model
-            and not self.allow_fallback
-            and not self.require_remote
-            and not self.require_local
-        ):
-            # prefer safe fallback behavior by default
-            self.allow_fallback = True
-            self.require_local = False
-            self.require_remote = False
-            print(
-                "ℹ️ local_model was provided but allow_fallback was not set — defaulting to allow remote fallback. "
-                "Pass require_local=True to insist on local-only behavior."
-            )
-
-        if self.require_local and self.require_remote:
-            raise ValueError(
-                "Conflicting options: require_local and require_remote cannot both be True."
-            )
-
-        # Instantiate ChatAPI. Prefer to pass the local/flag args into ChatAPI constructor
-        # so ChatAPI can run its own local init logic in its __init__ if implemented.
-        try:
-            # Prefer constructor signature supporting these extra args (if ChatAPI accepts them)
-            self.chat = ChatAPI(
-                url=self.api_url,
-                default_timeout=self.default_timeout,
-                local_model=self.local_model,
-                local_device=self.local_device,
-                require_local=self.require_local,
-                local_backend=self.local_backend,
-                hf_token=self.hf_token,
-                require_remote=self.require_remote,
-                allow_fallback=self.allow_fallback,
-            )
-        except TypeError:
-            # older ChatAPI may not accept those args — create basic instance then set attributes
-            self.chat = ChatAPI(url=self.api_url, default_timeout=self.default_timeout)
-            # set attributes on chat so send_message / other methods can read them
-            try:
-                self.chat.local_model = self.local_model
-                self.chat.local_device = self.local_device
-                self.chat.require_local = self.require_local
-                self.chat.require_remote = self.require_remote
-                self.chat.allow_fallback = self.allow_fallback
-            except Exception:
-                # fallback to setattr for robustness
-                setattr(self.chat, "local_model", self.local_model)
-                setattr(self.chat, "local_device", self.local_device)
-                setattr(self.chat, "require_local", self.require_local)
-                setattr(self.chat, "require_remote", self.require_remote)
-                setattr(self.chat, "allow_fallback", self.allow_fallback)
-
-            # existing code that tries to initialize LocalLLM should receive backend and hf_token:
-            if self.local_model:
-                try:
-                    self.local_llm = LocalLLM(
-                        local_model=self.local_model,
-                        device=self.local_device,
-                        backend=self.local_backend,
-                        hf_token=self.hf_token,
-                        require_local=self.require_local,
-                        auto_try_others=True,
-                    )
-                    # If require_local is True and local init didn't produce a ready LLM, raise
-                    if (
-                        self.require_local
-                        and not getattr(self.local_llm, "is_ready", lambda: False)()
-                    ):
-                        raise RuntimeError(
-                            "Local model specified but failed to initialize and 'require_local' is set."
-                        )
-                except Exception as e:
-                    # Preserve previous fallback behavior: if require_local -> re-raise; else log and keep local_llm=None
-                    if self.require_local:
-                        raise
-                    else:
-                        print(
-                            "⚠️ Local model initialization failed — will fall back to remote API. Error:",
-                            e,
-                        )
-                        self.local_llm = None
-
-        # Now, post-construction sanity: if require_local is set, ensure local_llm is present and ready
-        local_ready = False
-        try:
-            local_llm_obj = getattr(self.chat, "local_llm", None)
-            if (
-                local_llm_obj
-                and hasattr(local_llm_obj, "is_ready")
-                and local_llm_obj.is_ready()
-            ):
-                local_ready = True
-            # some implementations use a _ready flag
-            elif local_llm_obj and getattr(local_llm_obj, "_ready", False):
-                local_ready = True
-        except Exception:
-            local_ready = False
-
-        if self.require_local and not local_ready:
-            # If we reached here and require_local is True, local didn't initialize earlier.
-            # Attempt one additional best-effort repair/retry before failing hard.
-            try:
-                # try chat-level helper first
-                if hasattr(self.chat, "_attempt_local_repair_and_retry"):
-                    ok = self.chat._attempt_local_repair_and_retry()
-                else:
-                    ok = self._attempt_local_repair_and_retry()
-                if not ok:
-                    raise RuntimeError(
-                        "Local-only requested but local LLM not ready after repair attempt."
-                    )
-            except Exception as e:
-                # fail loudly — no silent fallback when require_local is True
-                raise RuntimeError(
-                    f"Local-only requested but local LLM could not be initialized: {e}"
-                )
-
-        # Final log summary (keeps original logging behavior)
-        mode = (
-            "remote-only"
-            if self.require_remote
-            else (
-                "local-only"
-                if self.require_local
-                else (
-                    "local-preferred with fallback"
-                    if self.allow_fallback and self.local_model
-                    else "remote-preferred"
-                )
-            )
-        )
-        print(
-            f"StoryPipeline initialized ({mode}). api_url={self.api_url!r}, local_model={self.local_model!r}, allow_fallback={self.allow_fallback}"
-        )
-
-    def resp_to_text(resp):
-        """Normalize responses that may be dicts (from cloudscraper/fallbacks) or strings."""
-        try:
-            if isinstance(resp, (str, bytes)):
-                return resp.decode("utf-8") if isinstance(resp, bytes) else resp
-            if isinstance(resp, dict):
-                # common keys
-                for k in ("response", "message", "text", "content", "result"):
-                    if k in resp and isinstance(resp[k], str):
-                        return resp[k]
-                # openai-like choices
-                if (
-                    "choices" in resp
-                    and isinstance(resp["choices"], list)
-                    and resp["choices"]
-                ):
-                    first = resp["choices"][0]
-                    if isinstance(first, dict):
-                        for k in ("text", "message", "content"):
-                            if k in first and isinstance(first[k], str):
-                                return first[k]
-                # fallback
-                return json.dumps(resp, ensure_ascii=False)
-            return str(resp)
-        except Exception:
-            try:
-                return json.dumps(resp, ensure_ascii=False)
-            except Exception:
-                return str(resp)
+        self.chat = ChatAPI(url=api_url, default_timeout=default_timeout)
 
     def _build_script_prompt(
         self,
@@ -1469,67 +410,6 @@ class StoryPipeline:
         )
         return prompt
 
-    def _attempt_local_repair_and_retry(self) -> bool:
-        """
-        Best-effort: attempt one auto-repair + re-init of the local model.
-        Reuses LocalLLM constructor (which may perform pip installs / fixes).
-        Returns True if re-init succeeded (self.chat.local_llm is ready); False otherwise.
-        This helper runs at most once when invoked by the constructor.
-        """
-        try:
-            print(
-                "ℹ️ Local init failed earlier — attempting one automatic repair + re-initialize...",
-                flush=True,
-            )
-            # If ChatAPI exposes a way to init local directly, prefer that.
-            if hasattr(self.chat, "init_local_llm"):
-                try:
-                    ok = self.chat.init_local_llm(
-                        local_model=self.local_model, device=self.local_device
-                    )
-                    if ok:
-                        return True
-                except Exception as e:
-                    print("⚠️ chat.init_local_llm raised:", e, flush=True)
-
-            # Try to construct a fresh LocalLLM and replace chat.local_llm if ready
-            tmp = None
-            try:
-                tmp = LocalLLM(local_model=self.local_model, device=self.local_device)
-            except Exception as e:
-                # Some LocalLLM constructors may do auto-repair and then raise; log and continue
-                print(
-                    "⚠️ LocalLLM constructor raised during repair attempt:",
-                    e,
-                    flush=True,
-                )
-
-            if tmp:
-                # check readiness
-                try:
-                    if hasattr(tmp, "is_ready") and tmp.is_ready():
-                        self.chat.local_llm = tmp
-                        print(
-                            "✅ LocalLLM initialized successfully on retry.", flush=True
-                        )
-                        return True
-                    elif getattr(tmp, "_ready", False):
-                        self.chat.local_llm = tmp
-                        print("✅ LocalLLM appears ready after retry.", flush=True)
-                        return True
-                except Exception as e:
-                    print("⚠️ error checking tmp.is_ready():", e, flush=True)
-
-            # No successful init
-            print(
-                "⚠️ Local repair + retry did not produce a ready local LLM.", flush=True
-            )
-            return False
-
-        except Exception as e:
-            print("⚠️ Unexpected error during local repair + retry:", e, flush=True)
-            return False
-
     def generate_script(
         self,
         niche: str,
@@ -1543,8 +423,21 @@ class StoryPipeline:
     ) -> str:
         """
         COMPLETE generate_script implementation — infinite-retry until success (no internal caps).
-        (Preserves all original features; added robust response normalization to handle dict responses.)
+
+        Behavior summary:
+        - Keeps all original features from your initial design: bracketed-only outputs in strict mode,
+          strengthen/retry prompts, continuation seeded with last paragraph, model condense attempts,
+          deterministic trimming fallback, fuzzy dedupe, cleaning hooks, and saving.
+        - **No wall-clock or API-call caps**: the method will keep retrying until a satisfactory
+          non-empty cleaned script that meets the target (within tolerance) is produced. This is
+          intentional per your request. The only "cap" is success.
+        - The saved artifact is EXACTLY one bracketed block and nothing else: `[<cleaned script>]`.
+        - The function will not save empty content. If a generated candidate cleans to empty, it will
+          keep retrying.
+
+        WARNING: Running without caps can consume unbounded resources. Use in a controlled environment.
         """
+
         # Derived values
         words_target = timing_minutes * words_per_minute
         tolerance = max(1, int(words_target * 0.01))
@@ -1621,6 +514,8 @@ class StoryPipeline:
             extra = (
                 "\n\nIMPORTANT: You MUST output EXACTLY ONE bracketed block and NOTHING ELSE. "
                 "The output must start with '[' and end with ']' and contain no characters outside those brackets. "
+                "The bracketed block should contain ONLY the full script text (no labels, no JSON, no commentary, no metadata, no tags). "
+                "There must be no additional bracketed blocks, and no leading or trailing whitespace or blank lines outside the brackets. "
                 f"Now adjust the script so that it contains exactly {words_target} words (count words in the usual sense—whitespace-separated). "
                 f"If you cannot hit exactly {words_target}, produce a script that is as close as possible within ±{tolerance} words. "
                 "Prioritize an exact match; if multiple outputs tie for closeness, any may be used. "
@@ -1650,7 +545,7 @@ class StoryPipeline:
             return resp.strip()
 
         def _heuristic_trim_to_target(text: str, target_words: int) -> str:
-            # deterministic conservative trimming preserving anchors (unchanged logic)
+            # deterministic conservative trimming preserving anchors
             paras = _get_paragraphs(text)
             if not paras:
                 return text
@@ -1810,17 +705,15 @@ class StoryPipeline:
                     time.sleep(0.2)
                     continue
 
-                resp_text = self._resp_to_text(resp)
-
                 # In strict mode we insist the model returns a bracketed block; otherwise we accept best candidate
                 if strict:
-                    if not single_block_re.match(resp_text):
+                    if not single_block_re.match(resp):
                         print(
                             "⚠️ Strict mode: response did not contain a single bracketed block — retrying."
                         )
                         time.sleep(0.2)
                         continue
-                candidate = _extract_candidate(resp_text)
+                candidate = _extract_candidate(resp)
                 try:
                     cleaned_candidate = clean_script_text(candidate) or candidate
                 except Exception:
@@ -1857,15 +750,13 @@ class StoryPipeline:
                         except Exception as e:
                             print(f"⚠️ Condense send_message failed: {e}")
                             break
-
-                        cond_resp_text = self._resp_to_text(cond_resp)
-                        if strict and not single_block_re.match(cond_resp_text):
+                        if strict and not single_block_re.match(cond_resp):
                             print(
                                 "⚠️ Strict mode: condense response not bracketed — retrying condense."
                             )
                             time.sleep(0.2)
                             continue
-                        cond_inner = _extract_candidate(cond_resp_text)
+                        cond_inner = _extract_candidate(cond_resp)
                         try:
                             cond_clean = clean_script_text(cond_inner) or cond_inner
                         except Exception:
@@ -1930,7 +821,18 @@ class StoryPipeline:
                 "GUIDELINES (follow these tightly):\n"
                 "- Seamlessness: bridge directly from LAST_PARAGRAPH so the result reads as one continuous video_script — no jarring resets, no reintroductory exposition.\n"
                 "- Middle-act mastery: prioritize rising action, conflict escalation, turning points, stakes increase, and micro-resolutions that propel the story forward.\n"
-                # (rest of the guidelines are unchanged)
+                "- Maintain characters, names, facts, tone, and tense exactly as present in PREV and LAST_PARAGRAPH. If a scene or character is implied, continue that thread unless explicitly contradicted.\n"
+                "- Show, don't tell: prefer sensory details, short scenes, beats, and concrete actions over long explanation. Use short+long sentences rhythmically to control pacing.\n"
+                "- Callbacks, not copy: reference earlier lines or imagery with subtle callback phrases (echo words, repeated motifs, similar imagery) rather than copying whole sentences.\n"
+                "- Flow & transitions: use graceful transitions between beats or scenes (one-sentence visual transitions, cut-to, or a brief descriptive line) without headings, timestamps, or labels.\n"
+                "- Scene economy: each paragraph should function as a micro-scene or beat — introduce a small change, reveal, decision, or escalation that advances momentum.\n"
+                "- Dialogue & tags: if characters speak, keep speaker attribution consistent with prior format. Use realistic, concise dialogue that reveals character or motive.\n"
+                "- Continuity safety: never contradict established facts (names, timeline, locations, relationships). If uncertain, favor neutral phrasing that preserves continuity.\n"
+                "- Length control: aim for ~{words_target} total words. If you overshoot slightly that's fine; if you undershoot, continue until the target is sensibly reached. When within ~3-7% of the target, create a satisfying mini-cliff or logical segue for the next batch.\n"
+                "- Formatting: plain paragraphs only (no lists, no headers, no code). Keep natural paragraph breaks for beats. No editorial comments, no analysis, no instructions to the reader.\n"
+                "- Safety & quality: keep language appropriate for a wide audience; avoid gratuitous profanity unless already present and integral to character voice.\n\n"
+                "Produce exactly one bracketed script block and nothing else: output a single opening bracket [ then the entire script content followed by a single closing bracket ] — include no other characters, whitespace, newlines, headings, labels, metadata, counts, commentary, instructions, fragments of the prompt, code fences, or BOM before or after; the bracketed text must be the complete script with no explanatory notes, stage directions, or parenthetical remarks not part of the script; if the script cannot be produced, return exactly []; the response must contain absolutely nothing else.\n"
+                "Deliver a single continuous piece that a human editor could paste after PREV_BEGIN and have the full script read as one complete, cinematic video script.\n"
             )
             try:
                 cont_resp = self.chat.send_message(
@@ -1943,9 +845,8 @@ class StoryPipeline:
                 time.sleep(0.2)
                 continue
 
-            cont_resp_text = self._resp_to_text(cont_resp)
             # In strict mode we accept only continuation text (model may return unbracketed continuation)
-            cont_candidate = _extract_candidate(cont_resp_text)
+            cont_candidate = _extract_candidate(cont_resp)
             try:
                 cont_clean = clean_script_text(cont_candidate) or cont_candidate
             except Exception:
@@ -1978,13 +879,11 @@ class StoryPipeline:
                     print(f"⚠️ Append-generation failed: {e}")
                     time.sleep(0.2)
                     continue
-
-                gen_resp_text = self._resp_to_text(gen_resp)
-                if strict and not single_block_re.match(gen_resp_text):
+                if strict and not single_block_re.match(gen_resp):
                     print("⚠️ Strict mode: append generation not bracketed — retrying.")
                     time.sleep(0.2)
                     continue
-                gen_candidate = _extract_candidate(gen_resp_text)
+                gen_candidate = _extract_candidate(gen_resp)
                 try:
                     gen_clean = clean_script_text(gen_candidate) or gen_candidate
                 except Exception:
@@ -2507,11 +1406,8 @@ class StoryPipeline:
                     time.sleep(1 + random.random())
                     continue
 
-                # normalize response safely
-                resp_text = self._resp_to_text(resp)
-
-                # extract candidate blocks (extractor expects a string)
-                blocks = _extract_blocks(resp_text)
+                # extract candidate blocks
+                blocks = _extract_blocks(resp)
 
                 if not blocks:
                     print(
@@ -2680,8 +1576,7 @@ class StoryPipeline:
                     time.sleep(1 + random.random())
                     para_cycle += 1
                     continue
-                resp_text = self._resp_to_text(resp)
-                blocks = _extract_blocks(resp_text)
+                blocks = _extract_blocks(resp)
                 added = 0
                 for blk in blocks:
                     if added >= need_now:
@@ -2829,8 +1724,7 @@ class StoryPipeline:
             timeout=timeout or self.chat.base_timeout,
             spinner_message="Generating narration...",
         )
-        resp_text = self._resp_to_text(resp)
-        narr_block = extract_largest_bracketed(resp_text)
+        narr_block = extract_largest_bracketed(resp)
         if narr_block:
             # remove label if present
             if narr_block.lower().startswith(bracket_label.lower()):
@@ -2866,7 +1760,8 @@ class StoryPipeline:
             "   - Summarizes the video naturally using SEO-rich language.\n"
             "   - Includes time-stamped highlights if applicable.\n"
             "   - Encourages watch time, comments, likes, and subscriptions.\n"
-            "   - CTAs to subscribe or follow.\n"
+            "   - Includes relevant affiliate links or placeholders (e.g., '👇 Check this out: [link]').\n"
+            "   - Adds social links and CTAs to subscribe or follow.\n"
             "   - Ends with keyword-rich hashtags and key phrases.\n"
             "3. **TAGS (comma-separated)** — Generate 20–30 high-ranking SEO tags (mix of short-tail and long-tail keywords relevant to the video topic).\n"
             "4. **HASHTAGS** — Include 10–20 trending, niche-relevant hashtags formatted like #ExampleTag.\n"
@@ -2887,39 +1782,18 @@ class StoryPipeline:
             timeout=timeout or self.chat.base_timeout,
             spinner_message="Generating YouTube metadata...",
         )
-        resp_text = self._resp_to_text(resp)
-        save_response("youtube_response", "youtube_metadata.txt", resp_text)
-        return resp_text
+        save_response("youtube_response", "youtube_metadata.txt", resp)
+        return resp
 
 
 # ---------------------- EXAMPLE USAGE ----------------------
 if __name__ == "__main__":
     start = time.time()
 
-    # Read runtime overrides from environment so CI/workflow controls them
-    env_model = os.environ.get("LOCAL_MODEL_PATH", "/mnt/models/mistral-small-3.1.gguf")
-    env_device = os.environ.get("LOCAL_DEVICE", "cpu")
-    env_backend = os.environ.get("LOCAL_BACKEND", "llama_cpp")
-    env_require_local = os.environ.get("REQUIRE_LOCAL", "false").lower() in (
-        "1",
-        "true",
-        "yes",
-    )
-    env_allow_fallback = os.environ.get("ALLOW_FALLBACK", "true").lower() in (
-        "1",
-        "true",
-        "yes",
-    )
-    env_hf_token = os.environ.get("HF_TOKEN", None)
-
     pipeline = StoryPipeline(
-        local_model=env_model,
-        local_device=env_device,
-        local_backend=env_backend,
-        hf_token=env_hf_token,
-        require_local=env_require_local,
-        allow_fallback=env_allow_fallback,
+        api_url="https://apifreellm.com/api/chat", default_timeout=100
     )
+
     # --- Example 1: Only generate the story/script (BRACKETED single block file saved) ---
     script = pipeline.generate_script(
         niche="Preschool-early-elementary children",
