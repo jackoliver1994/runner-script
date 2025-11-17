@@ -1,8 +1,11 @@
-Pillow
 numpy
+setuptools>=65.0
+wheel
+cython
+opencv-python-headless
+Pillow
 pandas
 matplotlib
-opencv-python-headless
 tqdm
 TTS
 soundfile
@@ -25,5 +28,7 @@ safetensors
 torch
 sentencepiece
 bitsandbytes
+pyworld
+psutil
 huggingface_hub
 llama-cpp-python
