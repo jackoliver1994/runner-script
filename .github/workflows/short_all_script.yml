@@ -32,6 +32,19 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Cleanup workspace and temp files (Linux/macOS)
+        if: always()
+        run: |
+          echo "Cleaning workspace..."
+          # remove everything under the workspace (but not the workspace dir itself)
+          rm -rf "$GITHUB_WORKSPACE"/* || true
+          rm -rf /tmp/* || true
+          # optional: remove runner temp & actions directories (self-hosted)
+          rm -rf /home/runner/work/_temp/* || true
+          rm -rf /home/runner/work/_tool/* || true
+          # optional docker cleanup (if you use docker)
+          docker system prune -af --volumes || true
+
       - name: Show disk and largest dirs before
         run: |
           df -h
