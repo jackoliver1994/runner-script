@@ -35,8 +35,16 @@ jobs:
       - name: Show disk before
         run: df -h && du -sh .
 
-      - name: Install psutil
-        run: python -m pip install psutil==5.9.5
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Install Playwright browsers
+        run: playwright install --with-deps
+
+      - name: Show disk after
+        run: df -h && du -sh .
 
       - name: Show environment (debug)
         run: |
@@ -48,48 +56,46 @@ jobs:
 
       - name: Run download & test script
         run: |
+          cd Script_Drive1
           python3 test_local_llm.py
         env:
           HF_TOKEN: ${{ github.event.inputs.hf_key }}
           MODEL_DEST_PATH: ${{ github.workspace }}/models/mistral-small-3.1.gguf
           REPO_ID: ggml-org/Mistral-Small-3.1-24B-Instruct-2503-GGUF
 
-      - name: Show disk after
-        run: df -h && du -sh .
-
       - name: Run your script (llm)
         env:
           R_HOURS: "6"
         run: |
-          cd Script_Drive
+          cd Script_Drive1
           python llm.py
 
       - name: Run your script (pollinations_image_genrate)
         env:
           R_HOURS: "6"
         run: |
-          cd Script_Drive
+          cd Script_Drive1
           python pollinations_image_genrate.py
 
       - name: Run your script (Coqui_narration)
         env:
           R_HOURS: "6"
         run: |
-          cd Script_Drive
+          cd Script_Drive1
           python Coqui_narration.py
 
       - name: Run your script (video_genrate)
         env:
           R_HOURS: "6"
         run: |
-          cd Script_Drive
+          cd Script_Drive1
           python video_genrate.py
 
       - name: Run your script (remove_logo_from_video)
         env:
           R_HOURS: "6"
         run: |
-          cd Script_Drive
+          cd Script_Drive1
           python remove_logo_from_video.py
 
       - name: Upload debug artifacts (if present)
@@ -109,5 +115,18 @@ jobs:
         env:
           R_HOURS: "6"
         run: |
-          cd Script_Drive
+          cd Script_Drive1
           python all_scripts.py
+
+      - name: Cleanup workspace and temp files (Linux/macOS)
+        if: always()
+        run: |
+          echo "Cleaning workspace..."
+          # remove everything under the workspace (but not the workspace dir itself)
+          rm -rf "$GITHUB_WORKSPACE"/* || true
+          rm -rf /tmp/* || true
+          # optional: remove runner temp & actions directories (self-hosted)
+          rm -rf /home/runner/work/_temp/* || true
+          rm -rf /home/runner/work/_tool/* || true
+          # optional docker cleanup (if you use docker)
+          docker system prune -af --volumes || true
