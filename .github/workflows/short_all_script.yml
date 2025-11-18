@@ -24,71 +24,32 @@ jobs:
       VERBOSE: "true"
 
     steps:
-      - name: Checkout (shallow + clean)
+      - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
         with:
-          fetch-depth: 1
-          clean: true
+          python-version: "3.11"
 
-      - name: Ensure workspace is pristine (safe, destructive inside repo only)
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "GITHUB_WORKSPACE=$GITHUB_WORKSPACE"
-          cd "$GITHUB_WORKSPACE"
-
-          # Reset tracked files and remove untracked / ignored files inside the repo.
-          # This ONLY operates inside $GITHUB_WORKSPACE and is destructive to untracked files.
-          git reset --hard HEAD || true
-          git clean -ffdx || true
-
-          echo "git status (should be clean):"
-          git status --porcelain || true
-
-      - name: Remove runner/user caches and runner temp (safe areas only)
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "RUNNER_TEMP=$RUNNER_TEMP"
-          echo "RUNNER_TOOL_CACHE=$RUNNER_TOOL_CACHE"
-          # Clear runner temp (safe)
-          if [ -n "${RUNNER_TEMP:-}" ] && [ -d "$RUNNER_TEMP" ]; then
-            rm -rf "$RUNNER_TEMP"/* || true
-          fi
-          # Clear runner tool cache (be careful: removing caches may force reinstall of tools later)
-          if [ -n "${RUNNER_TOOL_CACHE:-}" ] && [ -d "$RUNNER_TOOL_CACHE" ]; then
-            rm -rf "$RUNNER_TOOL_CACHE"/* || true
-          fi
-          # Clear common user caches (safe)
-          rm -rf "$HOME/.cache"/* || true
-          rm -rf "$HOME/.npm"/* || true
-          rm -rf "$HOME/.yarn"/* || true
-          rm -rf "$HOME/.local/share/containers"/* || true
-          # Clear actions workspace temp for this runner if present (safe)
-          if [ -d "$HOME/actions-runner/_work" ]; then
-            # remove other repos' work directories but keep runner internals
-            rm -rf "$HOME/actions-runner/_work"/* || true
-          fi
-
-      - name: Optional — prune docker if present (safe guard)
+      - name: Cleanup workspace and temp files (Linux/macOS)
         if: always()
-        shell: bash
         run: |
-          if command -v docker >/dev/null 2>&1; then
-            echo "Docker present — pruning unused objects (images/containers/volumes)."
-            # This will remove dangling images and unused data; keep it only if you understand the cost.
-            docker builder prune -af || true
-            docker system prune -af --volumes || true
-          else
-            echo "Docker not present; skipping docker prune."
-          fi
+          echo "Cleaning workspace..."
+          # remove everything under the workspace (but not the workspace dir itself)
+          rm -rf "$GITHUB_WORKSPACE"/* || true
+          rm -rf /tmp/* || true
+          # optional: remove runner temp & actions directories (self-hosted)
+          rm -rf /home/runner/work/_temp/* || true
+          rm -rf /home/runner/work/_tool/* || true
+          # optional docker cleanup (if you use docker)
+          docker system prune -af --volumes || true
 
       - name: Show disk and largest dirs before
-        shell: bash
         run: |
-          df -h || true
-          echo "Largest directories (workspace + runner caches + /opt/hostedtoolcache):"
-          sudo du -xh "$GITHUB_WORKSPACE" /home "$RUNNER_TEMP" "$RUNNER_TOOL_CACHE" /opt/hostedtoolcache 2>/dev/null | sort -h -r | head -40 || true
+          df -h
+          sudo du -xh / | sort -h -r | head -30
+          sudo du -xh /opt | sort -h -r | head -10
           docker system df || true
 
       - name: Install dependencies
@@ -100,11 +61,10 @@ jobs:
         run: playwright install --with-deps
 
       - name: Show disk and largest dirs after
-        shell: bash
         run: |
-          df -h || true
-          echo "Largest directories (workspace + runner caches + /opt/hostedtoolcache) AFTER setup:"
-          sudo du -xh "$GITHUB_WORKSPACE" /home "$RUNNER_TEMP" "$RUNNER_TOOL_CACHE" /opt/hostedtoolcache 2>/dev/null | sort -h -r | head -40 || true
+          df -h
+          sudo du -xh / | sort -h -r | head -30
+          sudo du -xh /opt | sort -h -r | head -10
           docker system df || true
 
       - name: Show environment (debug)
@@ -113,12 +73,7 @@ jobs:
           echo "MODEL_DEST_PATH -> $MODEL_DEST_PATH"
           echo "REPO_ID -> $REPO_ID"
           echo "SELECT_STRATEGY -> $SELECT_STRATEGY"
-          python -c "import sys
-try:
-  import psutil
-  print('Total RAM GB:', psutil.virtual_memory().total/1024**3)
-except Exception:
-  print('psutil not available or failed')"
+          python -c "import psutil,sys; print('Total RAM GB:', psutil.virtual_memory().total/1024**3 if 'psutil' in sys.modules else 'psutil missing')"
 
       - name: Run download & test script
         run: |
@@ -184,56 +139,22 @@ except Exception:
           cd Script_Drive1
           python all_scripts.py
 
-      - name: Show disk and largest dirs before final cleanup
-        shell: bash
+      - name: Show disk and largest dirs
         run: |
-          df -h || true
-          echo "Largest directories (workspace + runner caches + /opt/hostedtoolcache) BEFORE final cleanup:"
-          sudo du -xh "$GITHUB_WORKSPACE" /home "$RUNNER_TEMP" "$RUNNER_TOOL_CACHE" /opt/hostedtoolcache 2>/dev/null | sort -h -r | head -40 || true
+          df -h
+          sudo du -xh / | sort -h -r | head -30
+          sudo du -xh /opt | sort -h -r | head -10
           docker system df || true
 
-      - name: Final cleanup (safe)
+      - name: Cleanup workspace and temp files (Linux/macOS)
         if: always()
-        shell: bash
         run: |
-          set -euo pipefail
-          echo "Final cleaning workspace (safe):"
-
-          # Only operate inside $GITHUB_WORKSPACE: reset and remove untracked files produced during run
-          cd "$GITHUB_WORKSPACE"
-          git reset --hard HEAD || true
-          git clean -ffdx || true
-
-          # If you want to remove everything except a whitelist (e.g., keep README.md and src/), set WILDCARD_KEEP:
-          # Example: to keep .git, .github, README.md and src:
-          # shopt -s extglob
-          # rm -rf -- !( .git|.github|README.md|src )
-          # NOTE: use carefully — the example above will remove all other top-level items in the workspace.
-
-          # Clear runner temp and tool cache (safe)
-          if [ -n "${RUNNER_TEMP:-}" ] && [ -d "$RUNNER_TEMP" ]; then
-            rm -rf "$RUNNER_TEMP"/* || true
-          fi
-          if [ -n "${RUNNER_TOOL_CACHE:-}" ] && [ -d "$RUNNER_TOOL_CACHE" ]; then
-            rm -rf "$RUNNER_TOOL_CACHE"/* || true
-          fi
-
-          # Clear common user caches (safe)
-          rm -rf "$HOME/.cache"/* || true
-          rm -rf "$HOME/.npm"/* || true
-          rm -rf "$HOME/.yarn"/* || true
-
-          # Optional docker cleanup if docker exists
-          if command -v docker >/dev/null 2>&1; then
-            docker builder prune -af || true
-            docker system prune -af --volumes || true
-          fi
-
-      - name: Final disk snapshot (diagnostics)
-        if: always()
-        shell: bash
-        run: |
-          echo "Final disk usage:"
-          df -h || true
-          echo "Top dirs:"
-          sudo du -xh "$GITHUB_WORKSPACE" /home "$RUNNER_TEMP" "$RUNNER_TOOL_CACHE" /opt/hostedtoolcache 2>/dev/null | sort -h -r | head -40 || true
+          echo "Cleaning workspace..."
+          # remove everything under the workspace (but not the workspace dir itself)
+          rm -rf "$GITHUB_WORKSPACE"/* || true
+          rm -rf /tmp/* || true
+          # optional: remove runner temp & actions directories (self-hosted)
+          rm -rf /home/runner/work/_temp/* || true
+          rm -rf /home/runner/work/_tool/* || true
+          # optional docker cleanup (if you use docker)
+          docker system prune -af --volumes || true
