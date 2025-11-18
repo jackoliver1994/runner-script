@@ -32,12 +32,9 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Show disk and largest dirs before
+      - name: Show disk
         run: |
           df -h
-          sudo du -xh / | sort -h -r | head -30
-          sudo du -xh /opt | sort -h -r | head -10
-          docker system df || true
 
       - name: Debug workspace before install
         run: |
@@ -52,12 +49,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Show disk and largest dirs after
+      - name: Show disk
         run: |
           df -h
-          sudo du -xh / | sort -h -r | head -30
-          sudo du -xh /opt | sort -h -r | head -10
-          docker system df || true
 
       - name: Show environment (debug)
         run: |

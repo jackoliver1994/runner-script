@@ -274,6 +274,28 @@ def choose_gguf_from_candidates(
 # ----------------- HF download helpers -----------------
 
 
+# Compatibility wrapper for hf_hub_download across HF versions
+def hf_hub_download_compat(
+    repo_id: str, filename: str, token: Optional[str] = None, **kwargs
+) -> str:
+    """
+    Call hf_hub_download using the correct kwarg name for the installed huggingface_hub:
+      - newer versions expect token=<token>
+      - older versions expect use_auth_token=<token>
+    Falls back automatically.
+    """
+    try:
+        # try the modern signature first
+        return hf_hub_download(
+            repo_id=repo_id, filename=filename, token=token, **kwargs
+        )
+    except TypeError:
+        # older huggingface_hub versions used use_auth_token
+        return hf_hub_download(
+            repo_id=repo_id, filename=filename, use_auth_token=token, **kwargs
+        )
+
+
 def ensure_parent(path: str) -> None:
     parent = os.path.dirname(os.path.abspath(path))
     if parent and not os.path.exists(parent):
@@ -360,10 +382,10 @@ def download_model_via_hf(repo_id: str, select_strategy) -> str:
     _log("Selected filename:", filename)
 
     _log("Downloading to HF cache using hf_hub_download ... (this may take a while)")
-    cached = hf_hub_download(
+    cached = hf_hub_download_compat(
         repo_id=repo_id,
         filename=filename,
-        use_auth_token=(HF_TOKEN if USE_AUTH else None),
+        token=(HF_TOKEN if USE_AUTH else None),
     )
     _log("hf_hub_download returned cached path:", cached)
 
