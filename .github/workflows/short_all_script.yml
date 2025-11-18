@@ -70,12 +70,20 @@ jobs:
           MODEL_DEST_PATH: ${{ github.workspace }}/models/mistral-small-3.1.gguf
           REPO_ID: ggml-org/Mistral-Small-3.1-24B-Instruct-2503-GGUF
 
+      - name: Show disk
+        run: |
+          df -h
+
       - name: Run your script (llm)
         env:
           R_HOURS: "6"
         run: |
           cd Script_Drive1
           python llm.py
+
+      - name: Show disk
+        run: |
+          df -h
 
       - name: Run your script (pollinations_image_genrate)
         env:
