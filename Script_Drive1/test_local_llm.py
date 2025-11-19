@@ -208,7 +208,7 @@ def consume_generator_safely(gen: Iterable) -> str:
                 return "<unparseable generator>"
 
 
-def parse_llama_cpp_response(resp: Any) -> (str, str):
+def parse_llama_cpp_response(resp: Any) -> tuple[str, str]:
     """
     Return (assembled_text, preview_raw)
     """
