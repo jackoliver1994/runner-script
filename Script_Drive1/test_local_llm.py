@@ -565,7 +565,7 @@ def main():
         if resp and len(str(resp).strip()) > 0:
             _log("SUCCESS: model responded via llama-cpp-python.")
             _log("Response (first 400 chars):")
-            _log(str(resp)[:400])
+            _log(str(resp)[:100000])
             if POST_SUCCESS_CMD:
                 run_post_success(POST_SUCCESS_CMD)
             _log("Total time: {:.1f}s".format(time.time() - start))
@@ -578,7 +578,7 @@ def main():
         if resp2 and len(str(resp2).strip()) > 0:
             _log("SUCCESS: model responded via llama.cpp binary.")
             _log("Response (first 400 chars):")
-            _log(str(resp2)[:400])
+            _log(str(resp2)[:100000])
             if POST_SUCCESS_CMD:
                 run_post_success(POST_SUCCESS_CMD)
             _log("Total time: {:.1f}s".format(time.time() - start))
