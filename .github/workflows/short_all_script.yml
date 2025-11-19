@@ -152,3 +152,7 @@ jobs:
           rm -rf /home/runner/work/_tool/* || true
           # optional docker cleanup (if you use docker)
           docker system prune -af --volumes || true
+
+      - name: Show disk
+        run: |
+          df -h
