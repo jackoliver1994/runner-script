@@ -23,7 +23,8 @@ import sys
 import time
 import shutil
 import subprocess
-from typing import List, Optional, Tuple, Dict
+import inspect
+from typing import List, Optional, Tuple, Dict, Any
 
 # ----------------- CONFIG (read from env; override here if needed) -----------------
 HF_TOKEN: str = os.getenv("HF_TOKEN", "")  # Provided by GitHub workflow (hf_key)
@@ -407,6 +408,7 @@ def parse_llama_cpp_response(resp) -> str:
     try:
         # older/newer shapes
         if isinstance(resp, dict):
+            # v1/v2 shapes: {"choices":[{"text":"..."}]}
             if "choices" in resp and len(resp["choices"]) > 0:
                 c = resp["choices"][0]
                 if isinstance(c, dict):
@@ -414,10 +416,115 @@ def parse_llama_cpp_response(resp) -> str:
                         return str(c["text"])
                     if "message" in c and isinstance(c["message"], dict):
                         return str(c["message"].get("content", ""))
+                # fallback
                 return str(c)
+            # shape: {"id":..., "object":.., "output": "..."}
+            if "output" in resp:
+                return str(resp["output"])
+        # sometimes the library returns a simple object with .choices or .text
+        if hasattr(resp, "choices"):
+            try:
+                c = resp.choices[0]
+                if hasattr(c, "text"):
+                    return str(c.text)
+                if hasattr(c, "message"):
+                    return str(getattr(c, "message").get("content", ""))
+            except Exception:
+                pass
+        # plain string or non-dict
         return str(resp)
     except Exception:
         return str(resp)
+
+
+def llama_call_compat(
+    llm: Any,
+    prompt: str,
+    max_tokens: Optional[int] = None,
+    temperature: Optional[float] = None,
+    stop: Optional[List[str]] = None,
+    echo: Optional[bool] = None,
+) -> Any:
+    """
+    Compatibility wrapper to call llama-cpp-python Llama instances across versions.
+
+    Tries these in order:
+      - llm.create(...) with mapped kwargs
+      - llm.generate(...) with mapped kwargs
+      - llm(prompt, ...) callable form
+      - llm(prompt) plain callable
+    Mapping handles different kwarg names for token limits: max_tokens -> max_new_tokens / n_predict / max_completion_tokens
+    """
+
+    # helper to map and call a function with supported arg names
+    def try_call(fn, prompt_arg_style="kw"):
+        sig = inspect.signature(fn)
+        params = sig.parameters
+        call_kwargs = {}
+        # map token limit
+        if max_tokens is not None:
+            for alt in (
+                "max_tokens",
+                "max_new_tokens",
+                "n_predict",
+                "n_ctx",
+                "max_completion_tokens",
+                "n",
+            ):
+                if alt in params:
+                    call_kwargs[alt] = max_tokens
+                    break
+        # map temperature
+        if temperature is not None and "temperature" in params:
+            call_kwargs["temperature"] = temperature
+        # map stop sequences
+        if stop is not None:
+            for alt in ("stop", "stop_sequences", "stop_tokens", "stop_sequence"):
+                if alt in params:
+                    call_kwargs[alt] = stop
+                    break
+        # map echo
+        if echo is not None and "echo" in params:
+            call_kwargs["echo"] = echo
+        try:
+            if "prompt" in params or prompt_arg_style == "kw":
+                # attempt keyword prompt
+                return fn(prompt=prompt, **call_kwargs)
+            else:
+                # positional prompt
+                return fn(prompt, **call_kwargs)
+        except TypeError as te:
+            # maybe signature doesn't accept named prompt; try positional
+            try:
+                return fn(prompt, **call_kwargs)
+            except Exception:
+                raise te
+
+    # try create/generate methods if present
+    for name in ("create", "generate"):
+        if hasattr(llm, name):
+            fn = getattr(llm, name)
+            try:
+                _log(
+                    f"Attempting llama-cpp-python method '{name}' with compatibility mapping."
+                )
+                resp = try_call(fn, prompt_arg_style="kw")
+                return resp
+            except Exception as e:
+                _log(f"Method '{name}' failed: {e}")
+
+    # try calling the Llama instance directly (callable style)
+    try:
+        _log("Attempting llama-cpp-python callable style (llm(prompt, ...)).")
+        # try with mapped kwargs if possible
+        try:
+            return llm(prompt, max_tokens=max_tokens, temperature=temperature)
+        except TypeError:
+            # simpler callable
+            return llm(prompt)
+    except Exception as e:
+        _log("Callable llm(...) failed:", e)
+        return None
 
 
 def test_with_llama_cpp(
@@ -425,7 +532,7 @@ def test_with_llama_cpp(
 ) -> Optional[str]:
     """
     Try to use llama-cpp-python (llama_cpp package) to load the gguf and get a response.
-    Handles a few API variants / fallbacks.
+    Handles a few API variants / fallbacks via llama_call_compat.
     """
     try:
         from llama_cpp import Llama
@@ -436,41 +543,20 @@ def test_with_llama_cpp(
     try:
         _log("Loading model with llama_cpp:", model_path)
         # instantiate Llama; the library will load the GGUF
+        # pass only model_path to be maximally compatible; advanced args could be passed if needed
         llm = Llama(model_path=model_path)
         _log("Model loaded with llama_cpp. Trying to create/generate response...")
-        # Try several API variants:
-        try:
-            resp = llm.create(prompt=prompt, max_tokens=max_tokens, temperature=temp)
-            text = parse_llama_cpp_response(resp)
-            _log("llama_cpp.create success (truncated):", text[:300])
-            return text
-        except AttributeError:
-            _log("llama_cpp instance has no method 'create'. Trying 'generate' ...")
-            try:
-                resp = llm.generate(prompt, max_tokens=max_tokens, temperature=temp)
-                # some builds return a generator; others return object
-                if isinstance(resp, dict) and "choices" in resp:
-                    text = parse_llama_cpp_response(resp)
-                else:
-                    text = str(resp)
-                _log("llama_cpp.generate success (truncated):", text[:300])
-                return text
-            except Exception as e2:
-                _log("llama_cpp.generate failed:", e2)
-                # try call as function (some older wrappers)
-                try:
-                    resp = llm(prompt)
-                    text = parse_llama_cpp_response(resp)
-                    _log(
-                        "llama_cpp callable produced response (truncated):", text[:300]
-                    )
-                    return text
-                except Exception as e3:
-                    _log("llama_cpp callable failed:", e3)
-                    return None
-        except Exception as e:
-            _log("llama_cpp.create returned error:", e)
+        resp = llama_call_compat(
+            llm, prompt, max_tokens=max_tokens, temperature=temp, stop=None, echo=False
+        )
+        if resp is None:
+            _log("llama_call_compat returned None.")
             return None
+
+        # parse whatever shape it returned
+        text = parse_llama_cpp_response(resp)
+        _log("llama-cpp-python response (truncated):", text[:300])
+        return text
     except Exception as e:
         _log("Error loading model / running inference with llama_cpp:", e)
         return None
