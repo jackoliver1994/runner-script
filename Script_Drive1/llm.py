@@ -206,65 +206,151 @@ class LocalLLM:
         else:
             raise RuntimeError("LocalLLM: unsupported backend")
 
-    # --- per-backend impls ---
     def _send_llama_cpp(self, prompt: str, timeout: int) -> str:
-        # llama-cpp-python Llama.create expects 'prompt' or 'prompt' + params. We'll request a completion.
-        try:
-            # guards for different llama-cpp-python versions
-            resp = self._impl.create(
-                prompt=prompt, max_tokens=1024, temperature=0.7, top_p=0.95
-            )
-            # some versions return dict with 'choices'
-            text = ""
-            if isinstance(resp, dict):
-                # prefer structure like { 'choices':[ {'text': '...'} ] }
+        """
+        Robust llama-cpp-python caller: supports multiple llama-cpp-python APIs:
+        - create
+        - create_completion
+        - create_chat_completion
+        - __call__
+        - generate (low-level) + tokenize / detokenize
+        Returns plain text string.
+        """
+        llm = self._impl
+
+        # helper to extract text from typical response dicts
+        def _extract_text_from_resp(resp):
+            # resp might be dict, list, str, etc.
+            if resp is None:
+                return ""
+            # if it's already a string
+            if isinstance(resp, str):
+                return resp
+            # if it's a list (e.g., pipeline output)
+            if isinstance(resp, list):
+                for item in resp:
+                    # common HF pipeline element: {"generated_text": "..."}
+                    if isinstance(item, dict):
+                        if "generated_text" in item:
+                            return item["generated_text"]
+                        if "text" in item:
+                            return item["text"]
+                # fallback
                 try:
-                    choices = resp.get("choices")
-                    if choices and isinstance(choices, (list, tuple)):
-                        text = "".join(
-                            [c.get("text", "") for c in choices if isinstance(c, dict)]
-                        )
-                    else:
-                        text = resp.get("text", "") or ""
+                    return str(resp[0])
                 except Exception:
-                    text = str(resp)
-            else:
-                text = str(resp)
-            return text.strip()
-        except Exception as e:
-            raise RuntimeError(f"LocalLLM: llama-cpp generation error: {e}")
+                    return str(resp)
+            # if it's a dict with choices
+            if isinstance(resp, dict):
+                # if chat completion shape: { choices: [ { message: { content: "..." } } ] }
+                if "choices" in resp and isinstance(resp["choices"], (list, tuple)):
+                    parts = []
+                    for c in resp["choices"]:
+                        if isinstance(c, dict):
+                            # chat-style
+                            msg = c.get("message")
+                            if isinstance(msg, dict) and "content" in msg:
+                                parts.append(msg["content"])
+                                continue
+                            # classic completion
+                            if "text" in c:
+                                parts.append(c.get("text", ""))
+                                continue
+                            # some versions use 'content' on top level
+                            if "content" in c:
+                                parts.append(c.get("content", ""))
+                                continue
+                    if parts:
+                        return "".join(parts)
+                # older style: {'text': '...'}
+                if "text" in resp and isinstance(resp["text"], str):
+                    return resp["text"]
+                if "content" in resp and isinstance(resp["content"], str):
+                    return resp["content"]
+                # fallback: stringify
+                return str(resp)
+            # anything else
+            return str(resp)
 
-    def _send_gpt4all(self, prompt: str, timeout: int) -> str:
         try:
-            # GPT4All generate returns or prints; we use generate with streaming suppressed
-            # The Python API may be: self._impl.generate(prompt=prompt, n_predict=200)
-            # We'll attempt common use:
-            r = self._impl.generate(prompt, max_tokens=1024, streaming=False)
-            # GPT4All implementations sometimes return a dict or provide a last_text attr
-            if isinstance(r, dict) and "text" in r:
-                return r["text"].strip()
-            # try reading .response or .last_text
-            if hasattr(self._impl, "response"):
-                return str(self._impl.response).strip()
-            if hasattr(self._impl, "last_text"):
-                return str(self._impl.last_text).strip()
-            # fallback to str(r)
-            return str(r).strip()
-        except Exception as e:
-            raise RuntimeError(f"LocalLLM: gpt4all generation error: {e}")
+            # 1) try .create (some versions)
+            if hasattr(llm, "create"):
+                try:
+                    resp = llm.create(
+                        prompt=prompt, max_tokens=1024, temperature=0.7, top_p=0.95
+                    )
+                    return _extract_text_from_resp(resp).strip()
+                except Exception as e_create:
+                    # continue to next method
+                    print(f"LocalLLM: .create failed: {e_create}")
 
-    def _send_transformers(self, prompt: str, timeout: int) -> str:
-        try:
-            # pipeline call: return list of dicts
-            out = self._impl(
-                prompt, max_new_tokens=512, do_sample=True, top_p=0.95, temperature=0.7
+            # 2) try .create_completion
+            if hasattr(llm, "create_completion"):
+                try:
+                    resp = llm.create_completion(
+                        prompt=prompt, max_tokens=1024, temperature=0.7, top_p=0.95
+                    )
+                    return _extract_text_from_resp(resp).strip()
+                except Exception as e_cc:
+                    print(f"LocalLLM: .create_completion failed: {e_cc}")
+
+            # 3) try chat completion API .create_chat_completion
+            if hasattr(llm, "create_chat_completion"):
+                try:
+                    msg = [{"role": "user", "content": prompt}]
+                    resp = llm.create_chat_completion(
+                        messages=msg, max_tokens=1024, temperature=0.7
+                    )
+                    return _extract_text_from_resp(resp).strip()
+                except Exception as e_chat:
+                    print(f"LocalLLM: .create_chat_completion failed: {e_chat}")
+
+            # 4) try __call__ (some versions implement call operator)
+            if callable(getattr(llm, "__call__", None)):
+                try:
+                    # many versions accept same kwargs as create
+                    resp = llm(prompt, max_tokens=1024, temperature=0.7, top_p=0.95)
+                    return _extract_text_from_resp(resp).strip()
+                except Exception as e_call:
+                    print(f"LocalLLM: __call__ failed: {e_call}")
+
+            # 5) low-level streaming: tokenize + generate + detokenize
+            if (
+                hasattr(llm, "generate")
+                and hasattr(llm, "tokenize")
+                and hasattr(llm, "detokenize")
+            ):
+                try:
+                    # llama.tokenize expects bytes in many versions
+                    try:
+                        tokens = llm.tokenize(prompt.encode("utf-8"))
+                    except Exception:
+                        # some versions accept str
+                        tokens = llm.tokenize(prompt)
+                    out_tokens = []
+                    for t in llm.generate(
+                        tokens, top_k=40, top_p=0.95, temp=0.7, repeat_penalty=1.0
+                    ):
+                        # t may be int; append to output
+                        out_tokens.append(int(t))
+                    # detokenize expects a list of ints
+                    text = llm.detokenize(out_tokens)
+                    return text.strip()
+                except Exception as e_gen:
+                    print(
+                        f"LocalLLM: generate/tokenize/detokenize attempt failed: {e_gen}"
+                    )
+
+            # nothing worked
+            raise RuntimeError(
+                "LocalLLM: the installed llama-cpp-python exposes no known generation method. "
+                "Tried: create, create_completion, create_chat_completion, __call__, generate/tokenize. "
+                "Inspect the Llama object methods to adapt."
             )
-            if isinstance(out, list) and out:
-                text = out[0].get("generated_text", "") or out[0].get("text", "")
-                return text.strip()
-            return str(out).strip()
+
         except Exception as e:
-            raise RuntimeError(f"LocalLLM: transformers generation error: {e}")
+            # raise for caller to handle retries / fallback as previously implemented in send_message
+            raise RuntimeError(f"LocalLLM: llama-cpp generation error: {e}")
 
 
 # ---------------------- UTILITIES ----------------------
