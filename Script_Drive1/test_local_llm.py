@@ -1,29 +1,12 @@
 #!/usr/bin/env python3
-"""
-test_local_llm.py
-
-- Auto-detects system resources (RAM, CPU flags, GPU)
-- Picks best-fitting .gguf in a HF repo (heuristics)
-- Downloads model via huggingface_hub (HF_TOKEN from env)
-- Copies to MODEL_DEST_PATH (set by env or default)
-- Attempts to run a small test prompt using:
-    1) llama-cpp-python (preferred, with API-variant fallbacks)
-    2) llama.cpp 'main' binary (fallback)
-- Exit codes:
-    0  -> success (model responded)
-    2  -> model missing or zero bytes after download
-    3  -> model did not produce a usable response
-    4  -> unexpected error
-    130-> interrupted by user
-"""
-
 from __future__ import annotations
 import os
 import sys
 import time
 import shutil
 import subprocess
-from typing import List, Optional, Tuple, Dict
+from typing import List, Optional, Tuple, Dict, Any
+import inspect
 
 # ----------------- CONFIG (read from env; override here if needed) -----------------
 HF_TOKEN: str = os.getenv("HF_TOKEN", "")  # Provided by GitHub workflow (hf_key)
@@ -178,13 +161,6 @@ def parse_variant_tags(filename: str) -> List[str]:
 def choose_gguf_from_candidates(
     candidates: List[str], repo_id: str, strategy: str = "auto"
 ) -> str:
-    """
-    Strategy 'auto' picks based on:
-      - GPU with VRAM -> prefer fp16/f16/float variants
-      - Low system RAM (<=16GB) -> prefer q8*, q4_* smallest
-      - High RAM (>=64GB) -> prefer largest (non-quantized) if available
-    You can still override via SELECT_STRATEGY env to 'first', 'smallest', 'largest'.
-    """
     if not candidates:
         raise SystemExit("No .gguf candidates provided to chooser.")
 
@@ -193,7 +169,6 @@ def choose_gguf_from_candidates(
     gpu = detect_gpu_info()
     _log(f"System: RAM={total_ram:.1f}GB, CPU flags={cpu_flags}, GPU={gpu}")
 
-    # quick categorization of candidates
     categorized = []
     api = None
     try:
@@ -203,7 +178,6 @@ def choose_gguf_from_candidates(
     except Exception:
         siblings = None
 
-    # Attempt to get file sizes when possible (for 'smallest'/'largest' decisions)
     size_map = {}
     if siblings:
         for s in siblings:
@@ -216,13 +190,11 @@ def choose_gguf_from_candidates(
         sz = size_map.get(c, None)
         categorized.append((c, tags, sz))
 
-    # If explicit strategies requested
     s = strategy.lower()
     if s in ("first", "smallest", "largest"):
         if s == "first":
             return categorized[0][0]
         if s == "smallest":
-            # prefer q* or f16 small names then file size
             prioritized = sorted(
                 categorized,
                 key=lambda it: (
@@ -238,39 +210,29 @@ def choose_gguf_from_candidates(
             )
             return prioritized[0][0]
         if s == "largest":
-            # choose by file size if available else first
             sorted_by_size = sorted(categorized, key=lambda it: -(it[2] or 0))
             return sorted_by_size[0][0]
 
-    # AUTO strategy
-    # If GPU with >=12GB VRAM: prefer f16/fp16 or non-quantized
     if gpu and gpu.get("vram_gb", 0) >= 12:
-        # prefer f16 variants
         for name, tags, _ in categorized:
             if any(t in ("f16", "fp16", "f32", "bf16") for t in tags):
                 return name
-        # else pick the largest by size if available
         if size_map:
             return max(categorized, key=lambda it: it[2] or 0)[0]
         return categorized[0][0]
 
-    # If low RAM (<16GB) or no GPU -> prefer q8/q4 variants (smallest)
     if total_ram and total_ram < 16 or not gpu:
-        # look for q4/q8 variants
         q_candidates = [
             it for it in categorized if any(t.startswith("q") for t in it[1])
         ]
         if q_candidates:
-            # choose smallest file size if possible or shortest name
             if size_map:
                 return min(q_candidates, key=lambda it: it[2] or 1e12)[0]
             return sorted(q_candidates, key=lambda it: len(it[0]))[0]
-        # fallback: choose smallest by file size if available
         if size_map:
             return min(categorized, key=lambda it: it[2] or 1e12)[0]
         return categorized[0][0]
 
-    # Default fallback: pick first
     return categorized[0][0]
 
 
@@ -280,19 +242,11 @@ def choose_gguf_from_candidates(
 def hf_hub_download_compat(
     repo_id: str, filename: str, token: Optional[str] = None, **kwargs
 ) -> str:
-    """
-    Call hf_hub_download using the correct kwarg name for the installed huggingface_hub:
-      - newer versions expect token=<token>
-      - older versions expect use_auth_token=<token>
-    Falls back automatically.
-    """
     try:
-        # try the modern signature first
         return hf_hub_download(
             repo_id=repo_id, filename=filename, token=token, **kwargs
         )
     except TypeError:
-        # older huggingface_hub versions used use_auth_token
         return hf_hub_download(
             repo_id=repo_id, filename=filename, use_auth_token=token, **kwargs
         )
@@ -314,11 +268,9 @@ def pick_gguf_from_list(files: List[str], strategy) -> str:
         return candidates[strategy]
     s = str(strategy).lower()
     if s in ("first", "smallest", "largest"):
-        # Use earlier logic but simpler
         if s == "first":
             return candidates[0]
         if s == "smallest":
-            # simple: prefer filenames containing q8 or q4
             heur = sorted(
                 candidates,
                 key=lambda fn: (
@@ -356,14 +308,10 @@ def pick_gguf_from_list(files: List[str], strategy) -> str:
                 pass
             return candidates[0]
 
-    # else 'auto' or unknown -> use smarter chooser
     return choose_gguf_from_candidates(candidates, REPO_ID, strategy or "auto")
 
 
 def download_model_via_hf(repo_id: str, select_strategy) -> str:
-    """
-    Uses hf_hub_download to download into HF cache and returns final path (copied to MODEL_DEST_PATH).
-    """
     global HF_TOKEN
     if not HF_TOKEN:
         HF_TOKEN = os.getenv("HF_TOKEN", "")
@@ -404,22 +352,190 @@ def download_model_via_hf(repo_id: str, select_strategy) -> str:
 # ----------------- Inference test helpers -----------------
 
 
-def parse_llama_cpp_response(resp) -> str:
-    """Try common response shapes from llama-cpp-python."""
+def parse_llama_cpp_response(resp: Any) -> str:
+    """
+    Try multiple common response shapes from llama-cpp-python and related wrappers.
+    """
     try:
-        # older/newer shapes
+        # If it's a dict with choices (OpenAI-style)
         if isinstance(resp, dict):
             if "choices" in resp and len(resp["choices"]) > 0:
                 c = resp["choices"][0]
+                # OpenAI-like: c may be dict with 'text' or 'message'
                 if isinstance(c, dict):
                     if "text" in c:
                         return str(c["text"])
                     if "message" in c and isinstance(c["message"], dict):
                         return str(c["message"].get("content", ""))
+                # older llama-cpp-python sometimes returns 'choices' with 'text' nested
+                if isinstance(c, str):
+                    return c
                 return str(c)
+        # If it's an object with .choices
+        if hasattr(resp, "choices"):
+            try:
+                c = resp.choices[0]
+                if hasattr(c, "text"):
+                    return str(c.text)
+                if isinstance(c, dict) and "text" in c:
+                    return str(c["text"])
+            except Exception:
+                pass
+        # If it's a generator/iterator of chunks
+        if hasattr(resp, "__iter__") and not isinstance(resp, (str, bytes, dict)):
+            # Attempt to join pieces
+            pieces = []
+            try:
+                for part in resp:
+                    if isinstance(part, dict):
+                        # chunk shapes may have 'delta' or 'content' or 'text'
+                        if "text" in part:
+                            pieces.append(str(part["text"]))
+                        elif "content" in part:
+                            pieces.append(str(part["content"]))
+                        else:
+                            pieces.append(str(part))
+                    else:
+                        pieces.append(str(part))
+                return "".join(pieces)
+            except TypeError:
+                # not iterable
+                pass
+        # fallback to string
         return str(resp)
     except Exception:
-        return str(resp)
+        try:
+            return str(resp)
+        except Exception:
+            return "<unparseable response>"
+
+
+def _attempt_method_calls(
+    llm, prompt: str, max_tokens: int, temp: float
+) -> Optional[str]:
+    """
+    Try several method call shapes in order. Returns text or None.
+    Logs attempted signatures for debugging.
+    """
+    attempts = []
+
+    def try_call(func, *args, **kwargs):
+        name = getattr(func, "__name__", repr(func))
+        attempts.append((name, args, kwargs))
+        try:
+            out = func(*args, **kwargs)
+            # If out is a generator, gather it
+            if hasattr(out, "__iter__") and not isinstance(out, (str, bytes, dict)):
+                # collect
+                collected = []
+                try:
+                    for chunk in out:
+                        collected.append(chunk)
+                    out = "".join(map(str, collected))
+                except Exception:
+                    # fallback to string conversion
+                    out = str(out)
+            return out
+        except TypeError as te:
+            _log(f"TypeError calling {name}: {te}")
+            return te
+        except Exception as e:
+            _log(f"Exception calling {name}: {e}")
+            return e
+
+    # Candidate call shapes (order matters)
+    # 1) create(prompt=..., max_tokens=..., temperature=...)
+    if hasattr(llm, "create"):
+        _log("Attempting llm.create with various arg names...")
+        # try many plausible kwarg combos
+        cand_kwargs = [
+            {"prompt": prompt, "max_tokens": max_tokens, "temperature": temp},
+            {"prompt": prompt, "max_new_tokens": max_tokens, "temperature": temp},
+            {"prompt": prompt, "n_predict": max_tokens, "temperature": temp},
+            {
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": max_tokens,
+                "temperature": temp,
+            },
+            {
+                "messages": [{"role": "user", "content": prompt}],
+                "max_new_tokens": max_tokens,
+                "temperature": temp,
+            },
+            {"prompt": prompt},  # minimal
+        ]
+        for kw in cand_kwargs:
+            res = try_call(llm.create, **kw)
+            if not isinstance(res, (TypeError, Exception)) and res is not None:
+                _log("llm.create succeeded with kwargs:", kw.keys())
+                return parse_llama_cpp_response(res)
+
+    # 2) generate(prompt, ...) positional-first style
+    if hasattr(llm, "generate"):
+        _log("Attempting llm.generate with various arg names/positions...")
+        try_order = []
+        # try positional first
+        try_order.append(
+            ("positional", (prompt,), {"max_tokens": max_tokens, "temperature": temp})
+        )
+        try_order.append(
+            (
+                "kwargs_max_tokens",
+                (),
+                {"prompt": prompt, "max_tokens": max_tokens, "temperature": temp},
+            )
+        )
+        try_order.append(
+            (
+                "kwargs_max_new_tokens",
+                (),
+                {"prompt": prompt, "max_new_tokens": max_tokens, "temperature": temp},
+            )
+        )
+        try_order.append(
+            (
+                "kwargs_n_predict",
+                (),
+                {"prompt": prompt, "n_predict": max_tokens, "temperature": temp},
+            )
+        )
+        try_order.append(("prompt_only", (), {"prompt": prompt}))
+        for tag, args, kw in try_order:
+            res = try_call(llm.generate, *args, **kw)
+            if not isinstance(res, (TypeError, Exception)) and res is not None:
+                _log("llm.generate succeeded with attempt:", tag)
+                return parse_llama_cpp_response(res)
+
+    # 3) Try calling the instance directly: llm(prompt) or llm(prompt=..)
+    _log("Attempting to call llm as callable...")
+    try:
+        res = try_call(llm, prompt)
+        if not isinstance(res, (TypeError, Exception)) and res is not None:
+            _log("llm(...) callable succeeded (positional).")
+            return parse_llama_cpp_response(res)
+    except Exception as e:
+        _log("callable attempt raised:", e)
+
+    try:
+        res = try_call(llm, prompt=prompt, max_tokens=max_tokens, temperature=temp)
+        if not isinstance(res, (TypeError, Exception)) and res is not None:
+            _log("llm(...) callable succeeded (kwargs).")
+            return parse_llama_cpp_response(res)
+    except Exception as e:
+        _log("callable kwargs attempt raised:", e)
+
+    # If none worked, log all attempts for debugging
+    _log("All llama-cpp call attempts failed. Attempts log (truncated):")
+    for a in attempts[:10]:
+        _log(
+            " -",
+            a[0],
+            "args:",
+            a[1],
+            "kwargs keys:",
+            list(a[2].keys()) if isinstance(a[2], dict) else a[2],
+        )
+    return None
 
 
 def test_with_llama_cpp(
@@ -427,7 +543,7 @@ def test_with_llama_cpp(
 ) -> Optional[str]:
     """
     Try to use llama-cpp-python (llama_cpp package) to load the gguf and get a response.
-    Handles a few API variants / fallbacks.
+    Robustly handles multiple API shapes and kwarg names.
     """
     try:
         from llama_cpp import Llama
@@ -437,42 +553,16 @@ def test_with_llama_cpp(
 
     try:
         _log("Loading model with llama_cpp:", model_path)
-        # instantiate Llama; the library will load the GGUF
         llm = Llama(model_path=model_path)
         _log("Model loaded with llama_cpp. Trying to create/generate response...")
-        # Try several API variants:
-        try:
-            resp = llm.create(prompt=prompt, max_tokens=max_tokens, temperature=temp)
-            text = parse_llama_cpp_response(resp)
-            _log("llama_cpp.create success (truncated):", text[:300])
-            return text
-        except AttributeError:
-            _log("llama_cpp instance has no method 'create'. Trying 'generate' ...")
-            try:
-                resp = llm.generate(prompt, max_tokens=max_tokens, temperature=temp)
-                # some builds return a generator; others return object
-                if isinstance(resp, dict) and "choices" in resp:
-                    text = parse_llama_cpp_response(resp)
-                else:
-                    text = str(resp)
-                _log("llama_cpp.generate success (truncated):", text[:300])
-                return text
-            except Exception as e2:
-                _log("llama_cpp.generate failed:", e2)
-                # try call as function (some older wrappers)
-                try:
-                    resp = llm(prompt)
-                    text = parse_llama_cpp_response(resp)
-                    _log(
-                        "llama_cpp callable produced response (truncated):", text[:300]
-                    )
-                    return text
-                except Exception as e3:
-                    _log("llama_cpp callable failed:", e3)
-                    return None
-        except Exception as e:
-            _log("llama_cpp.create returned error:", e)
-            return None
+        text = _attempt_method_calls(llm, prompt, max_tokens, temp)
+        if text is not None:
+            _log("llama-cpp call produced output (truncated):", str(text)[:300])
+            return str(text)
+        _log(
+            "No usable response from llama-cpp-python instance after trying known call shapes."
+        )
+        return None
     except Exception as e:
         _log("Error loading model / running inference with llama_cpp:", e)
         return None
@@ -565,7 +655,7 @@ def main():
         if resp and len(str(resp).strip()) > 0:
             _log("SUCCESS: model responded via llama-cpp-python.")
             _log("Response (first 400 chars):")
-            _log(str(resp)[:100000])
+            _log(str(resp)[:400])
             if POST_SUCCESS_CMD:
                 run_post_success(POST_SUCCESS_CMD)
             _log("Total time: {:.1f}s".format(time.time() - start))
@@ -578,7 +668,7 @@ def main():
         if resp2 and len(str(resp2).strip()) > 0:
             _log("SUCCESS: model responded via llama.cpp binary.")
             _log("Response (first 400 chars):")
-            _log(str(resp2)[:100000])
+            _log(str(resp2)[:400])
             if POST_SUCCESS_CMD:
                 run_post_success(POST_SUCCESS_CMD)
             _log("Total time: {:.1f}s".format(time.time() - start))

@@ -13,17 +13,13 @@ Use:
     pipeline.generate_image_prompts(script_text, img_number=150, batch_size=50)
 """
 
-import requests
-import json
 import time
 import sys
 import os
-import random
 import re
-import ast
-import math
 import difflib
-from typing import Optional, List, Dict
+from pathlib import Path
+from typing import Optional, List
 from threading import Thread, Event
 from datetime import datetime
 
@@ -58,14 +54,132 @@ class LoadingSpinner:
             self.thread.join()
 
 
-# ---------------------- CHAT API HANDLER ----------------------
-class ChatAPI:
+# ---------------------- LOCAL LLM BACKEND ----------------------
+class LocalLLM:
+    """
+    LocalLLM: a drop-in replacement for ChatAPI.send_message that uses a local model.
+    Usage:
+        local = LocalLLM(model_dir="/home/runner/work/runner-script/runner-script/models")
+        resp = local.send_message("Write a short story...", timeout=60)
+    Backends tried (in order):
+      1. llama-cpp-python (Llama)
+      2. gpt4all (GPT4All)
+      3. transformers (AutoModelForCausalLM + AutoTokenizer) - best-effort for local torch checkpoints
+    """
+
+    MODEL_EXTENSIONS = [
+        ".gguf",
+        ".ggml",
+        ".bin",
+        ".pt",
+        ".pth",
+        ".safetensors",
+        ".model",
+    ]
+
     def __init__(
-        self, url: str = "https://apifreellm.com/api/chat", default_timeout: int = 100
+        self,
+        model_dir: str = "/home/runner/work/runner-script/runner-script/models",
+        default_timeout: int = 100,
     ):
-        self.url = url
-        self.headers = {"Content-Type": "application/json"}
+        self.model_dir = str(model_dir)
         self.base_timeout = default_timeout
+        self.backend = None
+        self.model_path = None
+        self._impl = None
+        # locate model and init backend
+        self._find_and_init()
+
+    def _find_model_file(self) -> Optional[str]:
+        # Look for files with common model extensions (first-found)
+        p = Path(self.model_dir)
+        if not p.exists():
+            return None
+        # scan recursively to find a likely model
+        for ext in self.MODEL_EXTENSIONS:
+            items = list(p.rglob(f"*{ext}"))
+            if items:
+                # prefer largest file (heuristic)
+                items_sorted = sorted(
+                    items, key=lambda x: x.stat().st_size, reverse=True
+                )
+                return str(items_sorted[0])
+        # fallback: any file in folder
+        allfiles = [f for f in p.rglob("*") if f.is_file()]
+        if allfiles:
+            return str(
+                sorted(allfiles, key=lambda x: x.stat().st_size, reverse=True)[0]
+            )
+        return None
+
+    def _find_and_init(self):
+        model_file = self._find_model_file()
+        if not model_file:
+            raise RuntimeError(
+                f"No model files found under {self.model_dir}. Place your .gguf/.ggml/.safetensors/.pt model there."
+            )
+        self.model_path = model_file
+
+        # try llama-cpp-python
+        try:
+            from llama_cpp import Llama  # type: ignore
+
+            try:
+                print(
+                    f"LocalLLM: initialising llama-cpp-python with model {self.model_path}"
+                )
+                self._impl = Llama(model_path=self.model_path)
+                self.backend = "llama_cpp"
+                return
+            except Exception as e:
+                print(f"LocalLLM: llama-cpp load failed: {e}")
+                # continue to other backends
+        except Exception:
+            pass
+
+        # try gpt4all
+        try:
+            from gpt4all import GPT4All  # type: ignore
+
+            try:
+                print(f"LocalLLM: initialising gpt4all with model {self.model_path}")
+                self._impl = GPT4All(model=self.model_path)
+                self.backend = "gpt4all"
+                return
+            except Exception as e:
+                print(f"LocalLLM: gpt4all init failed: {e}")
+        except Exception:
+            pass
+
+        # try transformers (cpu) - best effort for torch files
+        try:
+            from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline  # type: ignore
+
+            # attempt to load model path (if path points to a transformers-compatible dir or huggingface repo)
+            try:
+                print(
+                    f"LocalLLM: attempting Transformers backend with model {self.model_path}"
+                )
+                # If path is a local folder, pipeline will try to load it.
+                gen = pipeline(
+                    "text-generation",
+                    model=self.model_path,
+                    device_map="auto" if False else None,
+                )
+                self._impl = gen
+                self.backend = "transformers"
+                return
+            except Exception as e:
+                print(f"LocalLLM: transformers pipeline failed: {e}")
+        except Exception:
+            pass
+
+        # No backend available
+        raise RuntimeError(
+            "LocalLLM: No supported local LLM backend could be initialised. "
+            "Please install one of: 'llama-cpp-python' (recommended for .gguf), 'gpt4all', or 'transformers' and make sure a compatible model exists in the model_dir. "
+            f"Model dir inspected: {self.model_dir}, found file: {self.model_path}"
+        )
 
     def send_message(
         self,
@@ -78,137 +192,79 @@ class ChatAPI:
         spinner_message: str = "Waiting for response...",
     ) -> str:
         """
-        Robust POST with backoff and optional per-call timeout.
-        Returns the raw response text or raises RuntimeError on fatal client error.
+        Keep same signature used across the rest of your code for compatibility.
+        Returns the generated text.
         """
-        spinner = LoadingSpinner(spinner_message)
-        attempt = 0
         timeout = timeout or self.base_timeout
-        backoff = initial_backoff
-        start_time = time.monotonic()
+        # Short wrapper per backend
+        if self.backend == "llama_cpp":
+            return self._send_llama_cpp(message, timeout)
+        elif self.backend == "gpt4all":
+            return self._send_gpt4all(message, timeout)
+        elif self.backend == "transformers":
+            return self._send_transformers(message, timeout)
+        else:
+            raise RuntimeError("LocalLLM: unsupported backend")
 
-        while True:
-            attempt += 1
-            try:
-                print(f"\nAttempt #{attempt} — timeout={timeout}s — sending request...")
-                spinner.start()
-                resp = requests.post(
-                    self.url,
-                    headers=self.headers,
-                    json={"message": message},
-                    timeout=timeout,
-                )
-                spinner.stop()
-
-                status = resp.status_code
-
-                if status == 429 or 500 <= status < 600:
-                    print(
-                        f"⚠️ Server/Rate error HTTP {status}. Backing off {backoff:.1f}s and retrying..."
-                    )
-                    time.sleep(backoff + random.uniform(0, 1.0))
-                    backoff = min(backoff * 2, max_backoff)
-                    timeout = min(timeout + 100, 100000)
-                    continue
-
-                if 400 <= status < 500:
-                    # client error - optionally retry
-                    try:
-                        payload = resp.json()
-                        error_msg = payload.get("error") or json.dumps(payload)
-                    except Exception:
-                        error_msg = resp.text or f"HTTP {status}"
-                    msg = f"HTTP {status} - {error_msg}"
-
-                    if retry_on_client_errors:
-                        print(
-                            f"⚠️ Client error {msg} — retrying because retry_on_client_errors=True. Backoff {backoff:.1f}s..."
+    # --- per-backend impls ---
+    def _send_llama_cpp(self, prompt: str, timeout: int) -> str:
+        # llama-cpp-python Llama.create expects 'prompt' or 'prompt' + params. We'll request a completion.
+        try:
+            # guards for different llama-cpp-python versions
+            resp = self._impl.create(
+                prompt=prompt, max_tokens=1024, temperature=0.7, top_p=0.95
+            )
+            # some versions return dict with 'choices'
+            text = ""
+            if isinstance(resp, dict):
+                # prefer structure like { 'choices':[ {'text': '...'} ] }
+                try:
+                    choices = resp.get("choices")
+                    if choices and isinstance(choices, (list, tuple)):
+                        text = "".join(
+                            [c.get("text", "") for c in choices if isinstance(c, dict)]
                         )
-                        time.sleep(backoff + random.uniform(0, 1.0))
-                        backoff = min(backoff * 2, max_backoff)
-                        timeout = min(timeout + 100, 100000)
-                        continue
                     else:
-                        raise RuntimeError(f"Fatal client error (not retried): {msg}")
-
-                # non-error status
-                resp.raise_for_status()
-                try:
-                    result = resp.json()
-                except json.JSONDecodeError as e:
-                    print(
-                        f"⚠️ Invalid JSON received (will retry): {e}. Backing off {backoff:.1f}s..."
-                    )
-                    time.sleep(backoff + random.uniform(0, 1.0))
-                    backoff = min(backoff * 2, max_backoff)
-                    timeout = min(timeout + 100, 100000)
-                    continue
-
-                # Expecting JSON with {status: "success", response: "..."} per original code
-                if isinstance(result, dict) and result.get("status") == "success":
-                    content = result.get("response", "")
-                    if content is None:
-                        content = ""
-                    elapsed = int(time.monotonic() - start_time)
-                    print(f"✅ Success on attempt #{attempt} (elapsed {elapsed}s).")
-                    return content
-                else:
-                    # Could be different schema; we'll try fallback to string form
-                    err = (
-                        result.get("error")
-                        if isinstance(result, dict)
-                        else f"Unexpected body: {result}"
-                    )
-                    print(
-                        f"⚠️ API returned error or unexpected payload: {err}. Backing off {backoff:.1f}s and retrying..."
-                    )
-                    time.sleep(backoff + random.uniform(0, 1.0))
-                    backoff = min(backoff * 2, max_backoff)
-                    timeout = min(timeout + 100, 100000)
-                    continue
-
-            except requests.exceptions.Timeout as e:
-                spinner.stop()
-                print(
-                    f"\n⚠️ Timeout on attempt #{attempt}: {e}. Backing off {backoff:.1f}s and retrying..."
-                )
-                time.sleep(backoff + random.uniform(0, 1.0))
-                backoff = min(backoff * 2, max_backoff)
-                timeout = min(timeout + 100, 100000)
-                continue
-
-            except (
-                requests.exceptions.ConnectionError,
-                requests.exceptions.RequestException,
-            ) as e:
-                spinner.stop()
-                print(
-                    f"\n⚠️ Network error on attempt #{attempt}: {e}. Backing off {backoff:.1f}s and retrying..."
-                )
-                time.sleep(backoff + random.uniform(0, 1.0))
-                backoff = min(backoff * 2, max_backoff)
-                timeout = min(timeout + 100, 100000)
-                continue
-
-            except RuntimeError:
-                spinner.stop()
-                raise
-
-            except Exception as e:
-                spinner.stop()
-                print(
-                    f"\n⚠️ Unexpected error on attempt #{attempt}: {e}. Backing off {backoff:.1f}s and retrying..."
-                )
-                time.sleep(backoff + random.uniform(0, 1.0))
-                backoff = min(backoff * 2, max_backoff)
-                timeout = min(timeout + 100, 100000)
-                continue
-
-            finally:
-                try:
-                    spinner.stop()
+                        text = resp.get("text", "") or ""
                 except Exception:
-                    pass
+                    text = str(resp)
+            else:
+                text = str(resp)
+            return text.strip()
+        except Exception as e:
+            raise RuntimeError(f"LocalLLM: llama-cpp generation error: {e}")
+
+    def _send_gpt4all(self, prompt: str, timeout: int) -> str:
+        try:
+            # GPT4All generate returns or prints; we use generate with streaming suppressed
+            # The Python API may be: self._impl.generate(prompt=prompt, n_predict=200)
+            # We'll attempt common use:
+            r = self._impl.generate(prompt, max_tokens=1024, streaming=False)
+            # GPT4All implementations sometimes return a dict or provide a last_text attr
+            if isinstance(r, dict) and "text" in r:
+                return r["text"].strip()
+            # try reading .response or .last_text
+            if hasattr(self._impl, "response"):
+                return str(self._impl.response).strip()
+            if hasattr(self._impl, "last_text"):
+                return str(self._impl.last_text).strip()
+            # fallback to str(r)
+            return str(r).strip()
+        except Exception as e:
+            raise RuntimeError(f"LocalLLM: gpt4all generation error: {e}")
+
+    def _send_transformers(self, prompt: str, timeout: int) -> str:
+        try:
+            # pipeline call: return list of dicts
+            out = self._impl(
+                prompt, max_new_tokens=512, do_sample=True, top_p=0.95, temperature=0.7
+            )
+            if isinstance(out, list) and out:
+                text = out[0].get("generated_text", "") or out[0].get("text", "")
+                return text.strip()
+            return str(out).strip()
+        except Exception as e:
+            raise RuntimeError(f"LocalLLM: transformers generation error: {e}")
 
 
 # ---------------------- UTILITIES ----------------------
@@ -329,10 +385,10 @@ def clean_script_text(script_text: str) -> str:
 class StoryPipeline:
     def __init__(
         self,
-        api_url: str = "https://apifreellm.com/api/chat",
         default_timeout: int = 100,
+        model_dir: str = "/home/runner/work/runner-script/runner-script/models",
     ):
-        self.chat = ChatAPI(url=api_url, default_timeout=default_timeout)
+        self.chat = LocalLLM(model_dir=model_dir, default_timeout=default_timeout)
 
     def _build_script_prompt(
         self,
@@ -1791,7 +1847,8 @@ if __name__ == "__main__":
     start = time.time()
 
     pipeline = StoryPipeline(
-        api_url="https://apifreellm.com/api/chat", default_timeout=100
+        default_timeout=100,
+        model_dir="/home/runner/work/runner-script/runner-script/models",
     )
 
     # --- Example 1: Only generate the story/script (BRACKETED single block file saved) ---
