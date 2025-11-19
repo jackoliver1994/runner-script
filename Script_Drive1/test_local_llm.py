@@ -33,7 +33,10 @@ MODEL_DEST_PATH: str = os.getenv(
 )
 USE_AUTH: bool = os.getenv("USE_AUTH", "true").lower() in ("1", "true", "yes")
 SELECT_STRATEGY: str = os.getenv("SELECT_STRATEGY", "auto").lower()
-TEST_PROMPT: str = os.getenv("TEST_PROMPT", "Q: What is 2 + 2?\nA:")
+TEST_PROMPT: str = os.getenv(
+    "TEST_PROMPT",
+    "Q: What is 2 + 2?\nA:(stritly answer with correct answer) and write me 3000 word script for children story about a brave little toaster.\n",
+)
 TEST_MAX_TOKENS: int = int(os.getenv("TEST_MAX_TOKENS", "64"))
 TEST_TEMPERATURE: float = float(os.getenv("TEST_TEMPERATURE", "0.0"))
 VERBOSE: bool = os.getenv("VERBOSE", "true").lower() in ("1", "true", "yes")
