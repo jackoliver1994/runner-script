@@ -10,7 +10,7 @@ import inspect
 
 # ----------------- CONFIG (read from env; override here if needed) -----------------
 HF_TOKEN: str = os.getenv("HF_TOKEN", "")  # Provided by GitHub workflow (hf_key)
-REPO_ID: str = os.getenv("REPO_ID", "ggml-org/Mistral-Small-3.1-24B-Instruct-2503-GGUF")
+REPO_ID: str = os.getenv("REPO_ID", "mistralai/Mistral-Small-3.1-24B-Instruct-2503")
 MODEL_DEST_PATH: str = os.getenv(
     "MODEL_DEST_PATH", os.path.join(os.getcwd(), "models", "mistral-small-3.1.gguf")
 )
