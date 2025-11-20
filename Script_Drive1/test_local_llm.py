@@ -526,7 +526,7 @@ def _attempt_method_calls(
 
     # If none worked, log all attempts for debugging
     _log("All llama-cpp call attempts failed. Attempts log (truncated):")
-    for a in attempts[:10]:
+    for a in attempts:
         _log(
             " -",
             a[0],
@@ -557,7 +557,7 @@ def test_with_llama_cpp(
         _log("Model loaded with llama_cpp. Trying to create/generate response...")
         text = _attempt_method_calls(llm, prompt, max_tokens, temp)
         if text is not None:
-            _log("llama-cpp call produced output (truncated):", str(text)[:300])
+            _log("llama-cpp call produced output (truncated):", str(text))
             return str(text)
         _log(
             "No usable response from llama-cpp-python instance after trying known call shapes."
@@ -603,11 +603,11 @@ def test_with_llama_cpp_binary(
         if proc.returncode != 0:
             _log(
                 "llama.cpp binary returned non-zero code. stderr (truncated):",
-                proc.stderr[:1000],
+                proc.stderr,
             )
             return None
         out = proc.stdout.strip()
-        _log("llama.cpp binary output (truncated):", out[:800])
+        _log("llama.cpp binary output (truncated):", out)
         return out
     except Exception as e:
         _log("Error running llama.cpp binary:", e)
