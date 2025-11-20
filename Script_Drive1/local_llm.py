@@ -81,7 +81,7 @@ class LocalLLM:
     def __init__(
         self,
         model_dir: str = "/home/runner/work/runner-script/runner-script/models",
-        default_timeout: int = 300,
+        default_timeout: int = 10,
     ):
         self.model_dir = str(model_dir)
         self.base_timeout = default_timeout
@@ -123,66 +123,19 @@ class LocalLLM:
             from llama_cpp import Llama  # type: ignore
 
             print(f"LocalLLM: attempting llama-cpp-python init with {self.model_path}")
-
-            # set OMP threads from CPU count if not set
             cpu_count = os.cpu_count() or 1
             os.environ.setdefault("OMP_NUM_THREADS", str(max(1, cpu_count - 1)))
-            # try different n_ctx values (model metadata might say 131072; try large then fallback)
-            desired_ctx_candidates = []
-            # try to extract from gguf metadata by probing file name or default guesses
-            # prefer trying very large first but will step down if constructor fails
-            # common safe sequence
-            desired_ctx_candidates = [
-                131072,
-                65536,
-                32768,
-                16384,
-                8192,
-                4096,
-                2048,
-                1024,
-                512,
-            ]
 
-            last_exc = None
-            for n_ctx_try in desired_ctx_candidates:
-                try:
-                    # try to instantiate with n_ctx param (some llama-cpp-python versions accept it)
-                    print(
-                        f"LocalLLM: trying Llama(...) with n_ctx={n_ctx_try}, n_threads={cpu_count}"
-                    )
-                    try:
-                        self._impl = Llama(
-                            model_path=self.model_path,
-                            n_ctx=n_ctx_try,
-                            n_threads=cpu_count,
-                        )
-                    except TypeError:
-                        # older/newer versions may not accept n_threads param; try other combos
-                        try:
-                            self._impl = Llama(
-                                model_path=self.model_path, n_ctx=n_ctx_try
-                            )
-                        except TypeError:
-                            self._impl = Llama(model_path=self.model_path)
-                            # if this succeeds, we'll detect n_ctx below and accept whatever it is
-                    # detect runtime n_ctx after init
-                    self._n_ctx = self._detect_n_ctx()
-                    # if detected n_ctx is smaller than requested and we asked large, it's okay; keep actual.
-                    print(
-                        f"LocalLLM: llama-cpp init succeeded (requested {n_ctx_try}) -> runtime n_ctx={self._n_ctx}"
-                    )
-                    self.backend = "llama_cpp"
-                    break
-                except Exception as e:
-                    last_exc = e
-                    # clean up and try next smaller context
-                    print(f"LocalLLM: init with n_ctx={n_ctx_try} failed: {e}")
-                    continue
-            if not self._impl:
-                raise RuntimeError(
-                    f"LocalLLM: failed to init llama-cpp-python: {last_exc}"
-                )
+            # Try a single, safe Llama init (no insane n_ctx values).
+            try:
+                self._impl = Llama(model_path=self.model_path, n_threads=cpu_count)
+            except TypeError:
+                # older llama-cpp-python might not accept n_threads
+                self._impl = Llama(model_path=self.model_path)
+
+            self._n_ctx = self._detect_n_ctx()
+            print(f"LocalLLM: llama-cpp init succeeded -> runtime n_ctx={self._n_ctx}")
+            self.backend = "llama_cpp"
             return
         except Exception as e:
             print(f"LocalLLM: llama-cpp-python not available or init failed: {e}")
@@ -318,7 +271,7 @@ class LocalLLM:
         retry_on_client_errors: bool = False,
         initial_backoff: float = 1.0,
         max_backoff: float = 8.0,
-        spinner_message: str = "Waiting for response...",
+        spinner_message: str = "Waiting for response.",
         max_new_tokens: Optional[int] = None,
         temperature: float = 0.7,
         top_p: float = 0.95,
@@ -326,73 +279,38 @@ class LocalLLM:
         n_batch: int = 1,
         unlimited: bool = False,
         chunk_size: int = 512,
+        max_retries: Optional[int] = None,  # NEW: allow caller to limit retries
     ) -> str:
-        """
-        Signature is kept compatible with your existing call sites.
-        New optional params:
-          - max_new_tokens: per-generation token cap (if None default chosen below)
-          - unlimited: if True, auto-continue generation in chunks until a stop condition
-          - chunk_size: tokens per chunk when unlimited=True
-        Behavior:
-          - trims the prompt to fit the model context window
-          - if unlimited=True it will generate repeatedly (chunked) and stitch outputs,
-            preserving the most recent context up to n_ctx for each continuation step.
-        """
-        timeout = timeout or self.base_timeout
+        ...
         attempt = 0
         backoff = initial_backoff
         if max_new_tokens is None:
             max_new_tokens = min(1024, (self._n_ctx or 512) // 2)
 
+        # convert None => infinite when retry_forever True; otherwise cap = max_retries or 5
+        if retry_forever:
+            cap = None
+        else:
+            cap = max_retries if isinstance(max_retries, int) and max_retries > 0 else 5
+
         while True:
             attempt += 1
             try:
-                # ensure prompt fits single-chunk generation
-                prompt_to_send = self._trim_prompt_to_fit(
-                    message, max_new_tokens if not unlimited else chunk_size
-                )
-                if unlimited:
-                    return self._generate_unlimited(
-                        prompt_to_send,
-                        timeout,
-                        chunk_size,
-                        temperature,
-                        top_p,
-                        repeat_penalty,
-                        n_batch,
-                    )
-                else:
-                    if self.backend == "llama_cpp":
-                        return self._send_llama_cpp(
-                            prompt_to_send,
-                            timeout,
-                            max_new_tokens,
-                            temperature,
-                            top_p,
-                            repeat_penalty,
-                            n_batch,
-                        )
-                    elif self.backend == "gpt4all":
-                        return self._send_gpt4all(
-                            prompt_to_send, timeout, max_new_tokens
-                        )
-                    elif self.backend == "transformers":
-                        return self._send_transformers(
-                            prompt_to_send, timeout, max_new_tokens, temperature, top_p
-                        )
-                    else:
-                        raise RuntimeError("LocalLLM: unsupported backend")
+                ...
             except Exception as e:
                 print(f"⚠️ send_message failed on generation attempt {attempt}: {e}")
-                if not retry_forever and attempt >= 5:
-                    raise
+                # enforce hard cap if set and not retry_forever
+                if cap is not None and attempt >= cap:
+                    raise RuntimeError(
+                        f"send_message: reached max retries ({cap}). Last error: {e}"
+                    )
                 if (
                     "403" in str(e) or "client error" in str(e).lower()
                 ) and not retry_on_client_errors:
                     raise
                 time.sleep(min(backoff, max_backoff))
                 backoff = min(backoff * 2, max_backoff)
-                # retry (infinite if requested)
+                # continue loop (may be infinite if cap is None)
 
     # --------------- chunked/unlimited generation helper ---------------
     def _generate_unlimited(
@@ -447,12 +365,21 @@ class LocalLLM:
                 break
             # append chunk to output
             output += chunk
-            # stop heuristics: if chunk ends with an EOS-like token or is very short
-            if len(chunk.strip()) == 0:
+            # Trim chunk and detect common end signals or repeated outputs
+            chunk_stripped = chunk.strip()
+            if not chunk_stripped:
+                # model emitted nothing -> stop
                 break
-            if any(tok in chunk.strip()[-32:].lower() for tok in ("\n\n", "")):
-                # continue a bit more (not a reliable stop but conservative)
-                pass
+
+            # If the chunk ends with explicit end-of-text marker, stop.
+            if chunk_stripped.endswith("") or chunk_stripped.endswith("[end]"):
+                break
+
+            # If generation is repeating the same short fragment many times, stop to avoid runaway loops.
+            recent_tail = output[-512:] if len(output) > 512 else output
+            if recent_tail.endswith(chunk_stripped) and len(chunk_stripped) < 64:
+                # repeating a small fragment -> break to avoid infinite loops
+                break
 
             # prepare next prompt: keep last (n_ctx // 2) tokens of combined prompt+output to retain context
             combined = (prompt + "\n" + output)[
@@ -769,7 +696,7 @@ def clean_script_text(script_text: str) -> str:
 class StoryPipeline:
     def __init__(
         self,
-        default_timeout: int = 100,
+        default_timeout: int = 10,
         model_dir: str = "/home/runner/work/runner-script/runner-script/models",
     ):
         self.chat = LocalLLM(model_dir=model_dir, default_timeout=default_timeout)
@@ -1137,6 +1064,8 @@ class StoryPipeline:
                     resp = self.chat.send_message(
                         req_prompt,
                         timeout=timeout,
+                        max_new_tokens=1024,
+                        unlimited=True,
                         spinner_message=f"Generating initial script (attempt {attempt})...",
                     )
                 except Exception as e:
@@ -1185,6 +1114,8 @@ class StoryPipeline:
                             cond_resp = self.chat.send_message(
                                 condense_prompt,
                                 timeout=timeout,
+                                max_new_tokens=1024,
+                                unlimited=True,
                                 spinner_message=f"Condensing (try {ct+1}/{condense_tries})...",
                             )
                         except Exception as e:
@@ -1278,6 +1209,8 @@ class StoryPipeline:
                 cont_resp = self.chat.send_message(
                     cont_prompt,
                     timeout=timeout,
+                    max_new_tokens=1024,
+                    unlimited=True,
                     spinner_message=f"Continuation attempt (overall attempt {attempt})...",
                 )
             except Exception as e:
@@ -1313,6 +1246,8 @@ class StoryPipeline:
                     gen_resp = self.chat.send_message(
                         gen_prompt,
                         timeout=timeout,
+                        max_new_tokens=1024,
+                        unlimited=True,
                         spinner_message="Generating appended chunk...",
                     )
                 except Exception as e:
@@ -1818,6 +1753,8 @@ class StoryPipeline:
                     resp = self.chat.send_message(
                         prompt_request,
                         timeout=timeout_per_call,
+                        max_new_tokens=1024,
+                        unlimited=True,
                         spinner_message=f"Generating paragraph {para_idx+1} prompts (attempt {paragraph_attempts})...",
                     )
                 except Exception as e:
@@ -2010,6 +1947,8 @@ class StoryPipeline:
                     resp = self.chat.send_message(
                         prompt_request,
                         timeout=timeout_per_call,
+                        max_new_tokens=1024,
+                        unlimited=True,
                         spinner_message="Filling missing prompts...",
                     )
                 except Exception:
@@ -2162,6 +2101,8 @@ class StoryPipeline:
         resp = self.chat.send_message(
             prompt,
             timeout=timeout or self.chat.base_timeout,
+            max_new_tokens=1024,
+            unlimited=True,
             spinner_message="Generating narration...",
         )
         narr_block = extract_largest_bracketed(resp)
@@ -2231,7 +2172,7 @@ if __name__ == "__main__":
     start = time.time()
 
     pipeline = StoryPipeline(
-        default_timeout=100,
+        default_timeout=10,
         model_dir="/home/runner/work/runner-script/runner-script/models",
     )
 

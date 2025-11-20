@@ -349,60 +349,79 @@ def download_model_via_hf(repo_id: str, select_strategy) -> str:
     return MODEL_DEST_PATH
 
 
-# ----------------- Inference test helpers -----------------
+# ----------------- Inference test helpers (FIXED parsing + streaming handling) -----------------
+
+
+def _extract_text(obj: Any) -> str:
+    """Robustly extract textual content from many common LLM response shapes.
+
+    Handles:
+    - plain strings/bytes
+    - dicts with keys: text, content, message, delta, output, data
+    - OpenAI/Chat-style {'choices': [{'message': {'content': ...}}]}
+    - streaming chunks like {'choices':[{'delta':{'content':'...'}}]}
+    - nested lists
+    Returns concatenated text (may include newlines).
+    """
+
+    if obj is None:
+        return ""
+    if isinstance(obj, str):
+        return obj
+    if isinstance(obj, bytes):
+        try:
+            return obj.decode("utf-8", errors="replace")
+        except Exception:
+            return str(obj)
+    if isinstance(obj, (int, float, bool)):
+        return str(obj)
+    if isinstance(obj, list):
+        return "".join(_extract_text(x) for x in obj)
+    if isinstance(obj, dict):
+        # Priority: direct text/content fields
+        for k in ("text", "content", "answer", "response", "output"):
+            if k in obj and obj[k] is not None:
+                return _extract_text(obj[k])
+        # message -> content
+        if "message" in obj and obj["message"] is not None:
+            # message may be a dict with 'content' or string
+            return _extract_text(obj["message"])
+        # delta commonly used in streaming
+        if "delta" in obj and obj["delta"] is not None:
+            return _extract_text(obj["delta"])
+        # choices: concatenate each choice
+        if "choices" in obj and obj["choices"] is not None:
+            parts = []
+            try:
+                for choice in obj["choices"]:
+                    parts.append(_extract_text(choice))
+                return "".join(parts)
+            except Exception:
+                # fallback to stringifying
+                return str(obj["choices"]) if obj["choices"] is not None else ""
+        # If none matched, try concatenating values (preserve order) to avoid losing text
+        try:
+            vals = []
+            for v in obj.values():
+                vals.append(_extract_text(v))
+            return "".join(vals)
+        except Exception:
+            return str(obj)
+    # fallback
+    try:
+        return str(obj)
+    except Exception:
+        return ""
 
 
 def parse_llama_cpp_response(resp: Any) -> str:
     """
     Try multiple common response shapes from llama-cpp-python and related wrappers.
+    This version uses _extract_text to preserve multi-chunk/streamed responses and nested
+    message/delta shapes.
     """
     try:
-        # If it's a dict with choices (OpenAI-style)
-        if isinstance(resp, dict):
-            if "choices" in resp and len(resp["choices"]) > 0:
-                c = resp["choices"][0]
-                # OpenAI-like: c may be dict with 'text' or 'message'
-                if isinstance(c, dict):
-                    if "text" in c:
-                        return str(c["text"])
-                    if "message" in c and isinstance(c["message"], dict):
-                        return str(c["message"].get("content", ""))
-                # older llama-cpp-python sometimes returns 'choices' with 'text' nested
-                if isinstance(c, str):
-                    return c
-                return str(c)
-        # If it's an object with .choices
-        if hasattr(resp, "choices"):
-            try:
-                c = resp.choices[0]
-                if hasattr(c, "text"):
-                    return str(c.text)
-                if isinstance(c, dict) and "text" in c:
-                    return str(c["text"])
-            except Exception:
-                pass
-        # If it's a generator/iterator of chunks
-        if hasattr(resp, "__iter__") and not isinstance(resp, (str, bytes, dict)):
-            # Attempt to join pieces
-            pieces = []
-            try:
-                for part in resp:
-                    if isinstance(part, dict):
-                        # chunk shapes may have 'delta' or 'content' or 'text'
-                        if "text" in part:
-                            pieces.append(str(part["text"]))
-                        elif "content" in part:
-                            pieces.append(str(part["content"]))
-                        else:
-                            pieces.append(str(part))
-                    else:
-                        pieces.append(str(part))
-                return "".join(pieces)
-            except TypeError:
-                # not iterable
-                pass
-        # fallback to string
-        return str(resp)
+        return _extract_text(resp)
     except Exception:
         try:
             return str(resp)
@@ -424,17 +443,33 @@ def _attempt_method_calls(
         attempts.append((name, args, kwargs))
         try:
             out = func(*args, **kwargs)
-            # If out is a generator, gather it
+
+            # If out is a generator/iterator (streaming), gather and attempt to extract text
             if hasattr(out, "__iter__") and not isinstance(out, (str, bytes, dict)):
-                # collect
                 collected = []
                 try:
                     for chunk in out:
-                        collected.append(chunk)
-                    out = "".join(map(str, collected))
+                        # Each chunk may be a dict-like or simple string
+                        collected.append(
+                            _extract_text(chunk)
+                            if not isinstance(chunk, str)
+                            else chunk
+                        )
+                except TypeError:
+                    # not actually iterable
+                    pass
                 except Exception:
-                    # fallback to string conversion
-                    out = str(out)
+                    # fallback: stringify each chunk
+                    try:
+                        collected = [str(x) for x in out]
+                    except Exception:
+                        pass
+                out = "".join(collected)
+
+            # If out is a dict/list or other composite type, extract textual content
+            if not isinstance(out, (str, bytes)):
+                out = _extract_text(out)
+
             return out
         except TypeError as te:
             _log(f"TypeError calling {name}: {te}")
@@ -557,7 +592,8 @@ def test_with_llama_cpp(
         _log("Model loaded with llama_cpp. Trying to create/generate response...")
         text = _attempt_method_calls(llm, prompt, max_tokens, temp)
         if text is not None:
-            _log("llama-cpp call produced output (truncated):", str(text))
+            _log("llama-cpp call produced output (full):")
+            _log(str(text))
             return str(text)
         _log(
             "No usable response from llama-cpp-python instance after trying known call shapes."
@@ -602,12 +638,13 @@ def test_with_llama_cpp_binary(
         )
         if proc.returncode != 0:
             _log(
-                "llama.cpp binary returned non-zero code. stderr (truncated):",
+                "llama.cpp binary returned non-zero code. stderr (full):",
                 proc.stderr,
             )
             return None
-        out = proc.stdout.strip()
-        _log("llama.cpp binary output (truncated):", out)
+        out = proc.stdout
+        _log("llama.cpp binary output (full):")
+        _log(out)
         return out
     except Exception as e:
         _log("Error running llama.cpp binary:", e)
@@ -654,7 +691,7 @@ def main():
         )
         if resp and len(str(resp).strip()) > 0:
             _log("SUCCESS: model responded via llama-cpp-python.")
-            _log("Response:")
+            _log("Response (full):")
             _log(str(resp))
             if POST_SUCCESS_CMD:
                 run_post_success(POST_SUCCESS_CMD)
@@ -667,7 +704,7 @@ def main():
         resp2 = test_with_llama_cpp_binary(model_path, TEST_PROMPT)
         if resp2 and len(str(resp2).strip()) > 0:
             _log("SUCCESS: model responded via llama.cpp binary.")
-            _log("Response:")
+            _log("Response (full):")
             _log(str(resp2))
             if POST_SUCCESS_CMD:
                 run_post_success(POST_SUCCESS_CMD)
