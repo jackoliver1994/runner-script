@@ -18,6 +18,8 @@ import sys
 import os
 import re
 import difflib
+import glob
+import math
 from pathlib import Path
 from typing import Optional, List
 from threading import Thread, Event
@@ -54,17 +56,17 @@ class LoadingSpinner:
             self.thread.join()
 
 
-# ---------------------- LOCAL LLM BACKEND ----------------------
+# ---------------------- LOCAL LLM BACKEND (robust, context-aware) ----------------------
 class LocalLLM:
     """
-    LocalLLM: a drop-in replacement for ChatAPI.send_message that uses a local model.
-    Usage:
-        local = LocalLLM(model_dir="/home/runner/work/runner-script/runner-script/models")
-        resp = local.send_message("Write a short story...", timeout=60)
-    Backends tried (in order):
-      1. llama-cpp-python (Llama)
-      2. gpt4all (GPT4All)
-      3. transformers (AutoModelForCausalLM + AutoTokenizer) - best-effort for local torch checkpoints
+    Robust LocalLLM: drop-in replacement for ChatAPI that uses local LLMs.
+    Key features added:
+      - auto-detects context window (n_ctx) or defaults to 512
+      - token counting (uses llama.tokenize if available, else fallback estimate)
+      - trims oldest prompt content to fit prompt + max_new_tokens <= n_ctx
+      - robust llama-cpp-python API handling (create/create_completion/chat/__call__/generate)
+      - safe generation parameters (smaller batch, controlled max_new_tokens)
+      - preserves retry logic and infinite retry options
     """
 
     MODEL_EXTENSIONS = [
@@ -87,24 +89,21 @@ class LocalLLM:
         self.backend = None
         self.model_path = None
         self._impl = None
-        # locate model and init backend
+        self._n_ctx = None  # detected context window
+        self._avg_token_char = 4  # fallback average characters per token (approx)
         self._find_and_init()
 
     def _find_model_file(self) -> Optional[str]:
-        # Look for files with common model extensions (first-found)
         p = Path(self.model_dir)
         if not p.exists():
             return None
-        # scan recursively to find a likely model
         for ext in self.MODEL_EXTENSIONS:
             items = list(p.rglob(f"*{ext}"))
             if items:
-                # prefer largest file (heuristic)
                 items_sorted = sorted(
                     items, key=lambda x: x.stat().st_size, reverse=True
                 )
                 return str(items_sorted[0])
-        # fallback: any file in folder
         allfiles = [f for f in p.rglob("*") if f.is_file()]
         if allfiles:
             return str(
@@ -125,15 +124,24 @@ class LocalLLM:
             from llama_cpp import Llama  # type: ignore
 
             try:
+                # attempt to set n_ctx if the constructor supports it later
                 print(
                     f"LocalLLM: initialising llama-cpp-python with model {self.model_path}"
                 )
-                self._impl = Llama(model_path=self.model_path)
+                # instantiate
+                try:
+                    # attempt common constructor
+                    self._impl = Llama(model_path=self.model_path)
+                except TypeError:
+                    # some builds accept additional params - fallback to basic
+                    self._impl = Llama(model_path=self.model_path)
                 self.backend = "llama_cpp"
+                # detect context window after init
+                self._n_ctx = self._detect_n_ctx()
+                print(f"LocalLLM: detected n_ctx = {self._n_ctx}")
                 return
             except Exception as e:
                 print(f"LocalLLM: llama-cpp load failed: {e}")
-                # continue to other backends
         except Exception:
             pass
 
@@ -145,6 +153,7 @@ class LocalLLM:
                 print(f"LocalLLM: initialising gpt4all with model {self.model_path}")
                 self._impl = GPT4All(model=self.model_path)
                 self.backend = "gpt4all"
+                self._n_ctx = self._detect_n_ctx()
                 return
             except Exception as e:
                 print(f"LocalLLM: gpt4all init failed: {e}")
@@ -153,33 +162,111 @@ class LocalLLM:
 
         # try transformers (cpu) - best effort for torch files
         try:
-            from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline  # type: ignore
+            from transformers import pipeline  # type: ignore
 
-            # attempt to load model path (if path points to a transformers-compatible dir or huggingface repo)
             try:
                 print(
                     f"LocalLLM: attempting Transformers backend with model {self.model_path}"
                 )
-                # If path is a local folder, pipeline will try to load it.
                 gen = pipeline(
-                    "text-generation",
-                    model=self.model_path,
-                    device_map="auto" if False else None,
+                    "text-generation", model=self.model_path, device_map=None
                 )
                 self._impl = gen
                 self.backend = "transformers"
+                self._n_ctx = self._detect_n_ctx() or 1024
                 return
             except Exception as e:
                 print(f"LocalLLM: transformers pipeline failed: {e}")
         except Exception:
             pass
 
-        # No backend available
         raise RuntimeError(
             "LocalLLM: No supported local LLM backend could be initialised. "
-            "Please install one of: 'llama-cpp-python' (recommended for .gguf), 'gpt4all', or 'transformers' and make sure a compatible model exists in the model_dir. "
+            "Please install one of: 'llama-cpp-python', 'gpt4all', or 'transformers' and ensure model exists in model_dir. "
             f"Model dir inspected: {self.model_dir}, found file: {self.model_path}"
         )
+
+    def _detect_n_ctx(self) -> int:
+        # Try to detect context length from the impl, otherwise default to 512
+        candidates = []
+        if not self._impl:
+            return 512
+        # common attributes
+        for attr in (
+            "n_ctx",
+            "context_size",
+            "ctx_size",
+            "n_ctx_max",
+            "context_length",
+            "n_ctx_train",
+        ):
+            val = getattr(self._impl, attr, None)
+            if isinstance(val, int) and val > 0:
+                candidates.append(int(val))
+        # sometimes model exposes model_tokenizer or model info
+        # fallback to 512 if nothing found
+        if candidates:
+            # pick smallest reasonable (runtime limit)
+            return int(min(candidates))
+        return 512
+
+    def _count_tokens(self, text: str) -> int:
+        if not text:
+            return 0
+        # try to use impl.tokenize if available (llama-cpp)
+        try:
+            if hasattr(self._impl, "tokenize"):
+                # llama_cpp.tokenize may accept str or bytes
+                try:
+                    toks = self._impl.tokenize(text)
+                except Exception:
+                    toks = self._impl.tokenize(text.encode("utf-8"))
+                # some returns list-like
+                return len(toks)
+        except Exception:
+            pass
+        # fallback: rough estimate using chars
+        return max(1, int(len(text) / self._avg_token_char))
+
+    def _trim_prompt_to_fit(self, prompt: str, max_new_tokens: int) -> str:
+        """
+        Trim oldest parts of prompt until token_count(prompt) + max_new_tokens + overhead <= n_ctx.
+        Strategy: split prompt into paragraphs (double newline), pop from front until fits.
+        Falls back to trimming characters if necessary.
+        """
+        n_ctx = self._n_ctx or 512
+        overhead = 8  # small safety margin
+        if max_new_tokens is None:
+            max_new_tokens = 256
+        prompt_tokens = self._count_tokens(prompt)
+        allowed = n_ctx - max_new_tokens - overhead
+        if allowed <= 0:
+            # cannot generate anything reasonably; force max_new_tokens to 32 if possible
+            max_new_tokens = min(max_new_tokens, max(8, n_ctx // 8))
+            allowed = n_ctx - max_new_tokens - overhead
+
+        if prompt_tokens <= allowed:
+            return prompt  # already fits
+
+        # try paragraph-level trimming
+        parts = [p for p in prompt.split("\n\n") if p.strip() != ""]
+        if not parts:
+            parts = [prompt]
+        # keep the most recent paragraphs; pop from the front
+        while parts:
+            joined = "\n\n".join(parts)
+            if self._count_tokens(joined) <= allowed:
+                return joined
+            # drop the oldest paragraph
+            parts.pop(0)
+
+        # worst-case: trim characters from the start
+        # compute approx chars allowed from allowed tokens
+        approx_chars_allowed = allowed * self._avg_token_char
+        if approx_chars_allowed <= 0:
+            return ""  # no context possible
+        trimmed = prompt[-int(approx_chars_allowed) :]  # keep last part
+        return trimmed
 
     def send_message(
         self,
@@ -192,165 +279,240 @@ class LocalLLM:
         spinner_message: str = "Waiting for response...",
     ) -> str:
         """
-        Keep same signature used across the rest of your code for compatibility.
-        Returns the generated text.
+        Drop-in compatible send_message with retry loop preserved.
+        Will trim prompt to fit model context window before generation.
         """
         timeout = timeout or self.base_timeout
-        # Short wrapper per backend
-        if self.backend == "llama_cpp":
-            return self._send_llama_cpp(message, timeout)
-        elif self.backend == "gpt4all":
-            return self._send_gpt4all(message, timeout)
-        elif self.backend == "transformers":
-            return self._send_transformers(message, timeout)
-        else:
-            raise RuntimeError("LocalLLM: unsupported backend")
+        attempt = 0
+        backoff = initial_backoff
+        # default generation target (can be adjusted)
+        max_new_tokens = 256
 
-    def _send_llama_cpp(self, prompt: str, timeout: int) -> str:
+        while True:
+            attempt += 1
+            try:
+                # make a working prompt; ensure it fits the model's context window
+                prompt_to_send = self._trim_prompt_to_fit(message, max_new_tokens)
+                # choose backend
+                if self.backend == "llama_cpp":
+                    return self._send_llama_cpp(prompt_to_send, timeout, max_new_tokens)
+                elif self.backend == "gpt4all":
+                    return self._send_gpt4all(prompt_to_send, timeout, max_new_tokens)
+                elif self.backend == "transformers":
+                    return self._send_transformers(
+                        prompt_to_send, timeout, max_new_tokens
+                    )
+                else:
+                    raise RuntimeError("LocalLLM: unsupported backend")
+            except Exception as e:
+                # show attempt failure and backoff behavior (preserve original retry semantics)
+                print(f"⚠️ send_message failed on generation attempt {attempt}: {e}")
+                # if not retry_forever and attempts exceed some number, raise
+                if not retry_forever and attempt >= 5:
+                    raise
+                # if it's a client error and caller didn't want retry, raise
+                if (
+                    "403" in str(e) or "client error" in str(e).lower()
+                ) and not retry_on_client_errors:
+                    raise
+                # backoff then retry
+                time.sleep(min(backoff, max_backoff))
+                backoff = min(backoff * 2, max_backoff)
+                # loop continues (infinite if retry_forever=True)
+
+    def _send_llama_cpp(self, prompt: str, timeout: int, max_new_tokens: int) -> str:
         """
-        Robust llama-cpp-python caller: supports multiple llama-cpp-python APIs:
-        - create
-        - create_completion
-        - create_chat_completion
-        - __call__
-        - generate (low-level) + tokenize / detokenize
-        Returns plain text string.
+        Robust llama-cpp caller; tries several APIs and ensures safe generation params.
         """
         llm = self._impl
 
-        # helper to extract text from typical response dicts
         def _extract_text_from_resp(resp):
-            # resp might be dict, list, str, etc.
             if resp is None:
                 return ""
-            # if it's already a string
             if isinstance(resp, str):
                 return resp
-            # if it's a list (e.g., pipeline output)
             if isinstance(resp, list):
                 for item in resp:
-                    # common HF pipeline element: {"generated_text": "..."}
                     if isinstance(item, dict):
                         if "generated_text" in item:
                             return item["generated_text"]
                         if "text" in item:
                             return item["text"]
-                # fallback
                 try:
                     return str(resp[0])
                 except Exception:
                     return str(resp)
-            # if it's a dict with choices
             if isinstance(resp, dict):
-                # if chat completion shape: { choices: [ { message: { content: "..." } } ] }
                 if "choices" in resp and isinstance(resp["choices"], (list, tuple)):
                     parts = []
                     for c in resp["choices"]:
                         if isinstance(c, dict):
-                            # chat-style
                             msg = c.get("message")
                             if isinstance(msg, dict) and "content" in msg:
                                 parts.append(msg["content"])
                                 continue
-                            # classic completion
                             if "text" in c:
                                 parts.append(c.get("text", ""))
                                 continue
-                            # some versions use 'content' on top level
                             if "content" in c:
                                 parts.append(c.get("content", ""))
                                 continue
                     if parts:
                         return "".join(parts)
-                # older style: {'text': '...'}
                 if "text" in resp and isinstance(resp["text"], str):
                     return resp["text"]
                 if "content" in resp and isinstance(resp["content"], str):
                     return resp["content"]
-                # fallback: stringify
                 return str(resp)
-            # anything else
             return str(resp)
 
+        # ensure prompt fits (extra safety)
+        prompt = self._trim_prompt_to_fit(prompt, max_new_tokens)
+
+        # Attempt ordered API calls with safe arguments
+        # 1) try .create (if available)
         try:
-            # 1) try .create (some versions)
             if hasattr(llm, "create"):
                 try:
                     resp = llm.create(
-                        prompt=prompt, max_tokens=1024, temperature=0.7, top_p=0.95
+                        prompt=prompt,
+                        max_tokens=max_new_tokens,
+                        temperature=0.7,
+                        top_p=0.95,
                     )
                     return _extract_text_from_resp(resp).strip()
                 except Exception as e_create:
-                    # continue to next method
                     print(f"LocalLLM: .create failed: {e_create}")
+        except Exception:
+            pass
 
-            # 2) try .create_completion
+        # 2) try .create_completion
+        try:
             if hasattr(llm, "create_completion"):
                 try:
                     resp = llm.create_completion(
-                        prompt=prompt, max_tokens=1024, temperature=0.7, top_p=0.95
+                        prompt=prompt,
+                        max_tokens=max_new_tokens,
+                        temperature=0.7,
+                        top_p=0.95,
                     )
                     return _extract_text_from_resp(resp).strip()
                 except Exception as e_cc:
                     print(f"LocalLLM: .create_completion failed: {e_cc}")
+        except Exception:
+            pass
 
-            # 3) try chat completion API .create_chat_completion
+        # 3) try chat completion API
+        try:
             if hasattr(llm, "create_chat_completion"):
                 try:
                     msg = [{"role": "user", "content": prompt}]
                     resp = llm.create_chat_completion(
-                        messages=msg, max_tokens=1024, temperature=0.7
+                        messages=msg, max_tokens=max_new_tokens, temperature=0.7
                     )
                     return _extract_text_from_resp(resp).strip()
                 except Exception as e_chat:
                     print(f"LocalLLM: .create_chat_completion failed: {e_chat}")
+        except Exception:
+            pass
 
-            # 4) try __call__ (some versions implement call operator)
+        # 4) try __call__
+        try:
             if callable(getattr(llm, "__call__", None)):
                 try:
-                    # many versions accept same kwargs as create
-                    resp = llm(prompt, max_tokens=1024, temperature=0.7, top_p=0.95)
+                    resp = llm(
+                        prompt, max_tokens=max_new_tokens, temperature=0.7, top_p=0.95
+                    )
                     return _extract_text_from_resp(resp).strip()
                 except Exception as e_call:
                     print(f"LocalLLM: __call__ failed: {e_call}")
+        except Exception:
+            pass
 
-            # 5) low-level streaming: tokenize + generate + detokenize
+        # 5) low-level: tokenize + generate + detokenize
+        try:
             if (
                 hasattr(llm, "generate")
                 and hasattr(llm, "tokenize")
                 and hasattr(llm, "detokenize")
             ):
                 try:
-                    # llama.tokenize expects bytes in many versions
+                    # tokenize safely
                     try:
-                        tokens = llm.tokenize(prompt.encode("utf-8"))
-                    except Exception:
-                        # some versions accept str
                         tokens = llm.tokenize(prompt)
+                    except Exception:
+                        tokens = llm.tokenize(prompt.encode("utf-8"))
+                    # generate - use n_batch=1 if supported to avoid huge memory usage
                     out_tokens = []
-                    for t in llm.generate(
-                        tokens, top_k=40, top_p=0.95, temp=0.7, repeat_penalty=1.0
-                    ):
-                        # t may be int; append to output
-                        out_tokens.append(int(t))
-                    # detokenize expects a list of ints
+                    gen_args = {
+                        "top_k": 40,
+                        "top_p": 0.95,
+                        "temp": 0.7,
+                        "repeat_penalty": 1.0,
+                    }
+                    # some generate implementations accept n_predict or max_tokens
+                    # aim for max_new_tokens
+                    try:
+                        for t in llm.generate(
+                            tokens, max_tokens=max_new_tokens, n_batch=1, **gen_args
+                        ):
+                            out_tokens.append(int(t))
+                    except TypeError:
+                        # older generate signature without named args
+                        for t in llm.generate(tokens):
+                            out_tokens.append(int(t))
                     text = llm.detokenize(out_tokens)
                     return text.strip()
                 except Exception as e_gen:
                     print(
                         f"LocalLLM: generate/tokenize/detokenize attempt failed: {e_gen}"
                     )
+        except Exception:
+            pass
 
-            # nothing worked
-            raise RuntimeError(
-                "LocalLLM: the installed llama-cpp-python exposes no known generation method. "
-                "Tried: create, create_completion, create_chat_completion, __call__, generate/tokenize. "
-                "Inspect the Llama object methods to adapt."
-            )
+        # If none worked, give detailed error
+        raise RuntimeError(
+            "LocalLLM: the installed llama-cpp-python exposes no known usable generation method (or context issues). "
+            "Tried: create, create_completion, create_chat_completion, __call__, generate/tokenize/detokenize. "
+            "Ensure your llama-cpp-python is a supported version and the model fits the runtime context window."
+        )
 
+    def _send_gpt4all(self, prompt: str, timeout: int, max_new_tokens: int) -> str:
+        try:
+            # GPT4All generate may accept max_tokens/n_predict
+            try:
+                r = self._impl.generate(
+                    prompt, max_tokens=max_new_tokens, streaming=False
+                )
+            except TypeError:
+                r = self._impl.generate(
+                    prompt, n_predict=max_new_tokens, streaming=False
+                )
+            if isinstance(r, dict) and "text" in r:
+                return r["text"].strip()
+            if hasattr(self._impl, "response"):
+                return str(self._impl.response).strip()
+            if hasattr(self._impl, "last_text"):
+                return str(self._impl.last_text).strip()
+            return str(r).strip()
         except Exception as e:
-            # raise for caller to handle retries / fallback as previously implemented in send_message
-            raise RuntimeError(f"LocalLLM: llama-cpp generation error: {e}")
+            raise RuntimeError(f"LocalLLM: gpt4all generation error: {e}")
+
+    def _send_transformers(self, prompt: str, timeout: int, max_new_tokens: int) -> str:
+        try:
+            out = self._impl(
+                prompt,
+                max_new_tokens=max_new_tokens,
+                do_sample=True,
+                top_p=0.95,
+                temperature=0.7,
+            )
+            if isinstance(out, list) and out:
+                text = out[0].get("generated_text", "") or out[0].get("text", "")
+                return text.strip()
+            return str(out).strip()
+        except Exception as e:
+            raise RuntimeError(f"LocalLLM: transformers generation error: {e}")
 
 
 # ---------------------- UTILITIES ----------------------
