@@ -2,3 +2,4 @@ requests>=2.30.0
 huggingface-hub>=0.18.4
 llama-cpp-python
 psutil==5.9.5
+transformers

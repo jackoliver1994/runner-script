@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Optional, List
 from threading import Thread, Event
 from datetime import datetime
+from transformers import AutoTokenizer
 
 
 # ---------------------- LOADING SPINNER ----------------------
@@ -91,6 +92,114 @@ class LocalLLM:
         self._n_ctx = None
         self._avg_token_char = 4
         self._detect_and_init()
+
+    def _call_with_alarm_timeout(
+        self, fn, *args, timeout: Optional[int] = None, **kwargs
+    ):
+        """
+        Try to run fn(*args, **kwargs) but raise TimeoutError if it doesn't return
+        within `timeout` seconds. Uses signal.alarm on Unix (works only in main thread).
+        On Windows (os.name == 'nt') or if signal isn't available, it will just call fn.
+        This is a pragmatic guard to fail fast when a backend call hangs.
+        """
+        if not timeout or timeout <= 0:
+            return fn(*args, **kwargs)
+
+        if os.name == "nt":
+            # signal.alarm not available on Windows — call directly (no hard timeout)
+            return fn(*args, **kwargs)
+
+        import signal
+
+        def _handler(signum, frame):
+            raise TimeoutError("generation call timed out")
+
+        old_handler = signal.getsignal(signal.SIGALRM)
+        try:
+            signal.signal(signal.SIGALRM, _handler)
+            signal.setitimer(signal.ITIMER_REAL, int(timeout))
+            return fn(*args, **kwargs)
+        finally:
+            # clear alarm and restore handler
+            try:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+            except Exception:
+                pass
+            signal.signal(signal.SIGALRM, old_handler)
+
+
+def _ensure_tokenizer_for_model(self):
+    """
+    Ensure we have a cached tokenizer for the local model.
+    Uses self.model (HF id) or self.model_path. Fails silently and leaves
+    self._hf_tokenizer = None if transformers is not available.
+    """
+    if getattr(self, "_hf_tokenizer", None) is not None:
+        return
+    self._hf_tokenizer = None
+    model_id = getattr(self, "model", None) or getattr(self, "model_path", None)
+    if model_id is None:
+        return
+    if AutoTokenizer is None:
+        # transformers not installed or import failed
+        return
+    try:
+        # don't crash if tokenizer download fails
+        self._hf_tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True)
+    except Exception as e:
+        print(f"LocalLLM: tokenizer load failed for {model_id}: {e}")
+        self._hf_tokenizer = None
+
+    def compute_dynamic_max_new_tokens(
+        self, prompt: str, safety_factor: float = 0.80, hard_cap: Optional[int] = None
+    ) -> int:
+        """
+        Compute a safe max_new_tokens based on:
+        - runtime context length (self._n_ctx if detected, else 131072)
+        - tokenized prompt length (using HF tokenizer if available)
+        - safety_factor (0 < safety_factor <= 1) to leave headroom for kv cache
+        - optional hard_cap to never exceed a specific value
+        Returns an integer >= 1.
+        """
+        # 1) get model context
+        n_ctx = getattr(self, "_n_ctx", None) or 131072
+
+        # 2) ensure tokenizer cached
+        self._ensure_tokenizer_for_model()
+
+        prompt_tokens = None
+        if getattr(self, "_hf_tokenizer", None) is not None:
+            try:
+                prompt_tokens = len(self._hf_tokenizer(prompt)["input_ids"])
+            except Exception as e:
+                # fallback to estimate
+                print(f"LocalLLM: tokenizer call failed, falling back to estimate: {e}")
+                prompt_tokens = None
+
+        if prompt_tokens is None:
+            # rough fallback: estimate ~4 characters per token for english text
+            prompt_tokens = max(1, len(prompt) // 4)
+
+        # compute raw available tokens
+        available = max(0, n_ctx - prompt_tokens)
+
+        # apply safety factor so we don't fill the entire context (avoid OOM / kv growth)
+        safe_allowed = int(available * float(max(0.01, min(1.0, safety_factor))))
+
+        # enforce a minimum and optional hard cap
+        MIN_NEW_TOKENS = 8
+        if hard_cap is not None:
+            safe_allowed = min(safe_allowed, int(hard_cap))
+        safe_allowed = max(MIN_NEW_TOKENS, safe_allowed)
+
+        # As an extra conservative guard, clamp to a reasonable ceiling for local runs if not explicitly requested
+        # (you can change/remove this if you want to allow full 128k generations)
+        LOCAL_CONSERVATIVE_CEILING = (
+            getattr(self, "local_max_new_tokens_ceiling", None) or 65536
+        )
+        safe_allowed = min(safe_allowed, int(LOCAL_CONSERVATIVE_CEILING))
+
+        return safe_allowed
 
     # ---------------- discover model file ----------------
     def _find_model_file(self) -> Optional[str]:
@@ -280,6 +389,8 @@ class LocalLLM:
         unlimited: bool = False,
         chunk_size: int = 512,
         max_retries: Optional[int] = None,  # NEW: allow caller to limit retries
+        safety_factor: float = 0.80,
+        hard_cap: Optional[int] = None,
     ) -> str:
         """
         Generate text from the available backend. Keeps retry/backoff behavior but replaces
@@ -290,9 +401,16 @@ class LocalLLM:
         backoff = initial_backoff
         spinner = LoadingSpinner(spinner_message)
 
+        # inside send_message, near start:
         if max_new_tokens is None:
-            # safe default: not enormous
-            max_new_tokens = min(1024, max(64, (self._n_ctx or 512) // 4))
+            # compute dynamically based on prompt & model
+            # use explicit safety_factor and hard_cap params (defaults provided in signature)
+            max_new_tokens = self.compute_dynamic_max_new_tokens(
+                message, safety_factor=safety_factor, hard_cap=hard_cap
+            )
+            print(
+                f"LocalLLM: computed dynamic max_new_tokens={max_new_tokens} (safety_factor={safety_factor})"
+            )
 
         # convert None => infinite when retry_forever True; otherwise cap = max_retries or 5
         if retry_forever:
@@ -401,26 +519,68 @@ class LocalLLM:
         for iteration in range(max_iterations):
             # send one chunk
             chunk = None
-            if self.backend == "llama_cpp":
-                chunk = self._send_llama_cpp(
-                    current_prompt,
-                    timeout,
-                    chunk_size,
-                    temperature,
-                    top_p,
-                    repeat_penalty,
-                    n_batch,
-                )
-            elif self.backend == "gpt4all":
-                chunk = self._send_gpt4all(current_prompt, timeout, chunk_size)
-            elif self.backend == "transformers":
-                chunk = self._send_transformers(
-                    current_prompt, timeout, chunk_size, temperature, top_p
-                )
-            else:
+            try:
+                if self.backend == "llama_cpp":
+                    print(
+                        f"LocalLLM: calling _send_llama_cpp (iteration {iteration+1}/{max_iterations})"
+                    )
+                    chunk = self._call_with_alarm_timeout(
+                        self._send_llama_cpp,
+                        current_prompt,
+                        timeout,
+                        chunk_size,
+                        temperature,
+                        top_p,
+                        repeat_penalty,
+                        n_batch,
+                        timeout=timeout,
+                    )
+                    print(
+                        f"LocalLLM: _send_llama_cpp returned {len(chunk) if chunk is not None else 'None'} characters"
+                    )
+                elif self.backend == "gpt4all":
+                    print(
+                        f"LocalLLM: calling _send_gpt4all (iteration {iteration+1}/{max_iterations})"
+                    )
+                    chunk = self._call_with_alarm_timeout(
+                        self._send_gpt4all,
+                        current_prompt,
+                        timeout,
+                        chunk_size,
+                        timeout=timeout,
+                    )
+                    print(
+                        f"LocalLLM: _send_gpt4all returned {len(chunk) if chunk is not None else 'None'} characters"
+                    )
+                elif self.backend == "transformers":
+                    print(
+                        f"LocalLLM: calling _send_transformers (iteration {iteration+1}/{max_iterations})"
+                    )
+                    chunk = self._call_with_alarm_timeout(
+                        self._send_transformers,
+                        current_prompt,
+                        timeout,
+                        chunk_size,
+                        temperature,
+                        top_p,
+                        timeout=timeout,
+                    )
+                    print(
+                        f"LocalLLM: _send_transformers returned {len(chunk) if chunk is not None else 'None'} characters"
+                    )
+                else:
+                    raise RuntimeError(
+                        "LocalLLM: unsupported backend for unlimited generation"
+                    )
+            except TimeoutError:
+                # timed out — surface an exception so callers can retry or abort
                 raise RuntimeError(
-                    "LocalLLM: unsupported backend for unlimited generation"
+                    f"LocalLLM: backend generation timed out after {timeout} seconds"
                 )
+            except Exception as e:
+                # show what failed, then raise so send_message will handle retry/backoff
+                print(f"LocalLLM: backend generation raised an exception: {e}")
+                raise
 
             if not chunk:
                 break
@@ -1125,8 +1285,9 @@ class StoryPipeline:
                     resp = self.chat.send_message(
                         req_prompt,
                         timeout=timeout,
-                        max_new_tokens=1024,
                         unlimited=True,
+                        retry_forever=False,
+                        max_retries=5,
                         spinner_message=f"Generating initial script (attempt {attempt})...",
                     )
                 except Exception as e:
@@ -1175,8 +1336,9 @@ class StoryPipeline:
                             cond_resp = self.chat.send_message(
                                 condense_prompt,
                                 timeout=timeout,
-                                max_new_tokens=1024,
                                 unlimited=True,
+                                retry_forever=False,
+                                max_retries=5,
                                 spinner_message=f"Condensing (try {ct+1}/{condense_tries})...",
                             )
                         except Exception as e:
@@ -1270,8 +1432,9 @@ class StoryPipeline:
                 cont_resp = self.chat.send_message(
                     cont_prompt,
                     timeout=timeout,
-                    max_new_tokens=1024,
                     unlimited=True,
+                    retry_forever=False,
+                    max_retries=5,
                     spinner_message=f"Continuation attempt (overall attempt {attempt})...",
                 )
             except Exception as e:
@@ -1307,8 +1470,9 @@ class StoryPipeline:
                     gen_resp = self.chat.send_message(
                         gen_prompt,
                         timeout=timeout,
-                        max_new_tokens=1024,
                         unlimited=True,
+                        retry_forever=False,
+                        max_retries=5,
                         spinner_message="Generating appended chunk...",
                     )
                 except Exception as e:
@@ -1814,8 +1978,9 @@ class StoryPipeline:
                     resp = self.chat.send_message(
                         prompt_request,
                         timeout=timeout_per_call,
-                        max_new_tokens=1024,
                         unlimited=True,
+                        retry_forever=False,
+                        max_retries=5,
                         spinner_message=f"Generating paragraph {para_idx+1} prompts (attempt {paragraph_attempts})...",
                     )
                 except Exception as e:
@@ -2008,8 +2173,9 @@ class StoryPipeline:
                     resp = self.chat.send_message(
                         prompt_request,
                         timeout=timeout_per_call,
-                        max_new_tokens=1024,
                         unlimited=True,
+                        retry_forever=False,
+                        max_retries=5,
                         spinner_message="Filling missing prompts...",
                     )
                 except Exception:
@@ -2162,8 +2328,9 @@ class StoryPipeline:
         resp = self.chat.send_message(
             prompt,
             timeout=timeout or self.chat.base_timeout,
-            max_new_tokens=1024,
             unlimited=True,
+            retry_forever=False,
+            max_retries=5,
             spinner_message="Generating narration...",
         )
         narr_block = extract_largest_bracketed(resp)
@@ -2222,6 +2389,9 @@ class StoryPipeline:
         resp = self.chat.send_message(
             prompt,
             timeout=timeout or self.chat.base_timeout,
+            unlimited=True,
+            retry_forever=False,
+            max_retries=5,
             spinner_message="Generating YouTube metadata...",
         )
         save_response("youtube_response", "youtube_metadata.txt", resp)
