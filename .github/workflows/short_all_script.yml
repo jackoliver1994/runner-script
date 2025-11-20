@@ -79,7 +79,7 @@ jobs:
           R_HOURS: "6"
         run: |
           cd Script_Drive1
-          python llm.py
+          python local_llm.py
 
       - name: Show disk
         run: |
