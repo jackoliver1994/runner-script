@@ -281,11 +281,18 @@ class LocalLLM:
         chunk_size: int = 512,
         max_retries: Optional[int] = None,  # NEW: allow caller to limit retries
     ) -> str:
-        ...
+        """
+        Generate text from the available backend. Keeps retry/backoff behavior but replaces
+        the previous placeholder body with a working implementation.
+        """
+        timeout = timeout or getattr(self, "base_timeout", None) or 30
         attempt = 0
         backoff = initial_backoff
+        spinner = LoadingSpinner(spinner_message)
+
         if max_new_tokens is None:
-            max_new_tokens = min(1024, (self._n_ctx or 512) // 2)
+            # safe default: not enormous
+            max_new_tokens = min(1024, max(64, (self._n_ctx or 512) // 4))
 
         # convert None => infinite when retry_forever True; otherwise cap = max_retries or 5
         if retry_forever:
@@ -296,21 +303,75 @@ class LocalLLM:
         while True:
             attempt += 1
             try:
-                ...
+                spinner.message = f"{spinner_message} (attempt {attempt})"
+                spinner.start()
+
+                # Unlimited (chunked) generation path
+                if unlimited:
+                    out = self._generate_unlimited(
+                        prompt=message,
+                        timeout=timeout,
+                        chunk_size=chunk_size,
+                        temperature=temperature,
+                        top_p=top_p,
+                        repeat_penalty=repeat_penalty,
+                        n_batch=n_batch,
+                    )
+                    spinner.stop()
+                    return (out or "").strip()
+
+                # One-shot generation path
+                if self.backend == "llama_cpp":
+                    text = self._send_llama_cpp(
+                        prompt=message,
+                        timeout=timeout,
+                        max_new_tokens=max_new_tokens,
+                        temperature=temperature,
+                        top_p=top_p,
+                        repeat_penalty=repeat_penalty,
+                        n_batch=n_batch,
+                    )
+                elif self.backend == "gpt4all":
+                    text = self._send_gpt4all(
+                        prompt=message, timeout=timeout, max_new_tokens=max_new_tokens
+                    )
+                elif self.backend == "transformers":
+                    text = self._send_transformers(
+                        prompt=message,
+                        timeout=timeout,
+                        max_new_tokens=max_new_tokens,
+                        temperature=temperature,
+                        top_p=top_p,
+                    )
+                else:
+                    spinner.stop()
+                    raise RuntimeError(
+                        "LocalLLM: no backend configured for send_message"
+                    )
+
+                spinner.stop()
+                return (text or "").strip()
+
             except Exception as e:
+                spinner.stop()
                 print(f"⚠️ send_message failed on generation attempt {attempt}: {e}")
+
                 # enforce hard cap if set and not retry_forever
                 if cap is not None and attempt >= cap:
                     raise RuntimeError(
                         f"send_message: reached max retries ({cap}). Last error: {e}"
                     )
+
+                # some errors (403 / client) shouldn't be retried unless explicitly allowed
                 if (
                     "403" in str(e) or "client error" in str(e).lower()
                 ) and not retry_on_client_errors:
                     raise
+
+                # backoff and retry
                 time.sleep(min(backoff, max_backoff))
                 backoff = min(backoff * 2, max_backoff)
-                # continue loop (may be infinite if cap is None)
+                # loop continues (may be infinite if cap is None)
 
     # --------------- chunked/unlimited generation helper ---------------
     def _generate_unlimited(
