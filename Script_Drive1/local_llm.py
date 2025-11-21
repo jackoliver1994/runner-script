@@ -127,28 +127,27 @@ class LocalLLM:
                 pass
             signal.signal(signal.SIGALRM, old_handler)
 
-
-def _ensure_tokenizer_for_model(self):
-    """
-    Ensure we have a cached tokenizer for the local model.
-    Uses self.model (HF id) or self.model_path. Fails silently and leaves
-    self._hf_tokenizer = None if transformers is not available.
-    """
-    if getattr(self, "_hf_tokenizer", None) is not None:
-        return
-    self._hf_tokenizer = None
-    model_id = getattr(self, "model", None) or getattr(self, "model_path", None)
-    if model_id is None:
-        return
-    if AutoTokenizer is None:
-        # transformers not installed or import failed
-        return
-    try:
-        # don't crash if tokenizer download fails
-        self._hf_tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True)
-    except Exception as e:
-        print(f"LocalLLM: tokenizer load failed for {model_id}: {e}")
+    def _ensure_tokenizer_for_model(self):
+        """
+        Ensure we have a cached tokenizer for the local model.
+        Uses self.model (HF id) or self.model_path. Fails silently and leaves
+        self._hf_tokenizer = None if transformers is not available.
+        """
+        if getattr(self, "_hf_tokenizer", None) is not None:
+            return
         self._hf_tokenizer = None
+        model_id = getattr(self, "model", None) or getattr(self, "model_path", None)
+        if model_id is None:
+            return
+        if AutoTokenizer is None:
+            # transformers not installed or import failed
+            return
+        try:
+            # don't crash if tokenizer download fails
+            self._hf_tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True)
+        except Exception as e:
+            print(f"LocalLLM: tokenizer load failed for {model_id}: {e}")
+            self._hf_tokenizer = None
 
     def compute_dynamic_max_new_tokens(
         self, prompt: str, safety_factor: float = 0.80, hard_cap: Optional[int] = None
@@ -504,10 +503,10 @@ def _ensure_tokenizer_for_model(self):
     ) -> str:
         """
         Generate by chunks:
-         1. generate chunk_size tokens
-         2. append to output
-         3. build a continuation prompt using the trailing context (keep <= n_ctx)
-         4. repeat until model returns an end-of-text signal or a safety iteration cap
+        1. generate chunk_size tokens
+        2. append to output
+        3. build a continuation prompt using the trailing context (keep <= n_ctx)
+        4. repeat until model returns an end-of-text signal or a safety iteration cap
         This helps produce arbitrarily long outputs while respecting model n_ctx.
         """
         n_ctx = self._n_ctx or 512
