@@ -22,7 +22,7 @@ TEST_PROMPT: str = os.getenv(
     "TEST_PROMPT",
     "Write me a script for a 10 min video for children(stritly answer with the script)\n",
 )
-TEST_MAX_TOKENS: int = int(os.getenv("TEST_MAX_TOKENS", "64"))
+TEST_MAX_TOKENS: int = int(os.getenv("TEST_MAX_TOKENS", "30000"))
 TEST_TEMPERATURE: float = float(os.getenv("TEST_TEMPERATURE", "0.0"))
 VERBOSE: bool = os.getenv("VERBOSE", "true").lower() in ("1", "true", "yes")
 POST_SUCCESS_CMD: Optional[str] = os.getenv("POST_SUCCESS_CMD", None)
@@ -31,7 +31,7 @@ POST_SUCCESS_CMD: Optional[str] = os.getenv("POST_SUCCESS_CMD", None)
 
 def _log(*a, **k):
     if VERBOSE:
-        print(*a, **k)
+        print(*a, **k, flush=True)
 
 
 # Try importing required HF helpers early
