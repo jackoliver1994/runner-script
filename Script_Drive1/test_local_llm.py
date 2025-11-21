@@ -20,7 +20,9 @@ MODEL_DEST_PATH: str = os.getenv(
     ),
 )
 USE_AUTH: bool = os.getenv("USE_AUTH", "true").lower() in ("1", "true", "yes")
-SELECT_STRATEGY: str = os.getenv("SELECT_STRATEGY", "auto").lower()
+SELECT_STRATEGY: str = os.getenv(
+    "SELECT_STRATEGY", "auto"
+).lower()  # auto, first, smallest, largest
 TEST_PROMPT: str = os.getenv(
     "TEST_PROMPT",
     "Write me a script for a 10 min video for children(stritly answer with the script)\n",
@@ -269,8 +271,8 @@ def pick_gguf_from_list(files: List[str], strategy) -> str:
     ]
     if not candidates:
         raise SystemExit("No .gguf files found in the repo listing.")
-    if isinstance(strategy, int):
-        return candidates[strategy]
+    if isinstance(strategy, str) and strategy in candidates:
+        return strategy
     s = str(strategy).lower()
     if s in ("first", "smallest", "largest"):
         if s == "first":

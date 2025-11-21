@@ -20,7 +20,7 @@ jobs:
       MODEL_DEST_PATH: ${{ github.workspace }}/models/Mistral-Small-3.1-24B-Instruct-2503-Q5_K_M.gguf
       REPO_ID: bartowski/mistralai_Mistral-Small-3.1-24B-Instruct-2503-GGUF
       USE_AUTH: "true"
-      SELECT_STRATEGY: "auto"
+      SELECT_STRATEGY: "Mistral-Small-3.1-24B-Instruct-2503-Q5_K_M.gguf"
       VERBOSE: "true"
 
     steps:
