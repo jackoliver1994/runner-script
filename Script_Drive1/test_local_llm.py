@@ -10,14 +10,9 @@ import inspect
 
 # ----------------- CONFIG (read from env; override here if needed) -----------------
 HF_TOKEN: str = os.getenv("HF_TOKEN", "")  # Provided by GitHub workflow (hf_key)
-REPO_ID: str = os.getenv(
-    "REPO_ID", "bartowski/mistralai_Mistral-Small-3.1-24B-Instruct-2503-GGUF"
-)
+REPO_ID: str = os.getenv("REPO_ID", "mistralai/Mistral-Small-3.1-24B-Instruct-2503")
 MODEL_DEST_PATH: str = os.getenv(
-    "MODEL_DEST_PATH",
-    os.path.join(
-        os.getcwd(), "models", "Mistral-Small-3.1-24B-Instruct-2503-Q5_K_M.gguf"
-    ),
+    "MODEL_DEST_PATH", os.path.join(os.getcwd(), "models", "mistral-small-3.1.gguf")
 )
 USE_AUTH: bool = os.getenv("USE_AUTH", "true").lower() in ("1", "true", "yes")
 SELECT_STRATEGY: str = os.getenv(
@@ -271,8 +266,8 @@ def pick_gguf_from_list(files: List[str], strategy) -> str:
     ]
     if not candidates:
         raise SystemExit("No .gguf files found in the repo listing.")
-    if isinstance(strategy, str) and strategy in candidates:
-        return strategy
+    if isinstance(strategy, int):
+        return candidates[strategy]
     s = str(strategy).lower()
     if s in ("first", "smallest", "largest"):
         if s == "first":
