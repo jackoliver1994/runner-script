@@ -139,20 +139,14 @@ class LocalLLM:
         model_id = getattr(self, "model", None) or getattr(self, "model_path", None)
         if model_id is None:
             return
-        # Only try HF tokenizer if this looks like a HuggingFace repo id or local tokenizer folder:
-        if isinstance(model_id, str) and (
-            "/" in model_id
-            or os.path.isdir(os.path.join(str(model_id), "tokenizer.json"))
-        ):
-            try:
-                self._hf_tokenizer = AutoTokenizer.from_pretrained(
-                    model_id, use_fast=True
-                )
-            except Exception as e:
-                print(f"LocalLLM: tokenizer load failed for {model_id}: {e}")
-                self._hf_tokenizer = None
-        else:
-            # skip tokenizer for raw gguf / non-hf paths
+        if AutoTokenizer is None:
+            # transformers not installed or import failed
+            return
+        try:
+            # don't crash if tokenizer download fails
+            self._hf_tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True)
+        except Exception as e:
+            print(f"LocalLLM: tokenizer load failed for {model_id}: {e}")
             self._hf_tokenizer = None
 
     def compute_dynamic_max_new_tokens(
