@@ -17,8 +17,8 @@ jobs:
       HF_TOKEN: ${{ github.event.inputs.hf_key }}
 
       # MODEL_DEST_PATH and REPO_ID are set here (not dynamic). Change paths if you like.
-      MODEL_DEST_PATH: ${{ github.workspace }}/models/mistral-small-3.1.gguf
-      REPO_ID: ggml-org/Mistral-Small-3.1-24B-Instruct-2503-GGUF
+      MODEL_DEST_PATH: ${{ github.workspace }}/models/Mistral-Small-3.1-24B-Instruct-2503-Q5_K_M.gguf
+      REPO_ID: bartowski/mistralai_Mistral-Small-3.1-24B-Instruct-2503-GGUF
       USE_AUTH: "true"
       SELECT_STRATEGY: "auto"
       VERBOSE: "true"
@@ -68,7 +68,7 @@ jobs:
         env:
           HF_TOKEN: ${{ github.event.inputs.hf_key }}
           MODEL_DEST_PATH: ${{ github.workspace }}/models/mistral-small-3.1.gguf
-          REPO_ID: ggml-org/Mistral-Small-3.1-24B-Instruct-2503-GGUF
+          REPO_ID: bartowski/mistralai_Mistral-Small-3.1-24B-Instruct-2503-GGUF
 
       - name: Show disk
         run: |
