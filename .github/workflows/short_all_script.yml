@@ -68,7 +68,7 @@ jobs:
         env:
           HF_TOKEN: ${{ github.event.inputs.hf_key }}
           MODEL_DEST_PATH: ${{ github.workspace }}/models/mistral-small-3.1.gguf
-          REPO_ID: mistralai/Mistral-Small-3.1-24B-Instruct-2503
+          REPO_ID: bartowski/mistralai_Mistral-Small-3.1-24B-Instruct-2503-GGUF
 
       - name: Show disk
         run: |
