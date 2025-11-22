@@ -96,20 +96,6 @@ jobs:
             Script_Drive1/youtube_response/**
             Script_Drive1/narration_response/**
 
-      - name: Run your script (all_scripts)
-        env:
-          R_HOURS: "6"
-        run: |
-          cd Script_Drive1
-          python all_scripts.py
-
-      - name: Show disk and largest dirs
-        run: |
-          df -h
-          sudo du -xh / | sort -h -r | head -30
-          sudo du -xh /opt | sort -h -r | head -10
-          docker system df || true
-
       - name: Cleanup workspace and temp files (Linux/macOS)
         if: always()
         run: |
@@ -122,7 +108,3 @@ jobs:
           rm -rf /home/runner/work/_tool/* || true
           # optional docker cleanup (if you use docker)
           docker system prune -af --volumes || true
-
-      - name: Show disk
-        run: |
-          df -h
