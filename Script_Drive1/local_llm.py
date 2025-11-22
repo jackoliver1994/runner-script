@@ -849,15 +849,15 @@ def save_response(folder_name: str, file_name: str, content: str):
 
 
 def extract_largest_bracketed(text: str) -> Optional[str]:
-    matches = re.findall(r"\[([^\]]+)\]", text, flags=re.DOTALL)
-    if not matches:
+    blocks = extract_all_bracketed_blocks(text)
+    if not blocks:
         return None
-    largest = max(matches, key=lambda s: len(s))
+    largest = max(blocks, key=lambda s: len(s))
     return largest.strip()
 
 
 def extract_all_bracketed_blocks(text: str) -> List[str]:
-    return [m.strip() for m in re.findall(r"\[([^\]]+)\]", text, flags=re.DOTALL)]
+    return [m.strip() for m in re.findall(r"\[([\s\S]*?)\]", text, flags=re.DOTALL)]
 
 
 def escape_for_coqui_tts(text: str) -> str:
@@ -1044,7 +1044,11 @@ class StoryPipeline:
         single_block_re = re.compile(r"^\s*\[[\s\S]*\]\s*$", flags=re.DOTALL)
 
         def _word_count(text: str) -> int:
-            return len(re.findall(r"\w+", text or ""))
+            # count words more accurately (accounts for contractions and hyphens)
+            if not text:
+                return 0
+            # count sequences of letters/apostrophes/hyphens
+            return len(re.findall(r"\b[\w'-]+\b", text))
 
         def _get_paragraphs(text: str) -> list:
             if not text:
@@ -1070,18 +1074,21 @@ class StoryPipeline:
                 if not np:
                     continue
                 duplicate = False
+                # if exact duplicate, drop
                 if np in normals:
                     duplicate = True
                 else:
-                    for k in normals:
-                        if len(np) < 40 or len(k) < 40:
-                            continue
-                        if (
-                            difflib.SequenceMatcher(None, np, k).ratio()
-                            >= fuzzy_threshold
-                        ):
-                            duplicate = True
-                            break
+                    # only use fuzzy detection for reasonably long paragraphs to avoid killing transitions
+                    if len(np) >= 120:
+                        for k in normals:
+                            if len(k) < 120:
+                                continue
+                            if (
+                                difflib.SequenceMatcher(None, np, k).ratio()
+                                >= fuzzy_threshold
+                            ):
+                                duplicate = True
+                                break
                 if not duplicate:
                     kept.append(p)
                     normals.append(np)
