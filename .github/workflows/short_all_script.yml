@@ -17,8 +17,8 @@ jobs:
       HF_TOKEN: ${{ github.event.inputs.hf_key }}
 
       # MODEL_DEST_PATH and REPO_ID are set here (not dynamic). Change paths if you like.
-      MODEL_DEST_PATH: ${{ github.workspace }}/models/mpt-7b-storywriter.gguf
-      REPO_ID: maddes8cht/mosaicml-mpt-7b-storywriter-gguf
+      MODEL_DEST_PATH: ${{ github.workspace }}/models/Qwen1.5-7B-Chat.gguf
+      REPO_ID: Qwen/Qwen1.5-7B-Chat-GGUF
       USE_AUTH: "true"
       SELECT_STRATEGY: "auto"
       VERBOSE: "true"
@@ -62,7 +62,7 @@ jobs:
         env:
           HF_TOKEN: ${{ github.event.inputs.hf_key }}
           MODEL_DEST_PATH: ${{ github.workspace }}/models/Llama-2-7B-Chat-GGUF.gguf
-          REPO_ID: maddes8cht/mosaicml-mpt-7b-storywriter-gguf
+          REPO_ID: Qwen/Qwen1.5-7B-Chat-GGUF
 
       - name: Show disk
         run: |
