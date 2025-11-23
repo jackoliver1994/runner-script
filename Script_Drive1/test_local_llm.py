@@ -5,7 +5,7 @@ import sys
 import time
 import shutil
 import subprocess
-from typing import List, Optional, Tuple, Dict, Any
+from typing import List, Optional, Tuple, Dict, Any, Union
 import inspect
 
 # ----------------- CONFIG (read from env; override here if needed) -----------------
@@ -160,82 +160,290 @@ def parse_variant_tags(filename: str) -> List[str]:
     return tags
 
 
-def choose_gguf_from_candidates(
-    candidates: List[str], repo_id: str, strategy: str = "auto"
-) -> str:
-    if not candidates:
-        raise SystemExit("No .gguf candidates provided to chooser.")
-
-    total_ram = get_total_ram_gb()
-    cpu_flags = detect_cpu_flags()
-    gpu = detect_gpu_info()
-    _log(f"System: RAM={total_ram:.1f}GB, CPU flags={cpu_flags}, GPU={gpu}")
-
-    categorized = []
-    api = None
+def _try_get_local_size(path: str) -> Optional[int]:
+    """Return file size in bytes if path exists locally and is accessible, else None."""
     try:
-        api = HfApi()
-        info = api.repo_info(repo_id, token=HF_TOKEN if USE_AUTH else None)
-        siblings = getattr(info, "siblings", None)
+        if path.startswith("http://") or path.startswith("https://"):
+            return None
+        return os.path.getsize(path)
     except Exception:
-        siblings = None
+        return None
 
-    size_map = {}
-    if siblings:
-        for s in siblings:
-            name = getattr(s, "rfilename", None)
-            if name and (name in candidates):
-                size_map[name] = getattr(s, "size", 0)
 
-    for c in candidates:
-        tags = parse_variant_tags(c)
-        sz = size_map.get(c, None)
-        categorized.append((c, tags, sz))
+def _is_quantized_name(name: str) -> bool:
+    """Heuristic: file names containing q4, q8, q5, quant, 'int' often indicate quantized models."""
+    n = name.lower()
+    # common patterns: q4_0, q8_0, q4, q8, 4bit, 8bit, quantized, quant, int8, int4
+    patterns = [r"\bq\d", r"\b\dbit\b", r"quant", r"int8", r"int4", r"8bit", r"4bit"]
+    return any(re.search(p, n) for p in patterns)
 
-    s = strategy.lower()
-    if s in ("first", "smallest", "largest"):
-        if s == "first":
-            return categorized[0][0]
-        if s == "smallest":
-            prioritized = sorted(
-                categorized,
-                key=lambda it: (
-                    (
-                        0
-                        if any(
-                            (t.startswith("q") or "q4" in t or "q8" in t) for t in it[1]
-                        )
-                        else 1
-                    ),
-                    it[2] or 1e12,
-                ),
+
+def _available_ram_bytes() -> Optional[int]:
+    """Try to get available RAM in bytes; returns None if psutil not available."""
+    try:
+        import psutil
+
+        return psutil.virtual_memory().available
+    except Exception:
+        return None
+
+
+def _try_get_gpu_mem_bytes() -> Optional[int]:
+    """Try to detect the total GPU memory (bytes) on the main GPU. Return None if not detectable."""
+    # Try pynvml first, then torch.cuda
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        meminfo = pynvml.nvmlDeviceGetMemoryInfo(handle)
+        pynvml.nvmlShutdown()
+        return int(meminfo.total)
+    except Exception:
+        pass
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            # total memory of device 0
+            props = torch.cuda.get_device_properties(0)
+            return int(props.total_memory)
+    except Exception:
+        pass
+    return None
+
+
+def choose_gguf_from_candidates(
+    candidates: List[str],
+    strategy: Union[str, int] = "auto",
+    verbose: bool = False,
+) -> str:
+    """
+    Choose one .gguf candidate from a list according to strategy.
+
+    candidates: list of filenames, paths or URLs (strings)
+    strategy: one of:
+        - integer index -> return candidates[index]
+        - 'first' -> first candidate
+        - 'smallest' -> by local file size if available, else by quantized heuristics
+        - 'largest' -> by local file size if available, else by non-quantized heuristics
+        - 'auto' -> uses system resources heuristics (GPU memory > threshold or RAM) to
+                    prefer full (non-quantized) model or quantized model
+        - filename string -> matched against basename or full candidate entry (case-insensitive)
+    Returns selected candidate string.
+    Raises SystemExit if no valid .gguf candidates or index out of range.
+    """
+    if not candidates:
+        raise SystemExit("No candidates provided to choose_gguf_from_candidates().")
+
+    # Filter to .gguf-like entries (be tolerant: could be '...gguf' or contain '.gguf')
+    ggufs = [c for c in candidates if c and ".gguf" in c.lower()]
+    if not ggufs:
+        raise SystemExit("No .gguf files found in candidates.")
+
+    # Normalize strategy string if applicable
+    if isinstance(strategy, str):
+        strategy_lower = strategy.strip().lower()
+    else:
+        strategy_lower = None
+
+    # 1) Direct filename/full-string match (case-insensitive)
+    if isinstance(strategy, str) and strategy_lower:
+        for c in ggufs:
+            if (
+                os.path.basename(c).lower() == strategy_lower
+                or c.lower() == strategy_lower
+            ):
+                if verbose:
+                    print(f"[chooser] Direct filename match -> {c}")
+                return c
+
+    # 2) Integer index
+    if isinstance(strategy, int):
+        idx = strategy
+        if idx < 0 or idx >= len(ggufs):
+            raise SystemExit(f"Index strategy out of range: {idx} (len={len(ggufs)})")
+        if verbose:
+            print(f"[chooser] Index strategy -> {idx} -> {ggufs[idx]}")
+        return ggufs[idx]
+
+    # 3) 'first' strategy
+    if isinstance(strategy, str) and strategy_lower in (
+        "first",
+        "first-found",
+        "first_found",
+    ):
+        if verbose:
+            print(f"[chooser] First strategy -> {ggufs[0]}")
+        return ggufs[0]
+
+    # Helper: gather sizes (if available) and quant flag
+    sized_list = []
+    for c in ggufs:
+        size = _try_get_local_size(c)  # may be None for URLs or missing files
+        quant = _is_quantized_name(os.path.basename(c))
+        sized_list.append({"path": c, "size": size, "quant": quant})
+
+    # 4) 'smallest' strategy
+    if isinstance(strategy, str) and strategy_lower == "smallest":
+        # Prefer smallest by available size; if no sizes, prefer quantized names
+        sizes = [s["size"] for s in sized_list if s["size"] is not None]
+        if sizes:
+            # pick candidate with smallest size (local)
+            pick = min(
+                (s for s in sized_list if s["size"] is not None),
+                key=lambda x: x["size"],
             )
-            return prioritized[0][0]
-        if s == "largest":
-            sorted_by_size = sorted(categorized, key=lambda it: -(it[2] or 0))
-            return sorted_by_size[0][0]
+            if verbose:
+                print(
+                    f"[chooser] Smallest-by-size -> {pick['path']} ({pick['size']} bytes)"
+                )
+            return pick["path"]
+        # fallback: choose quantized name if present
+        for s in sized_list:
+            if s["quant"]:
+                if verbose:
+                    print(
+                        f"[chooser] Smallest heuristic fallback -> {s['path']} (quantized by name)"
+                    )
+                return s["path"]
+        if verbose:
+            print(f"[chooser] Smallest fallback -> {sized_list[0]['path']}")
+        return sized_list[0]["path"]
 
-    if gpu and gpu.get("vram_gb", 0) >= 12:
-        for name, tags, _ in categorized:
-            if any(t in ("f16", "fp16", "f32", "bf16") for t in tags):
-                return name
-        if size_map:
-            return max(categorized, key=lambda it: it[2] or 0)[0]
-        return categorized[0][0]
+    # 5) 'largest' strategy
+    if isinstance(strategy, str) and strategy_lower == "largest":
+        sizes = [s["size"] for s in sized_list if s["size"] is not None]
+        if sizes:
+            pick = max(
+                (s for s in sized_list if s["size"] is not None),
+                key=lambda x: x["size"],
+            )
+            if verbose:
+                print(
+                    f"[chooser] Largest-by-size -> {pick['path']} ({pick['size']} bytes)"
+                )
+            return pick["path"]
+        # fallback: prefer non-quantized names
+        nonq = [s for s in sized_list if not s["quant"]]
+        if nonq:
+            if verbose:
+                print(
+                    f"[chooser] Largest heuristic fallback -> {nonq[0]['path']} (non-quantized by name)"
+                )
+            return nonq[0]["path"]
+        if verbose:
+            print(f"[chooser] Largest fallback -> {sized_list[0]['path']}")
+        return sized_list[0]["path"]
 
-    if total_ram and total_ram < 16 or not gpu:
-        q_candidates = [
-            it for it in categorized if any(t.startswith("q") for t in it[1])
-        ]
-        if q_candidates:
-            if size_map:
-                return min(q_candidates, key=lambda it: it[2] or 1e12)[0]
-            return sorted(q_candidates, key=lambda it: len(it[0]))[0]
-        if size_map:
-            return min(categorized, key=lambda it: it[2] or 1e12)[0]
-        return categorized[0][0]
+    # 6) 'auto' strategy (default)
+    # Try to determine if system has a capable GPU or much RAM. If resources are constrained, prefer quantized.
+    if strategy is None or (isinstance(strategy, str) and strategy_lower == "auto"):
+        gpu_mem = _try_get_gpu_mem_bytes()
+        ram_avail = _available_ram_bytes()
+        if verbose:
+            print(
+                f"[chooser] Auto heuristics: gpu_mem={gpu_mem}, ram_avail={ram_avail}"
+            )
 
-    return categorized[0][0]
+        # Use thresholds (bytes): GPU >= 12 GiB -> prefer full (non-quantized); else prefer quantized
+        GB = 1024**3
+        gpu_threshold = 12 * GB
+        ram_threshold = (
+            24 * GB
+        )  # arbitrary: if machine has lots of RAM, can pick larger models
+
+        prefer_quant = True
+        if gpu_mem is not None:
+            prefer_quant = gpu_mem < gpu_threshold
+            if verbose:
+                print(f"[chooser] prefer_quant (based on GPU) = {prefer_quant}")
+        elif ram_avail is not None:
+            # if lots of RAM, don't prefer quant
+            prefer_quant = ram_avail < ram_threshold
+            if verbose:
+                print(f"[chooser] prefer_quant (based on RAM) = {prefer_quant}")
+        else:
+            # No reliable system info: make a conservative choice using filenames:
+            # if any candidate looks quantized -> prefer quant, else prefer non-quant
+            has_quant = any(s["quant"] for s in sized_list)
+            has_nonq = any(not s["quant"] for s in sized_list)
+            prefer_quant = has_quant and not has_nonq
+            if verbose:
+                print(f"[chooser] prefer_quant (fallback by names) = {prefer_quant}")
+
+        # If sizes are available, use sizes combined with quant flag
+        sizes_known = any(s["size"] is not None for s in sized_list)
+        if sizes_known:
+            # If prefer_quant -> choose smallest quantized; else choose largest non-quantized (or largest overall)
+            if prefer_quant:
+                quant_candidates = [
+                    s for s in sized_list if s["quant"] and s["size"] is not None
+                ]
+                if quant_candidates:
+                    pick = min(quant_candidates, key=lambda x: x["size"])
+                    if verbose:
+                        print(f"[chooser] Auto (prefer quant) -> {pick['path']}")
+                    return pick["path"]
+                # otherwise fall back to smallest by size
+                pick = min(
+                    (s for s in sized_list if s["size"] is not None),
+                    key=lambda x: x["size"],
+                )
+                if verbose:
+                    print(f"[chooser] Auto fallback smallest -> {pick['path']}")
+                return pick["path"]
+            else:
+                nonq_candidates = [
+                    s for s in sized_list if (not s["quant"]) and s["size"] is not None
+                ]
+                if nonq_candidates:
+                    pick = max(nonq_candidates, key=lambda x: x["size"])
+                    if verbose:
+                        print(f"[chooser] Auto (prefer full) -> {pick['path']}")
+                    return pick["path"]
+                # otherwise pick largest overall
+                pick = max(
+                    (s for s in sized_list if s["size"] is not None),
+                    key=lambda x: x["size"],
+                )
+                if verbose:
+                    print(f"[chooser] Auto fallback largest -> {pick['path']}")
+                return pick["path"]
+        else:
+            # No sizes known. Use name heuristics:
+            if prefer_quant:
+                for s in sized_list:
+                    if s["quant"]:
+                        if verbose:
+                            print(
+                                f"[chooser] Auto (no sizes) choose quant by name -> {s['path']}"
+                            )
+                        return s["path"]
+                if verbose:
+                    print(
+                        f"[chooser] Auto (no sizes) no quant names; pick first -> {sized_list[0]['path']}"
+                    )
+                return sized_list[0]["path"]
+            else:
+                for s in sized_list:
+                    if not s["quant"]:
+                        if verbose:
+                            print(
+                                f"[chooser] Auto (no sizes) choose non-quant by name -> {s['path']}"
+                            )
+                        return s["path"]
+                # else fallback
+                if verbose:
+                    print(
+                        f"[chooser] Auto (no sizes) fallback -> {sized_list[0]['path']}"
+                    )
+                return sized_list[0]["path"]
+
+    # If strategy didn't match any known commands, raise
+    raise SystemExit(
+        f"Unknown choose strategy: {strategy!r}. Valid: int, 'first', 'smallest', 'largest', 'auto', or filename."
+    )
 
 
 # ----------------- HF download helpers -----------------

@@ -7,10 +7,6 @@ Refactored from user's original script into a modular, callable design.
 - ChatAPI.send_message accepts per-call timeout and controllable retry options.
 - Image prompt generation supports batching (smaller requests) with backoff/retry to reduce timeouts.
 - Helpers to extract bracketed blocks and ensure the "single bracketed block only" requirement.
-
-Use:
-    pipeline = StoryPipeline(api_url="https://apifreellm.com/api/chat")
-    pipeline.generate_image_prompts(script_text, img_number=150, batch_size=50)
 """
 
 import time
