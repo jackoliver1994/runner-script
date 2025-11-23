@@ -20,7 +20,7 @@ jobs:
       MODEL_DEST_PATH: ${{ github.workspace }}/models/Qwen1.5-7B-Chat.gguf
       REPO_ID: Qwen/Qwen1.5-7B-Chat-GGUF
       USE_AUTH: "true"
-      SELECT_STRATEGY: "auto"
+      SELECT_STRATEGY: "largest"
       VERBOSE: "true"
 
     steps:
@@ -61,7 +61,7 @@ jobs:
           pip cache purge
         env:
           HF_TOKEN: ${{ github.event.inputs.hf_key }}
-          MODEL_DEST_PATH: ${{ github.workspace }}/models/Llama-2-7B-Chat-GGUF.gguf
+          MODEL_DEST_PATH: ${{ github.workspace }}/models/Qwen1.5-7B-Chat.gguf
           REPO_ID: Qwen/Qwen1.5-7B-Chat-GGUF
 
       - name: Show disk
