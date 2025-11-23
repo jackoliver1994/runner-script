@@ -1,4 +1,0 @@
-requests>=2.30.0
-huggingface-hub>=0.18.4
-psutil==5.9.5
-transformers==4.40.1
