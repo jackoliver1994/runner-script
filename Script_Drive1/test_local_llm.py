@@ -384,7 +384,7 @@ def pick_gguf_from_list(files: List[str], strategy) -> str:
                 pass
             return candidates[0]
 
-    return choose_gguf_from_candidates(candidates, REPO_ID, strategy or "auto")
+    return choose_gguf_from_candidates(candidates, strategy or "auto", verbose=VERBOSE)
 
 
 def download_model_via_hf(repo_id: str, select_strategy) -> str:
