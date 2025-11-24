@@ -126,22 +126,58 @@ class LocalLLM:
     def _ensure_tokenizer_for_model(self):
         """
         Ensure we have a cached tokenizer for the local model.
-        Uses self.model (HF id) or self.model_path. Fails silently and leaves
-        self._hf_tokenizer = None if transformers is not available.
+        Behavior changes:
+        - If self.model (HF id) is set, attempt HF tokenizer load.
+        - If self.model_path points at a directory, attempt tokenizer load from that directory.
+        - If self.model_path points at a single file (e.g. .gguf / .ggml), skip AutoTokenizer (transformers cannot load from a single binary).
+        - Fail silently (sets self._hf_tokenizer = None) and prints a clear message on problems.
         """
         if getattr(self, "_hf_tokenizer", None) is not None:
             return
         self._hf_tokenizer = None
+
+        # model identifier preference: prefer explicit self.model (repo id or dir)
         model_id = getattr(self, "model", None) or getattr(self, "model_path", None)
         if model_id is None:
             return
+
         if AutoTokenizer is None:
             # transformers not installed or import failed
+            print(
+                "LocalLLM: transformers.AutoTokenizer not available; skipping HF tokenizer."
+            )
             return
+
+        from pathlib import Path
+
         try:
-            # don't crash if tokenizer download fails
+            # If model_id is a local path...
+            try:
+                p = Path(str(model_id))
+                if p.exists():
+                    # If it's a file (gguf / ggml / safetensors / bin), transformers tokenizer can't load from it
+                    if p.is_file():
+                        print(
+                            f"LocalLLM: tokenizer load skipped — model path points to a single file ({p.suffix}). "
+                            "AutoTokenizer requires a folder (tokenizer files) or a HF repo id."
+                        )
+                        self._hf_tokenizer = None
+                        return
+                    # it's a directory — attempt to load tokenizer from that folder
+                    if p.is_dir():
+                        self._hf_tokenizer = AutoTokenizer.from_pretrained(
+                            str(p), use_fast=True
+                        )
+                        return
+                # if path doesn't exist, fall through to treating model_id as HF repo id
+            except Exception:
+                # not a valid Path or some IO issue — we will try from_pretrained below
+                pass
+
+            # If we reach here, attempt to load as a HuggingFace repo id / local folder path string
             self._hf_tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True)
         except Exception as e:
+            # Print a concise explanation (do not re-raise). Leave tokenizer as None to fallback to char-based estimate.
             print(f"LocalLLM: tokenizer load failed for {model_id}: {e}")
             self._hf_tokenizer = None
 
@@ -221,6 +257,17 @@ class LocalLLM:
         if not model_file:
             raise RuntimeError(f"No model files found under {self.model_dir}.")
         self.model_path = model_file
+
+        # Keep an explicit 'model' attribute for tokenizer attempts:
+        from pathlib import Path
+
+        _p = Path(self.model_path)
+        if _p.exists() and _p.is_dir():
+            # model path is a directory -> it may contain tokenizer files; use it as model id
+            self.model = str(self.model_path)
+        else:
+            # single-file model (gguf/ggml etc.) -> do not treat as HF id for tokenizer
+            self.model = None
 
         # prefer llama-cpp-python (for gguf/ggml)
         try:
