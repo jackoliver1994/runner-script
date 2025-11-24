@@ -20,7 +20,7 @@ jobs:
       MODEL_DEST_PATH: ${{ github.workspace }}/models/Qwen1.5-7B-Chat.gguf
       REPO_ID: Qwen/Qwen1.5-7B-Chat-GGUF
       USE_AUTH: "true"
-      SELECT_STRATEGY: "largest"
+      SELECT_STRATEGY: "qwen1_5-7b-chat-q8_0.gguf"
       VERBOSE: "true"
 
     steps:
