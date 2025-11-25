@@ -87,7 +87,7 @@ class LocalLLM:
         self.model_dir = str(model_dir)
         self.base_timeout = default_timeout
         self.backend = None
-        self.model_path = None
+        self.model_path = str(model_dir)
         self._impl = None
         self._n_ctx = None
         self._avg_token_char = 4
