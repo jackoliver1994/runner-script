@@ -207,9 +207,10 @@ class LocalLLM:
                 print(f"LocalLLM: tokenizer call failed, falling back to estimate: {e}")
                 prompt_tokens = None
 
-        if prompt_tokens is None:
-            # rough fallback: estimate ~4 characters per token for english text
-            prompt_tokens = max(1, len(prompt) // 4)
+        # If the prompt already exceeds reported n_ctx, adapt conservatively:
+        if prompt_tokens >= n_ctx:
+            # Assume only ~60% of context is usable for the prompt so some room remains for generation.
+            prompt_tokens = int(n_ctx * 0.60)
 
         # compute raw available tokens
         available = max(0, n_ctx - prompt_tokens)
@@ -218,7 +219,7 @@ class LocalLLM:
         safe_allowed = int(available * float(max(0.01, min(1.0, safety_factor))))
 
         # enforce a minimum and optional hard cap
-        MIN_NEW_TOKENS = 8
+        MIN_NEW_TOKENS = 64  # raised from 8 -> 64 to avoid tiny generations
         if hard_cap is not None:
             safe_allowed = min(safe_allowed, int(hard_cap))
         safe_allowed = max(MIN_NEW_TOKENS, safe_allowed)
@@ -275,11 +276,11 @@ class LocalLLM:
 
             print(f"LocalLLM: attempting llama-cpp-python init with {self.model_path}")
             cpu_count = os.cpu_count() or 1
-            os.environ.setdefault("OMP_NUM_THREADS", str(max(1, cpu_count - 1)))
+            n_threads = max(1, cpu_count - 1)
+            os.environ.setdefault("OMP_NUM_THREADS", str(n_threads))
 
-            # Try a single, safe Llama init (no insane n_ctx values).
             try:
-                self._impl = Llama(model_path=self.model_path, n_threads=cpu_count)
+                self._impl = Llama(model_path=self.model_path, n_threads=n_threads)
             except TypeError:
                 # older llama-cpp-python might not accept n_threads
                 self._impl = Llama(model_path=self.model_path)
@@ -697,18 +698,53 @@ class LocalLLM:
         # ensure prompt fits
         prompt = self._trim_prompt_to_fit(prompt, max_new_tokens)
 
-        # try .create
+        # try .create (non-streaming) and fallback to streaming if empty
         try:
             if hasattr(llm, "create"):
                 try:
-                    # modern llama-cpp-python: supports stream and callback; here call non-streaming
                     resp = llm.create(
                         prompt=prompt,
                         max_tokens=max_new_tokens,
                         temperature=temperature,
                         top_p=top_p,
                     )
-                    return _extract_text(resp).strip()
+                    text = _extract_text(resp).strip()
+                    if text:
+                        return text
+                    # nothing extracted — dump debug and try streaming fallback
+                    print(
+                        f"LocalLLM: .create returned empty response (type={type(resp)}). repr(head)={repr(resp)[:400]}"
+                    )
+                    # try streaming fallback (many llama-cpp-python versions support stream=True returning an iterator)
+                    try:
+                        parts = []
+                        stream_iter = llm.create(
+                            prompt=prompt,
+                            max_tokens=max_new_tokens,
+                            temperature=temperature,
+                            top_p=top_p,
+                            stream=True,
+                        )
+                        for item in stream_iter:
+                            # item may be dict or str; try to extract likely text fields
+                            if isinstance(item, dict):
+                                t = (
+                                    item.get("text")
+                                    or item.get("generated_text")
+                                    or (
+                                        item.get("choices")
+                                        and item["choices"][0].get("text")
+                                    )
+                                )
+                                if t:
+                                    parts.append(str(t))
+                            else:
+                                parts.append(str(item))
+                        joined = "".join(parts).strip()
+                        if joined:
+                            return joined
+                    except Exception as e:
+                        print(f"LocalLLM: streaming .create fallback failed: {e}")
                 except Exception as e:
                     print(f"LocalLLM: .create failed: {e}")
         except Exception:
