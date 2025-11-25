@@ -20,6 +20,132 @@ from threading import Thread, Event
 from datetime import datetime
 from transformers import AutoTokenizer
 
+# ------------------------------------------------------------------------
+# ModelTokenBudget helper (insert this once near the top of the module)
+# ------------------------------------------------------------------------
+
+
+class ModelTokenBudget:
+    """
+    Model-aware token budgeting helper.
+    - Tries to load a HuggingFace tokenizer (AutoTokenizer) for exact counts when possible.
+    - Falls back to per-model char-per-token heuristics when tokenizer is unavailable.
+    - Exposes count_prompt_tokens(prompt) and compute_max_new_tokens(...).
+    """
+
+    DEFAULT_CHAR_PER_TOKEN = 4.0
+    MODEL_OVERRIDES = {
+        "gpt": 4.0,
+        "gpt-j": 4.0,
+        "gpt2": 4.0,
+        "llama": 4.0,
+        "gguf": 4.0,
+        "ggml": 4.0,
+        "mistral": 3.5,
+        "bloom": 4.5,
+        "opt": 4.0,
+        "vicuna": 4.0,
+    }
+
+    def __init__(
+        self, model_path_or_id: Optional[str] = None, n_ctx_default: int = 4096
+    ):
+        self.model_id = model_path_or_id or ""
+        self.n_ctx_default = n_ctx_default
+        self._tokenizer = None
+        self._char_per_token = None
+        self._try_load_tokenizer()
+
+    def _try_load_tokenizer(self):
+        """
+        Try to load a HF tokenizer for accurate token counts.
+        Silent failure if transformers not installed or tokenizer can't be loaded.
+        """
+        if not self.model_id:
+            return
+        try:
+            from transformers import AutoTokenizer
+
+            # try directory first, then repo id
+            if os.path.isdir(self.model_id):
+                try:
+                    self._tokenizer = AutoTokenizer.from_pretrained(
+                        self.model_id, use_fast=True
+                    )
+                except Exception:
+                    self._tokenizer = None
+            else:
+                try:
+                    self._tokenizer = AutoTokenizer.from_pretrained(
+                        self.model_id, use_fast=True
+                    )
+                except Exception:
+                    self._tokenizer = None
+        except Exception:
+            # transformers not installed or failed — keep tokenizer None
+            self._tokenizer = None
+
+    def _infer_char_per_token(self):
+        if self._char_per_token is not None:
+            return self._char_per_token
+        if self._tokenizer:
+            self._char_per_token = None
+            return None
+        mid = (self.model_id or "").lower()
+        for key, val in self.MODEL_OVERRIDES.items():
+            if key in mid:
+                self._char_per_token = val
+                return val
+        self._char_per_token = self.DEFAULT_CHAR_PER_TOKEN
+        return self._char_per_token
+
+    def count_prompt_tokens(self, prompt: str) -> int:
+        """
+        Return an estimate of prompt token count.
+        Uses tokenizer if available, otherwise uses heuristic char-per-token.
+        """
+        if not prompt:
+            return 0
+        if self._tokenizer:
+            try:
+                enc = self._tokenizer.encode(prompt, add_special_tokens=False)
+                return len(enc)
+            except Exception:
+                pass
+        cpt = self._infer_char_per_token() or self.DEFAULT_CHAR_PER_TOKEN
+        return max(0, int(len(prompt) / cpt))
+
+    def compute_max_new_tokens(
+        self,
+        prompt: str,
+        n_ctx: Optional[int] = None,
+        safety_factor: float = 0.8,
+        requested_max_new: Optional[int] = None,
+        min_new_tokens: int = 64,
+        local_ceiling: Optional[int] = 16384,
+    ) -> int:
+        """
+        Compute a dynamic max_new_tokens value:
+         - Uses tokenizer if available.
+         - Respects requested_max_new if provided.
+         - Applies safety_factor to reserve context for prompt and response.
+         - Ensures min and ceiling bounds.
+        """
+        n_ctx = n_ctx or self.n_ctx_default
+        prompt_tokens = self.count_prompt_tokens(prompt)
+        available = max(0, int((n_ctx - prompt_tokens) * safety_factor))
+        if requested_max_new is not None:
+            chosen = min(requested_max_new, available)
+        else:
+            chosen = min(available, int(n_ctx * (1.0 - safety_factor)))
+        chosen = max(chosen, min_new_tokens)
+        if local_ceiling:
+            chosen = min(chosen, local_ceiling)
+        return int(chosen)
+
+
+# ---------------------------------------------------------------------------
+
 
 # ---------------------- LOADING SPINNER ----------------------
 class LoadingSpinner:
@@ -191,43 +317,18 @@ class LocalLLM:
         local_ceiling: Optional[int] = None,
         n_ctx: Optional[int] = None,
     ) -> int:
-        """
-        Model-aware dynamic max_new_tokens.
-
-        This function delegates to the ModelTokenBudget helper (added at file end).
-        Behavior:
-        - Attempts to use a real tokenizer if available for exact prompt token count.
-        - Falls back to per-model or global heuristics (char-per-token).
-        - Honors an explicit `requested_max_new` where provided, but caps it by safety/available context.
-        - Uses `min_new_tokens` floor (defaults to 64).
-        - Uses `local_ceiling` if provided, otherwise looks for an instance attribute
-            `local_max_new_tokens_ceiling` (existing code used `local_max_new_tokens_ceiling`).
-        - `n_ctx` can be provided explicitly; otherwise falls back to self._n_ctx or 131072.
-        """
-        # determine context length
         if n_ctx is None:
             n_ctx = getattr(self, "_n_ctx", None) or 131072
-
-        # Allow callers to override the local ceiling via attribute (keeps backwards compatibility).
         if local_ceiling is None:
-            local_ceiling = (
-                getattr(self, "local_max_new_tokens_ceiling", None)
-                or getattr(self, "local_max_new_tokens_ceiling", None)
-                or getattr(self, "local_max_new_tokens_ceiling", None)
-            )
-        # final fallback ceiling used if nothing else configured
-        if local_ceiling is None:
-            local_ceiling = 65536
+            local_ceiling = getattr(self, "local_max_new_tokens_ceiling", None) or 65536
 
-        # Choose a model identifier to feed to ModelTokenBudget:
+        # choose a model identifier if your class sets one (try common attributes)
         model_id = None
-        # try common attributes that may exist in the class (keep robust)
         for attr in ("model", "model_path", "model_dir", "model_file"):
             if getattr(self, attr, None):
                 model_id = getattr(self, attr)
                 break
 
-        # Build a budget helper and compute a recommended max_new_tokens
         try:
             budget = ModelTokenBudget(model_path_or_id=model_id, n_ctx_default=n_ctx)
             computed = budget.compute_max_new_tokens(
@@ -239,39 +340,25 @@ class LocalLLM:
                 local_ceiling=local_ceiling,
             )
         except Exception as e:
-            # If ModelTokenBudget fails (should be rare), fall back to a conservative heuristic
+            # fallback heuristic if something goes wrong
             print(f"LocalLLM: ModelTokenBudget failed, falling back to heuristic: {e}")
-            # fallback: estimate prompt tokens ~4 chars/token unless model hints suggest otherwise
             approx_cpt = getattr(self, "_avg_token_char", 4.0)
             prompt_tokens = max(0, int(len(prompt) / approx_cpt))
             available = max(
-                0,
-                int(
-                    (n_ctx - prompt_tokens) * float(max(0.01, min(1.0, safety_factor)))
-                ),
+                0, int((n_ctx - prompt_tokens) * max(0.01, min(1.0, safety_factor)))
             )
             computed = max(min_new_tokens, min(int(local_ceiling), available))
-            # honor explicit requested cap if present
             if requested_max_new is not None:
                 computed = min(computed, int(requested_max_new))
 
-        # final guards: enforce min and ceiling
-        try:
-            computed = int(computed)
-        except Exception:
-            computed = min_new_tokens
-
+        # final guards
+        computed = int(computed)
         if computed < int(min_new_tokens):
             computed = int(min_new_tokens)
         if local_ceiling:
             computed = min(computed, int(local_ceiling))
-
-        # Keep compatibility: if explicit hard_cap provided, ensure it's honored
         if hard_cap is not None:
-            try:
-                computed = min(computed, int(hard_cap))
-            except Exception:
-                pass
+            computed = min(computed, int(hard_cap))
 
         return computed
 
@@ -432,29 +519,7 @@ class LocalLLM:
 
     # ---------------- prompt trimming strategy (keep recent context) ----------------
     def _trim_prompt_to_fit(self, prompt: str, max_new_tokens: int) -> str:
-        n_ctx = self._n_ctx or 512
-        safety = 8
-        allowed = n_ctx - max_new_tokens - safety
-        if allowed <= 0:
-            # if impossible, reduce max_new_tokens heuristically (caller should pick smaller chunk)
-            allowed = max(32, n_ctx // 8)
-        # if prompt already fits, return
-        if self._count_tokens(prompt) <= allowed:
-            return prompt
-        # trim by paragraphs first
-        parts = [p for p in prompt.split("\n\n") if p.strip() != ""]
-        if not parts:
-            # hard trim
-            approx_chars = allowed * self._avg_token_char
-            return prompt[-int(approx_chars) :]
-        while parts:
-            joined = "\n\n".join(parts)
-            if self._count_tokens(joined) <= allowed:
-                return joined
-            parts.pop(0)
-        # fallback hard trim
-        approx_chars = allowed * self._avg_token_char
-        return prompt[-int(approx_chars) :]
+        return prompt
 
     # ---------------- public send_message (preserves retry loop & signature) ----------------
     def send_message(
