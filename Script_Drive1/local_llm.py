@@ -151,28 +151,41 @@ class LocalLLM:
         from pathlib import Path
 
         try:
-            # If model_id is a local path...
-            try:
-                p = Path(str(model_id))
-                if p.exists():
-                    # If it's a file (gguf / ggml / safetensors / bin), transformers tokenizer can't load from it
-                    if p.is_file():
-                        print(
-                            f"LocalLLM: tokenizer load skipped — model path points to a single file ({p.suffix}). "
-                            "AutoTokenizer requires a folder (tokenizer files) or a HF repo id."
-                        )
-                        self._hf_tokenizer = None
-                        return
-                    # it's a directory — attempt to load tokenizer from that folder
-                    if p.is_dir():
-                        self._hf_tokenizer = AutoTokenizer.from_pretrained(
-                            str(p), use_fast=True
-                        )
-                        return
-                # if path doesn't exist, fall through to treating model_id as HF repo id
-            except Exception:
-                # not a valid Path or some IO issue — we will try from_pretrained below
-                pass
+            p = Path(str(model_id))
+            if p.exists():
+                if p.is_file():
+                    # If user provided a single file inside a models directory, attempt loading tokenizer from the model_dir
+                    model_dir = (
+                        Path(self.model_dir)
+                        if getattr(self, "model_dir", None)
+                        else p.parent
+                    )
+                    if model_dir.exists() and model_dir.is_dir():
+                        try:
+                            print(
+                                f"LocalLLM: trying tokenizer from model directory {model_dir}"
+                            )
+                            self._hf_tokenizer = AutoTokenizer.from_pretrained(
+                                str(model_dir), use_fast=True
+                            )
+                            return
+                        except Exception:
+                            # fall through to original single-file fallback
+                            pass
+
+                    print(
+                        f"LocalLLM: tokenizer load skipped — model path points to a single file ({p.suffix}). AutoTokenizer requires a folder (tokenizer files) or a HF repo id."
+                    )
+                    self._hf_tokenizer = None
+                    return
+                # if p is dir, try from_pretrained on the folder (unchanged)
+                if p.is_dir():
+                    self._hf_tokenizer = AutoTokenizer.from_pretrained(
+                        str(p), use_fast=True
+                    )
+                    return
+        except Exception:
+            pass
 
             # If we reach here, attempt to load as a HuggingFace repo id / local folder path string
             self._hf_tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True)
@@ -264,11 +277,17 @@ class LocalLLM:
 
         _p = Path(self.model_path)
         if _p.exists() and _p.is_dir():
-            # model path is a directory -> it may contain tokenizer files; use it as model id
+            # model_path is a dir -> may include tokenizer files
             self.model = str(self.model_path)
         else:
-            # single-file model (gguf/ggml etc.) -> do not treat as HF id for tokenizer
-            self.model = None
+            # single-file model (gguf/ggml etc.) -> set self.model to the parent dir
+            try:
+                parent_dir = str(Path(self.model_path).parent)
+                self.model = parent_dir
+                # keep explicit model_path pointing at the file (for llama-cpp load)
+                # but set 'model' attribute to the dir so tokenizer loading can try the directory.
+            except Exception:
+                self.model = str(self.model_path)
 
         # prefer llama-cpp-python (for gguf/ggml)
         try:
@@ -455,11 +474,32 @@ class LocalLLM:
                 f"LocalLLM: computed dynamic max_new_tokens={max_new_tokens} (safety_factor={safety_factor})"
             )
 
-        # convert None => infinite when retry_forever True; otherwise cap = max_retries or 5
+        # --- sanitize cap so comparisons never throw ---
         if retry_forever:
             cap = None
         else:
-            cap = max_retries if isinstance(max_retries, int) and max_retries > 0 else 5
+            # ensure we always end up with either an int > 0 or a default int
+            try:
+                cap = int(max_retries) if (max_retries is not None) else 5
+                if cap <= 0:
+                    cap = 5
+            except Exception:
+                cap = 5
+
+        # later, when enforcing the cap (inside the except block) use a safe check:
+        # enforce hard cap if set and not retry_forever
+        try:
+            if cap is not None and isinstance(cap, int) and attempt >= cap:
+                raise RuntimeError(
+                    f"send_message: reached max retries ({cap}). Last error: {e}"
+                )
+        except TypeError:
+            # defensive fallback — if any weird type sneaks in, convert to default int and continue retry
+            cap = 5
+            if attempt >= cap:
+                raise RuntimeError(
+                    f"send_message: reached max retries ({cap}). Last error: {e}"
+                )
 
         while True:
             attempt += 1
