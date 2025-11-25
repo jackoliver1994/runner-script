@@ -519,39 +519,29 @@ class LocalLLM:
 
     # ---------------- prompt trimming strategy (keep recent context) ----------------
     def _trim_prompt_to_fit(self, prompt: str, max_new_tokens: int) -> str:
-        """
-        Trim the prompt from the start (keep the most recent context) so that:
-            prompt_tokens + max_new_tokens + margin <= model_n_ctx
-
-        Uses self._count_tokens() when possible; falls back to a char-estimate if needed.
-        """
-        try:
-            n_ctx = int(getattr(self, "_n_ctx", 512) or 512)
-            margin = 8  # safety tokens
-            # ensure we have a sensible max_new_tokens
-            max_new_tokens = int(max(1, max_new_tokens or 64))
-
-            prompt_toks = self._count_tokens(prompt)
-            allowed_prompt_tokens = max(0, n_ctx - max_new_tokens - margin)
-
-            if prompt_toks <= allowed_prompt_tokens:
-                return prompt
-
-            # Trim by approximate chars-to-token ratio
-            approx_cpt = getattr(self, "_avg_token_char", 4.0)
-            # add small slack factor to avoid off-by-one
-            approx_allowed_chars = int(allowed_prompt_tokens * approx_cpt * 1.1)
-            if approx_allowed_chars <= 0:
-                # nothing allowed: return a compact sentinel prompt (last N chars)
-                return prompt[-2048:]
-
-            # keep the last approx_allowed_chars characters (preserve recent context)
-            trimmed = prompt[-approx_allowed_chars:]
-            # try to avoid returning a leading partial unicode surrogate
-            return trimmed.lstrip()
-        except Exception:
-            # conservative fallback: keep last 2000 chars
-            return prompt[-2000:]
+        n_ctx = self._n_ctx or 512
+        safety = 8
+        allowed = n_ctx - max_new_tokens - safety
+        if allowed <= 0:
+            # if impossible, reduce max_new_tokens heuristically (caller should pick smaller chunk)
+            allowed = max(32, n_ctx // 8)
+        # if prompt already fits, return
+        if self._count_tokens(prompt) <= allowed:
+            return prompt
+        # trim by paragraphs first
+        parts = [p for p in prompt.split("\n\n") if p.strip() != ""]
+        if not parts:
+            # hard trim
+            approx_chars = allowed * self._avg_token_char
+            return prompt[-int(approx_chars) :]
+        while parts:
+            joined = "\n\n".join(parts)
+            if self._count_tokens(joined) <= allowed:
+                return joined
+            parts.pop(0)
+        # fallback hard trim
+        approx_chars = allowed * self._avg_token_char
+        return prompt[-int(approx_chars) :]
 
     # ---------------- public send_message (preserves retry loop & signature) ----------------
     def send_message(
