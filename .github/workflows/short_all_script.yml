@@ -17,10 +17,10 @@ jobs:
       HF_TOKEN: ${{ github.event.inputs.hf_key }}
 
       # MODEL_DEST_PATH and REPO_ID are set here (not dynamic). Change paths if you like.
-      MODEL_DEST_PATH: ${{ github.workspace }}/models/Qwen1.5-7B-Chat.gguf
-      REPO_ID: mradermacher/Nexus-IKM-RolePlay-StoryWriter-Hermes-2-Pro-7B-i1-GGUF
+      MODEL_DEST_PATH: ${{ github.workspace }}/models/Llama-2-13B-chat.gguf
+      REPO_ID: TheBloke/Llama-2-13B-chat-GGUF
       USE_AUTH: "true"
-      SELECT_STRATEGY: "Nexus-IKM-RolePlay-StoryWriter-Hermes-2-Pro-7B.i1-Q6_K.gguf"
+      SELECT_STRATEGY: "llama-2-13b-chat.Q6_K.gguf"
       VERBOSE: "true"
 
     steps:
@@ -62,7 +62,7 @@ jobs:
         env:
           HF_TOKEN: ${{ github.event.inputs.hf_key }}
           MODEL_DEST_PATH: ${{ github.workspace }}/models/Qwen1.5-7B-Chat.gguf
-          REPO_ID: mradermacher/Nexus-IKM-RolePlay-StoryWriter-Hermes-2-Pro-7B-i1-GGUF
+          REPO_ID: TheBloke/Llama-2-13B-chat-GGUF
 
       - name: Show disk
         run: |
