@@ -61,7 +61,7 @@ jobs:
           pip cache purge
         env:
           HF_TOKEN: ${{ github.event.inputs.hf_key }}
-          MODEL_DEST_PATH: ${{ github.workspace }}/models/Qwen1.5-7B-Chat.gguf
+          MODEL_DEST_PATH: ${{ github.workspace }}/models/Llama-2-13B-chat.gguf
           REPO_ID: TheBloke/Llama-2-13B-chat-GGUF
 
       - name: Show disk
