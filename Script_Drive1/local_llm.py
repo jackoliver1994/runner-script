@@ -151,41 +151,28 @@ class LocalLLM:
         from pathlib import Path
 
         try:
-            p = Path(str(model_id))
-            if p.exists():
-                if p.is_file():
-                    # If user provided a single file inside a models directory, attempt loading tokenizer from the model_dir
-                    model_dir = (
-                        Path(self.model_dir)
-                        if getattr(self, "model_dir", None)
-                        else p.parent
-                    )
-                    if model_dir.exists() and model_dir.is_dir():
-                        try:
-                            print(
-                                f"LocalLLM: trying tokenizer from model directory {model_dir}"
-                            )
-                            self._hf_tokenizer = AutoTokenizer.from_pretrained(
-                                str(model_dir), use_fast=True
-                            )
-                            return
-                        except Exception:
-                            # fall through to original single-file fallback
-                            pass
-
-                    print(
-                        f"LocalLLM: tokenizer load skipped — model path points to a single file ({p.suffix}). AutoTokenizer requires a folder (tokenizer files) or a HF repo id."
-                    )
-                    self._hf_tokenizer = None
-                    return
-                # if p is dir, try from_pretrained on the folder (unchanged)
-                if p.is_dir():
-                    self._hf_tokenizer = AutoTokenizer.from_pretrained(
-                        str(p), use_fast=True
-                    )
-                    return
-        except Exception:
-            pass
+            # If model_id is a local path...
+            try:
+                p = Path(str(model_id))
+                if p.exists():
+                    # If it's a file (gguf / ggml / safetensors / bin), transformers tokenizer can't load from it
+                    if p.is_file():
+                        print(
+                            f"LocalLLM: tokenizer load skipped — model path points to a single file ({p.suffix}). "
+                            "AutoTokenizer requires a folder (tokenizer files) or a HF repo id."
+                        )
+                        self._hf_tokenizer = None
+                        return
+                    # it's a directory — attempt to load tokenizer from that folder
+                    if p.is_dir():
+                        self._hf_tokenizer = AutoTokenizer.from_pretrained(
+                            str(p), use_fast=True
+                        )
+                        return
+                # if path doesn't exist, fall through to treating model_id as HF repo id
+            except Exception:
+                # not a valid Path or some IO issue — we will try from_pretrained below
+                pass
 
             # If we reach here, attempt to load as a HuggingFace repo id / local folder path string
             self._hf_tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True)
@@ -220,10 +207,9 @@ class LocalLLM:
                 print(f"LocalLLM: tokenizer call failed, falling back to estimate: {e}")
                 prompt_tokens = None
 
-        # If the prompt already exceeds reported n_ctx, adapt conservatively:
-        if prompt_tokens >= n_ctx:
-            # Assume only ~60% of context is usable for the prompt so some room remains for generation.
-            prompt_tokens = int(n_ctx * 0.60)
+        if prompt_tokens is None:
+            # rough fallback: estimate ~4 characters per token for english text
+            prompt_tokens = max(1, len(prompt) // 4)
 
         # compute raw available tokens
         available = max(0, n_ctx - prompt_tokens)
@@ -232,7 +218,7 @@ class LocalLLM:
         safe_allowed = int(available * float(max(0.01, min(1.0, safety_factor))))
 
         # enforce a minimum and optional hard cap
-        MIN_NEW_TOKENS = 64  # raised from 8 -> 64 to avoid tiny generations
+        MIN_NEW_TOKENS = 8
         if hard_cap is not None:
             safe_allowed = min(safe_allowed, int(hard_cap))
         safe_allowed = max(MIN_NEW_TOKENS, safe_allowed)
@@ -277,17 +263,11 @@ class LocalLLM:
 
         _p = Path(self.model_path)
         if _p.exists() and _p.is_dir():
-            # model_path is a dir -> may include tokenizer files
+            # model path is a directory -> it may contain tokenizer files; use it as model id
             self.model = str(self.model_path)
         else:
-            # single-file model (gguf/ggml etc.) -> set self.model to the parent dir
-            try:
-                parent_dir = str(Path(self.model_path).parent)
-                self.model = parent_dir
-                # keep explicit model_path pointing at the file (for llama-cpp load)
-                # but set 'model' attribute to the dir so tokenizer loading can try the directory.
-            except Exception:
-                self.model = str(self.model_path)
+            # single-file model (gguf/ggml etc.) -> do not treat as HF id for tokenizer
+            self.model = None
 
         # prefer llama-cpp-python (for gguf/ggml)
         try:
@@ -295,11 +275,11 @@ class LocalLLM:
 
             print(f"LocalLLM: attempting llama-cpp-python init with {self.model_path}")
             cpu_count = os.cpu_count() or 1
-            n_threads = max(1, cpu_count - 1)
-            os.environ.setdefault("OMP_NUM_THREADS", str(n_threads))
+            os.environ.setdefault("OMP_NUM_THREADS", str(max(1, cpu_count - 1)))
 
+            # Try a single, safe Llama init (no insane n_ctx values).
             try:
-                self._impl = Llama(model_path=self.model_path, n_threads=n_threads)
+                self._impl = Llama(model_path=self.model_path, n_threads=cpu_count)
             except TypeError:
                 # older llama-cpp-python might not accept n_threads
                 self._impl = Llama(model_path=self.model_path)
@@ -474,32 +454,11 @@ class LocalLLM:
                 f"LocalLLM: computed dynamic max_new_tokens={max_new_tokens} (safety_factor={safety_factor})"
             )
 
-        # --- sanitize cap so comparisons never throw ---
+        # convert None => infinite when retry_forever True; otherwise cap = max_retries or 5
         if retry_forever:
             cap = None
         else:
-            # ensure we always end up with either an int > 0 or a default int
-            try:
-                cap = int(max_retries) if (max_retries is not None) else 5
-                if cap <= 0:
-                    cap = 5
-            except Exception:
-                cap = 5
-
-        # later, when enforcing the cap (inside the except block) use a safe check:
-        # enforce hard cap if set and not retry_forever
-        try:
-            if cap is not None and isinstance(cap, int) and attempt >= cap:
-                raise RuntimeError(
-                    f"send_message: reached max retries ({cap}). Last error: {e}"
-                )
-        except TypeError:
-            # defensive fallback — if any weird type sneaks in, convert to default int and continue retry
-            cap = 5
-            if attempt >= cap:
-                raise RuntimeError(
-                    f"send_message: reached max retries ({cap}). Last error: {e}"
-                )
+            cap = max_retries if isinstance(max_retries, int) and max_retries > 0 else 5
 
         while True:
             attempt += 1
@@ -738,53 +697,18 @@ class LocalLLM:
         # ensure prompt fits
         prompt = self._trim_prompt_to_fit(prompt, max_new_tokens)
 
-        # try .create (non-streaming) and fallback to streaming if empty
+        # try .create
         try:
             if hasattr(llm, "create"):
                 try:
+                    # modern llama-cpp-python: supports stream and callback; here call non-streaming
                     resp = llm.create(
                         prompt=prompt,
                         max_tokens=max_new_tokens,
                         temperature=temperature,
                         top_p=top_p,
                     )
-                    text = _extract_text(resp).strip()
-                    if text:
-                        return text
-                    # nothing extracted — dump debug and try streaming fallback
-                    print(
-                        f"LocalLLM: .create returned empty response (type={type(resp)}). repr(head)={repr(resp)[:400]}"
-                    )
-                    # try streaming fallback (many llama-cpp-python versions support stream=True returning an iterator)
-                    try:
-                        parts = []
-                        stream_iter = llm.create(
-                            prompt=prompt,
-                            max_tokens=max_new_tokens,
-                            temperature=temperature,
-                            top_p=top_p,
-                            stream=True,
-                        )
-                        for item in stream_iter:
-                            # item may be dict or str; try to extract likely text fields
-                            if isinstance(item, dict):
-                                t = (
-                                    item.get("text")
-                                    or item.get("generated_text")
-                                    or (
-                                        item.get("choices")
-                                        and item["choices"][0].get("text")
-                                    )
-                                )
-                                if t:
-                                    parts.append(str(t))
-                            else:
-                                parts.append(str(item))
-                        joined = "".join(parts).strip()
-                        if joined:
-                            return joined
-                    except Exception as e:
-                        print(f"LocalLLM: streaming .create fallback failed: {e}")
+                    return _extract_text(resp).strip()
                 except Exception as e:
                     print(f"LocalLLM: .create failed: {e}")
         except Exception:
