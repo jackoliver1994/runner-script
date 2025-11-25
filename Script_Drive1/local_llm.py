@@ -182,55 +182,98 @@ class LocalLLM:
             self._hf_tokenizer = None
 
     def compute_dynamic_max_new_tokens(
-        self, prompt: str, safety_factor: float = 0.80, hard_cap: Optional[int] = None
+        self,
+        prompt: str,
+        safety_factor: float = 0.80,
+        hard_cap: Optional[int] = None,
+        requested_max_new: Optional[int] = None,
+        min_new_tokens: int = 64,
+        local_ceiling: Optional[int] = None,
+        n_ctx: Optional[int] = None,
     ) -> int:
         """
-        Compute a safe max_new_tokens based on:
-        - runtime context length (self._n_ctx if detected, else 131072)
-        - tokenized prompt length (using HF tokenizer if available)
-        - safety_factor (0 < safety_factor <= 1) to leave headroom for kv cache
-        - optional hard_cap to never exceed a specific value
-        Returns an integer >= 1.
+        Model-aware dynamic max_new_tokens.
+
+        This function delegates to the ModelTokenBudget helper (added at file end).
+        Behavior:
+        - Attempts to use a real tokenizer if available for exact prompt token count.
+        - Falls back to per-model or global heuristics (char-per-token).
+        - Honors an explicit `requested_max_new` where provided, but caps it by safety/available context.
+        - Uses `min_new_tokens` floor (defaults to 64).
+        - Uses `local_ceiling` if provided, otherwise looks for an instance attribute
+            `local_max_new_tokens_ceiling` (existing code used `local_max_new_tokens_ceiling`).
+        - `n_ctx` can be provided explicitly; otherwise falls back to self._n_ctx or 131072.
         """
-        # 1) get model context
-        n_ctx = getattr(self, "_n_ctx", None) or 131072
+        # determine context length
+        if n_ctx is None:
+            n_ctx = getattr(self, "_n_ctx", None) or 131072
 
-        # 2) ensure tokenizer cached
-        self._ensure_tokenizer_for_model()
+        # Allow callers to override the local ceiling via attribute (keeps backwards compatibility).
+        if local_ceiling is None:
+            local_ceiling = (
+                getattr(self, "local_max_new_tokens_ceiling", None)
+                or getattr(self, "local_max_new_tokens_ceiling", None)
+                or getattr(self, "local_max_new_tokens_ceiling", None)
+            )
+        # final fallback ceiling used if nothing else configured
+        if local_ceiling is None:
+            local_ceiling = 65536
 
-        prompt_tokens = None
-        if getattr(self, "_hf_tokenizer", None) is not None:
-            try:
-                prompt_tokens = len(self._hf_tokenizer(prompt)["input_ids"])
-            except Exception as e:
-                # fallback to estimate
-                print(f"LocalLLM: tokenizer call failed, falling back to estimate: {e}")
-                prompt_tokens = None
+        # Choose a model identifier to feed to ModelTokenBudget:
+        model_id = None
+        # try common attributes that may exist in the class (keep robust)
+        for attr in ("model", "model_path", "model_dir", "model_file"):
+            if getattr(self, attr, None):
+                model_id = getattr(self, attr)
+                break
 
-        if prompt_tokens is None:
-            # rough fallback: estimate ~4 characters per token for english text
-            prompt_tokens = max(1, len(prompt) // 4)
+        # Build a budget helper and compute a recommended max_new_tokens
+        try:
+            budget = ModelTokenBudget(model_path_or_id=model_id, n_ctx_default=n_ctx)
+            computed = budget.compute_max_new_tokens(
+                prompt,
+                n_ctx=n_ctx,
+                safety_factor=safety_factor,
+                requested_max_new=requested_max_new or hard_cap,
+                min_new_tokens=min_new_tokens,
+                local_ceiling=local_ceiling,
+            )
+        except Exception as e:
+            # If ModelTokenBudget fails (should be rare), fall back to a conservative heuristic
+            print(f"LocalLLM: ModelTokenBudget failed, falling back to heuristic: {e}")
+            # fallback: estimate prompt tokens ~4 chars/token unless model hints suggest otherwise
+            approx_cpt = getattr(self, "_avg_token_char", 4.0)
+            prompt_tokens = max(0, int(len(prompt) / approx_cpt))
+            available = max(
+                0,
+                int(
+                    (n_ctx - prompt_tokens) * float(max(0.01, min(1.0, safety_factor)))
+                ),
+            )
+            computed = max(min_new_tokens, min(int(local_ceiling), available))
+            # honor explicit requested cap if present
+            if requested_max_new is not None:
+                computed = min(computed, int(requested_max_new))
 
-        # compute raw available tokens
-        available = max(0, n_ctx - prompt_tokens)
+        # final guards: enforce min and ceiling
+        try:
+            computed = int(computed)
+        except Exception:
+            computed = min_new_tokens
 
-        # apply safety factor so we don't fill the entire context (avoid OOM / kv growth)
-        safe_allowed = int(available * float(max(0.01, min(1.0, safety_factor))))
+        if computed < int(min_new_tokens):
+            computed = int(min_new_tokens)
+        if local_ceiling:
+            computed = min(computed, int(local_ceiling))
 
-        # enforce a minimum and optional hard cap
-        MIN_NEW_TOKENS = 8
+        # Keep compatibility: if explicit hard_cap provided, ensure it's honored
         if hard_cap is not None:
-            safe_allowed = min(safe_allowed, int(hard_cap))
-        safe_allowed = max(MIN_NEW_TOKENS, safe_allowed)
+            try:
+                computed = min(computed, int(hard_cap))
+            except Exception:
+                pass
 
-        # As an extra conservative guard, clamp to a reasonable ceiling for local runs if not explicitly requested
-        # (you can change/remove this if you want to allow full 128k generations)
-        LOCAL_CONSERVATIVE_CEILING = (
-            getattr(self, "local_max_new_tokens_ceiling", None) or 65536
-        )
-        safe_allowed = min(safe_allowed, int(LOCAL_CONSERVATIVE_CEILING))
-
-        return safe_allowed
+        return computed
 
     # ---------------- discover model file ----------------
     def _find_model_file(self) -> Optional[str]:
@@ -448,7 +491,12 @@ class LocalLLM:
             # compute dynamically based on prompt & model
             # use explicit safety_factor and hard_cap params (defaults provided in signature)
             max_new_tokens = self.compute_dynamic_max_new_tokens(
-                message, safety_factor=safety_factor, hard_cap=hard_cap
+                message,
+                safety_factor=safety_factor,
+                hard_cap=hard_cap,
+                requested_max_new=2048,  # explicit requested generation length
+                min_new_tokens=128,  # override default if you want larger minimum
+                n_ctx=getattr(self, "_n_ctx", None) or 8192,
             )
             print(
                 f"LocalLLM: computed dynamic max_new_tokens={max_new_tokens} (safety_factor={safety_factor})"
