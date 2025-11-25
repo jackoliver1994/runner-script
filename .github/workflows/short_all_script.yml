@@ -20,7 +20,7 @@ jobs:
       MODEL_DEST_PATH: ${{ github.workspace }}/models/Llama-2-13B-chat.gguf
       REPO_ID: TheBloke/Llama-2-13B-chat-GGUF
       USE_AUTH: "true"
-      SELECT_STRATEGY: "llama-2-13b-chat.Q6_K.gguf"
+      SELECT_STRATEGY: "llama-2-13b-chat.Q5_0.gguf"
       VERBOSE: "true"
 
     steps:
