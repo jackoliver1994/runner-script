@@ -171,31 +171,129 @@ class LocalLLM:
         )
 
     # --------------- tokenizer helper ---------------
+    def _find_model_file(self) -> Optional[str]:
+        """
+        Search for model files inside subfolders of self.model_dir.
+        Preference order:
+        1) model files (.gguf/.ggml/.safetensors/...) in a subfolder that contains tokenizer/config artifacts
+        2) largest model file found anywhere under model_dir (including nested)
+        Side-effect: sets self.model_folder to the directory containing the chosen model.
+        """
+        p = Path(self.model_dir).expanduser().resolve()
+        if not p.exists():
+            return None
+
+        # collect candidate model files under immediate subfolders first (one level deep)
+        candidates = []
+        for sub in sorted([d for d in p.iterdir() if d.is_dir()]):
+            for ext in getattr(
+                self, "MODEL_EXTENSIONS", [".gguf", ".ggml", ".safetensors", ".bin"]
+            ):
+                candidates.extend(list(sub.glob(f"*{ext}")))
+
+        # if none found in immediate children, search recursively
+        if not candidates:
+            for ext in getattr(
+                self, "MODEL_EXTENSIONS", [".gguf", ".ggml", ".safetensors", ".bin"]
+            ):
+                candidates.extend(list(p.rglob(f"*{ext}")))
+
+        # fallback: if still no candidates, consider any file under p
+        if not candidates:
+            allfiles = [f for f in p.rglob("*") if f.is_file()]
+            if not allfiles:
+                return None
+            candidates = allfiles
+
+        # helper to detect tokenizer/config artifacts in a folder
+        def folder_has_tokenizer_artifacts(folder: Path) -> bool:
+            if not folder or not folder.exists():
+                return False
+            look_for = {
+                "tokenizer.json",
+                "tokenizer_config.json",
+                "tokenizer.model",
+                "spiece.model",
+                "sentencepiece.model",
+                "vocab.json",
+                "vocab.txt",
+                "special_tokens_map.json",
+                "config.json",
+                "generation_config.json",
+            }
+            for name in look_for:
+                if (folder / name).exists():
+                    return True
+            for f in folder.iterdir():
+                if f.is_file() and (
+                    "tokenizer" in f.name.lower() or "vocab" in f.name.lower()
+                ):
+                    return True
+            return False
+
+        # score candidates: boost if parent has tokenizer artifacts and if parent name equals stem
+        scored = []
+        for f in candidates:
+            try:
+                size = f.stat().st_size
+            except Exception:
+                size = 0
+            parent = f.parent
+            score = 0
+            if folder_has_tokenizer_artifacts(parent):
+                score += 10_000_000
+            if parent.name == f.stem:
+                score += 1_000_000
+            # prefer files in immediate children of model_dir slightly
+            try:
+                if parent.parent == p:
+                    score += 100_000
+            except Exception:
+                pass
+            score += int(size / (1024 * 1024))  # size in MB as tie-breaker
+            scored.append((score, size, f))
+
+        if not scored:
+            return None
+
+        scored_sorted = sorted(scored, key=lambda x: (x[0], x[1]), reverse=True)
+        chosen = scored_sorted[0][2]
+        self.model_folder = str(chosen.parent)
+        # also set model_path/model for compatibility with other code
+        self.model_path = str(chosen)
+        try:
+            self.model = str(chosen.name)
+        except Exception:
+            pass
+        return str(chosen)
+
     def _ensure_tokenizer_for_model(self):
-        # skip if already present or transformers not available
-        if self._hf_tokenizer is not None or AutoTokenizer is None:
+        """
+        Load HF tokenizer from the folder where the chosen model lives.
+        Assumes downloader placed tokenizer/config files beside the model (models/<model-stem>/...).
+        Uses local_files_only=True so no remote downloads are attempted.
+        """
+        if getattr(self, "_hf_tokenizer", None) is not None or AutoTokenizer is None:
             return
 
-        # prefer explicit self.model_folder if available (set by _find_model_file)
+        # prefer self.model_folder (set by _find_model_file), then parent of model_path, then model_dir
         folder = None
         try:
             if getattr(self, "model_folder", None):
                 folder = Path(self.model_folder)
+            elif getattr(self, "model_path", None):
+                folder = Path(self.model_path).parent
             else:
-                # derive from the model_path (which is a file path returned by _find_model_file)
-                mp = getattr(self, "model_path", None) or getattr(
-                    self, "model_dir", None
-                )
-                if mp:
-                    folder = Path(str(mp)).parent
-            if folder is None:
+                folder = Path(self.model_dir).expanduser().resolve()
+
+            if not folder or not folder.exists():
                 print(
                     "LocalLLM: no model folder could be determined for tokenizer lookup."
                 )
                 self._hf_tokenizer = None
                 return
 
-            # check for common tokenizer files in folder
+            # check for tokenizer artifacts
             found = False
             for fname in (
                 "tokenizer.json",
@@ -213,14 +311,14 @@ class LocalLLM:
                     break
 
             if not found:
-                # also check an immediate sibling folder named after the model stem (defensive)
+                # defensive: check the subfolder named after the folder stem
                 try:
-                    stem_folder = folder / Path(getattr(self, "model_path")).stem
+                    stem_folder = folder / Path(getattr(self, "model_path", "")).stem
                     if stem_folder.exists() and stem_folder.is_dir():
                         for fname in (
                             "tokenizer.json",
-                            "tokenizer_config.json",
                             "tokenizer.model",
+                            "tokenizer_config.json",
                         ):
                             if (stem_folder / fname).exists():
                                 folder = stem_folder
@@ -231,12 +329,12 @@ class LocalLLM:
 
             if not found:
                 print(
-                    f"LocalLLM: tokenizer artifacts NOT found in model folder {folder}; skipping HF tokenizer load. (Downloader should have placed tokenizer files here.)"
+                    f"LocalLLM: tokenizer artifacts NOT found in model folder {folder}; skipping HF tokenizer load."
                 )
                 self._hf_tokenizer = None
                 return
 
-            # Try to load tokenizer from the local folder only.
+            # attempt local-only tokenizer load
             try:
                 self._hf_tokenizer = AutoTokenizer.from_pretrained(
                     str(folder), use_fast=True, local_files_only=True
@@ -244,7 +342,6 @@ class LocalLLM:
                 print(f"LocalLLM: tokenizer loaded from local folder {folder}")
                 return
             except Exception as e:
-                # if local_files_only fails, print helpful message and keep None
                 print(f"LocalLLM: failed to load tokenizer from {folder}: {e}")
                 self._hf_tokenizer = None
                 return
