@@ -54,10 +54,10 @@ jobs:
           echo "SELECT_STRATEGY -> $SELECT_STRATEGY"
           python -c "import psutil,sys; print('Total RAM GB:', psutil.virtual_memory().total/1024**3 if 'psutil' in sys.modules else 'psutil missing')"
 
-      - name: Run download & test script
+      - name: Run your script (llm)
         run: |
           cd Script_Drive1
-          python3 test_local_llm.py
+          python3 local_llm.py
         env:
           HF_TOKEN: ${{ github.event.inputs.hf_key }}
           MODEL_DEST_PATH: ${{ github.workspace }}/models/Llama-2-7B-chat.gguf
@@ -72,13 +72,6 @@ jobs:
           TARGET_DIR="/home/runner/work/runner-script/runner-script/models"
           echo "Listing: $TARGET_DIR"
           ls -R "$TARGET_DIR"
-
-      - name: Run your script (llm)
-        env:
-          R_HOURS: "6"
-        run: |
-          cd Script_Drive1
-          python local_llm.py
 
       - name: Show disk
         run: |
