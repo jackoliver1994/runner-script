@@ -171,112 +171,28 @@ class LocalLLM:
         )
 
     # --------------- tokenizer helper ---------------
-    def _find_model_file(self) -> Optional[str]:
-        """
-        Search for model files inside subfolders of self.model_dir.
-        Preference order:
-        1) model files (.gguf/.ggml/.safetensors/...) in a subfolder that contains tokenizer/config artifacts
-        2) largest model file found anywhere under model_dir (including nested)
-        Side-effect: sets self.model_folder to the directory containing the chosen model.
-        """
-        p = Path(self.model_dir).expanduser().resolve()
-        if not p.exists():
-            return None
-
-        # collect candidate model files under immediate subfolders first (one level deep)
-        candidates = []
-        for sub in sorted([d for d in p.iterdir() if d.is_dir()]):
-            for ext in getattr(
-                self, "MODEL_EXTENSIONS", [".gguf", ".ggml", ".safetensors", ".bin"]
-            ):
-                candidates.extend(list(sub.glob(f"*{ext}")))
-
-        # if none found in immediate children, search recursively
-        if not candidates:
-            for ext in getattr(
-                self, "MODEL_EXTENSIONS", [".gguf", ".ggml", ".safetensors", ".bin"]
-            ):
-                candidates.extend(list(p.rglob(f"*{ext}")))
-
-        # fallback: if still no candidates, consider any file under p
-        if not candidates:
-            allfiles = [f for f in p.rglob("*") if f.is_file()]
-            if not allfiles:
-                return None
-            candidates = allfiles
-
-        # helper to detect tokenizer/config artifacts in a folder
-        def folder_has_tokenizer_artifacts(folder: Path) -> bool:
-            if not folder or not folder.exists():
-                return False
-            look_for = {
-                "tokenizer.json",
-                "tokenizer_config.json",
-                "tokenizer.model",
-                "spiece.model",
-                "sentencepiece.model",
-                "vocab.json",
-                "vocab.txt",
-                "special_tokens_map.json",
-                "config.json",
-                "generation_config.json",
-            }
-            for name in look_for:
-                if (folder / name).exists():
-                    return True
-            for f in folder.iterdir():
-                if f.is_file() and (
-                    "tokenizer" in f.name.lower() or "vocab" in f.name.lower()
-                ):
-                    return True
-            return False
-
-        # score candidates: boost if parent has tokenizer artifacts and if parent name equals stem
-        scored = []
-        for f in candidates:
-            try:
-                size = f.stat().st_size
-            except Exception:
-                size = 0
-            parent = f.parent
-            score = 0
-            if folder_has_tokenizer_artifacts(parent):
-                score += 10_000_000
-            if parent.name == f.stem:
-                score += 1_000_000
-            # prefer files in immediate children of model_dir slightly
-            try:
-                if parent.parent == p:
-                    score += 100_000
-            except Exception:
-                pass
-            score += int(size / (1024 * 1024))  # size in MB as tie-breaker
-            scored.append((score, size, f))
-
-        if not scored:
-            return None
-
-        scored_sorted = sorted(scored, key=lambda x: (x[0], x[1]), reverse=True)
-        chosen = scored_sorted[0][2]
-        self.model_folder = str(chosen.parent)
-        # also set model_path/model for compatibility with other code
-        self.model_path = str(chosen)
-        try:
-            self.model = str(chosen.name)
-        except Exception:
-            pass
-        return str(chosen)
-
     def _ensure_tokenizer_for_model(self):
         """
-        Load HF tokenizer from the folder where the chosen model lives.
-        Assumes downloader placed tokenizer/config files beside the model (models/<model-stem>/...).
-        Uses local_files_only=True so no remote downloads are attempted.
+        Robust tokenizer loader for the downloader-created layout:
+        models/
+            <model-stem>/
+            <model-stem>.gguf
+            config.json
+            README.md
+            LICENSE
+            (optionally tokenizer.model / tokenizer.json / tokenizer_config.json / vocab.json ...)
+
+        Behavior:
+        1) If tokenizer artifacts exist in the model folder, load them with AutoTokenizer (local_files_only=True).
+        2) Else if config.json exists, try to infer a HF repo/id and load tokenizer (try local then remote).
+        3) Else, if llama_cpp is available, use its tokenizer via a small wrapper around Llama.tokenize/detokenize.
+        4) Fallback: DummyTokenizer (deterministic, for structural tests only).
         """
+        # no-op if already present or AutoTokenizer not available
         if getattr(self, "_hf_tokenizer", None) is not None or AutoTokenizer is None:
             return
 
-        # prefer self.model_folder (set by _find_model_file), then parent of model_path, then model_dir
+        # determine folder where model + artifacts live
         folder = None
         try:
             if getattr(self, "model_folder", None):
@@ -284,57 +200,34 @@ class LocalLLM:
             elif getattr(self, "model_path", None):
                 folder = Path(self.model_path).parent
             else:
-                folder = Path(self.model_dir).expanduser().resolve()
+                folder = Path(getattr(self, "model_dir", "."))
 
-            if not folder or not folder.exists():
-                print(
-                    "LocalLLM: no model folder could be determined for tokenizer lookup."
-                )
-                self._hf_tokenizer = None
-                return
+            if folder.is_file():
+                folder = folder.parent
+            folder = folder.expanduser().resolve()
+        except Exception:
+            folder = None
 
-            # check for tokenizer artifacts
-            found = False
-            for fname in (
-                "tokenizer.json",
-                "tokenizer_config.json",
-                "tokenizer.model",
-                "spiece.model",
-                "sentencepiece.model",
-                "vocab.json",
-                "vocab.txt",
-                "special_tokens_map.json",
-                "config.json",
-            ):
-                if (folder / fname).exists():
-                    found = True
-                    break
+        if folder is None or not folder.exists():
+            print("LocalLLM: no model folder could be determined for tokenizer lookup.")
+            self._hf_tokenizer = None
+            return
 
-            if not found:
-                # defensive: check the subfolder named after the folder stem
-                try:
-                    stem_folder = folder / Path(getattr(self, "model_path", "")).stem
-                    if stem_folder.exists() and stem_folder.is_dir():
-                        for fname in (
-                            "tokenizer.json",
-                            "tokenizer.model",
-                            "tokenizer_config.json",
-                        ):
-                            if (stem_folder / fname).exists():
-                                folder = stem_folder
-                                found = True
-                                break
-                except Exception:
-                    pass
+        # quick helper: check for common tokenizer files
+        tokenizer_files = (
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "tokenizer.model",
+            "spiece.model",
+            "sentencepiece.model",
+            "vocab.json",
+            "vocab.txt",
+            "special_tokens_map.json",
+        )
+        found_tokenizer_file = any((folder / f).exists() for f in tokenizer_files)
 
-            if not found:
-                print(
-                    f"LocalLLM: tokenizer artifacts NOT found in model folder {folder}; skipping HF tokenizer load."
-                )
-                self._hf_tokenizer = None
-                return
-
-            # attempt local-only tokenizer load
+        # 1) If tokenizer artifacts present -> load locally
+        if found_tokenizer_file:
             try:
                 self._hf_tokenizer = AutoTokenizer.from_pretrained(
                     str(folder), use_fast=True, local_files_only=True
@@ -343,13 +236,186 @@ class LocalLLM:
                 return
             except Exception as e:
                 print(f"LocalLLM: failed to load tokenizer from {folder}: {e}")
-                self._hf_tokenizer = None
-                return
+                # continue to try other fallbacks
 
-        except Exception as e:
-            print(f"LocalLLM: tokenizer load failed with unexpected error: {e}")
-            self._hf_tokenizer = None
-            return
+        # 2) Try to infer tokenizer repo/id from config.json (if present)
+        cfg_path = folder / "config.json"
+        if cfg_path.exists():
+            try:
+                with open(cfg_path, "r", encoding="utf-8") as fh:
+                    cfg = json.load(fh)
+            except Exception as e:
+                cfg = {}
+                print(f"LocalLLM: failed to parse config.json: {e}")
+
+            # collect likely fields that may point to a HF repo/id or tokenizer name
+            candidate_keys = (
+                "tokenizer",
+                "tokenizer_class",
+                "tokenizer_name",
+                "hf_hub_id",
+                "hub_id",
+                "hf_repo",
+                "repo_id",
+                "model_name",
+                "base_model",
+                "name_or_path",
+            )
+            candidates = []
+            for k in candidate_keys:
+                v = cfg.get(k)
+                if isinstance(v, str) and v:
+                    candidates.append(v.strip())
+
+            # also add environment override
+            env_fallback = os.getenv("FALLBACK_TOKENIZER_REPO")
+            if env_fallback:
+                candidates.insert(0, env_fallback)
+
+            # try local then remote load for each candidate
+            for cand in candidates:
+                try:
+                    # first try local (in case downloader already put it)
+                    try:
+                        self._hf_tokenizer = AutoTokenizer.from_pretrained(
+                            cand, use_fast=True, local_files_only=True
+                        )
+                        print(f"LocalLLM: tokenizer loaded (local id) from {cand}")
+                        return
+                    except Exception:
+                        # try remote (if allowed) - will raise if no net or access
+                        self._hf_tokenizer = AutoTokenizer.from_pretrained(
+                            cand, use_fast=True
+                        )
+                        print(
+                            f"LocalLLM: tokenizer downloaded/loaded from remote id {cand}"
+                        )
+                        return
+                except Exception as e:
+                    print(f"LocalLLM: candidate tokenizer '{cand}' failed: {e}")
+                    self._hf_tokenizer = None
+
+        # 3) If no HF tokenizer, try to use llama_cpp's tokenizer (if installed)
+        #    This will instantiate a Llama just to use its tokenize/detokenize methods.
+        #    If model is huge this may be expensive, but it often works in CI where llama-cpp-python is used anyway.
+        try:
+            # find a gguf in folder if self.model_path not set
+            gguf_path = None
+            if getattr(self, "model_path", None):
+                p = Path(self.model_path)
+                if p.exists():
+                    gguf_path = str(p)
+            if gguf_path is None:
+                for f in folder.iterdir():
+                    if f.is_file() and ".gguf" in f.name.lower():
+                        gguf_path = str(f)
+                        break
+
+            if gguf_path:
+                try:
+                    from llama_cpp import Llama
+
+                    # instantiate a short-lived Llama to access tokenization functions
+                    # NOTE: this may load the model into memory; it depends on llama_cpp internals.
+                    ll = Llama(model_path=gguf_path)
+                    # check for tokenize/detokenize presence
+                    if hasattr(ll, "tokenize") and hasattr(ll, "detokenize"):
+
+                        class LlamaTokenizerWrapper:
+                            def __init__(self, llm):
+                                self._llm = llm
+                                # best-effort special token defaults
+                                self.pad_token_id = getattr(llm, "pad_token_id", 0)
+                                self.eos_token_id = getattr(llm, "eos_token_id", 2)
+
+                            def encode(
+                                self, text, add_special_tokens=True, return_tensors=None
+                            ):
+                                ids = self._llm.tokenize(text)
+                                # llama_cpp returns list[int] (or bytes) - ensure list
+                                if isinstance(ids, (bytes, bytearray)):
+                                    try:
+                                        ids = list(ids)
+                                    except Exception:
+                                        ids = [int(i) for i in ids]
+                                if return_tensors == "pt":
+                                    try:
+                                        import torch
+
+                                        return torch.tensor([ids], dtype=torch.long)
+                                    except Exception:
+                                        pass
+                                return ids
+
+                            def decode(self, ids, skip_special_tokens=True):
+                                try:
+                                    return self._llm.detokenize(ids)
+                                except Exception:
+                                    # best-effort fallback
+                                    return " ".join(f"<{i}>" for i in ids)
+
+                            def __call__(
+                                self,
+                                text,
+                                return_tensors=None,
+                                padding=False,
+                                truncation=False,
+                                max_length=None,
+                            ):
+                                input_ids = self.encode(
+                                    text, return_tensors=return_tensors
+                                )
+                                return {"input_ids": input_ids}
+
+                        self._hf_tokenizer = LlamaTokenizerWrapper(ll)
+                        print(
+                            f"LocalLLM: using llama_cpp tokenizer wrapper based on {gguf_path}"
+                        )
+                        return
+                except Exception as e:
+                    # llama_cpp not available or failed -> continue
+                    print(f"LocalLLM: llama_cpp tokenizer wrapper unavailable: {e}")
+        except Exception:
+            pass
+
+        # 4) Last resort: DummyTokenizer (deterministic but NOT model-compatible)
+        class DummyTokenizer:
+            def __init__(self):
+                self.pad_token_id = 0
+                self.eos_token_id = 1
+
+            def encode(self, text, add_special_tokens=True, return_tensors=None):
+                toks = text.strip().split()
+                ids = [abs(hash(t)) % 65536 for t in toks] or [0]
+                if return_tensors == "pt":
+                    try:
+                        import torch
+
+                        return torch.tensor([ids], dtype=torch.long)
+                    except Exception:
+                        pass
+                return ids
+
+            def decode(self, ids, skip_special_tokens=True):
+                return " ".join(f"<{i}>" for i in ids)
+
+            def __call__(
+                self,
+                text,
+                return_tensors=None,
+                padding=False,
+                truncation=False,
+                max_length=None,
+            ):
+                input_ids = self.encode(text, return_tensors=return_tensors)
+                return {"input_ids": input_ids}
+
+        self._hf_tokenizer = DummyTokenizer()
+        print(
+            f"LocalLLM: tokenizer artifacts NOT found in {folder}; using DummyTokenizer fallback. "
+            "NOTE: DummyTokenizer is for tests only and will NOT produce valid token IDs for real inference."
+        )
+        return
 
     # --------------- detect n_ctx ---------------
     def _detect_n_ctx(self) -> int:
