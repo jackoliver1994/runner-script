@@ -172,13 +172,87 @@ class LocalLLM:
 
     # --------------- tokenizer helper ---------------
     def _ensure_tokenizer_for_model(self):
+        # skip if already present or transformers not available
         if self._hf_tokenizer is not None or AutoTokenizer is None:
             return
-        model_id = getattr(self, "model", None) or getattr(self, "model_path", None)
+
+        model_id = (
+            getattr(self, "model", None)
+            or getattr(self, "model_path", None)
+            or getattr(self, "model_dir", None)
+        )
         if not model_id:
             return
+
         try:
-            self._hf_tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True)
+            mpath = Path(str(model_id))
+
+            # If model_id points to a single file (e.g. .gguf/.ggml), don't pass that file directly
+            # to from_pretrained — instead try to find tokenizer files in the same folder or a sensible sibling.
+            if mpath.is_file():
+                parent = mpath.parent
+                stem = mpath.stem
+                candidates = [parent, parent / stem, parent / (stem + "-tokenizer")]
+
+                tokenizer_folder = None
+                for c in candidates:
+                    if c.exists() and c.is_dir():
+                        # look for common tokenizer artifacts
+                        for fname in (
+                            "tokenizer.json",
+                            "tokenizer_config.json",
+                            "vocab.json",
+                            "merges.txt",
+                            "spiece.model",
+                            "vocab.txt",
+                        ):
+                            if (c / fname).exists():
+                                tokenizer_folder = str(c)
+                                break
+                    if tokenizer_folder:
+                        break
+
+                if tokenizer_folder:
+                    try:
+                        # prefer local-only load to avoid unexpected downloads
+                        self._hf_tokenizer = AutoTokenizer.from_pretrained(
+                            tokenizer_folder, use_fast=True, local_files_only=True
+                        )
+                        print(
+                            f"LocalLLM: tokenizer loaded from local folder {tokenizer_folder}"
+                        )
+                    except Exception as e:
+                        print(
+                            f"LocalLLM: tokenizer load from {tokenizer_folder} failed: {e}"
+                        )
+                        self._hf_tokenizer = None
+                else:
+                    print(
+                        f"LocalLLM: tokenizer not found next to model file {mpath}; skipping tokenizer load."
+                    )
+                    self._hf_tokenizer = None
+                return
+
+            # If model_id is a directory or HF repo id, try local first then remote
+            try:
+                self._hf_tokenizer = AutoTokenizer.from_pretrained(
+                    str(model_id), use_fast=True, local_files_only=True
+                )
+                print(f"LocalLLM: tokenizer loaded (local) for {model_id}")
+                return
+            except Exception:
+                # try remote if allowed / possible
+                try:
+                    self._hf_tokenizer = AutoTokenizer.from_pretrained(
+                        str(model_id), use_fast=True
+                    )
+                    print(f"LocalLLM: tokenizer loaded (remote) for {model_id}")
+                    return
+                except Exception as e:
+                    print(f"LocalLLM: tokenizer load failed for {model_id}: {e}")
+                    self._hf_tokenizer = None
+                    return
+
         except Exception as e:
             print(f"LocalLLM: tokenizer load failed for {model_id}: {e}")
             self._hf_tokenizer = None
