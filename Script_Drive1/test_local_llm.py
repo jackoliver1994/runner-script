@@ -388,6 +388,11 @@ def pick_gguf_from_list(files: List[str], strategy) -> str:
 
 
 def download_model_via_hf(repo_id: str, select_strategy) -> str:
+    """
+    Download the chosen .gguf model and also fetch tokenizers/configs/docs from the repo.
+    - Places everything into a folder named after the model file stem next to MODEL_DEST_PATH.
+    - Returns the final path to the .gguf inside that folder.
+    """
     global HF_TOKEN
     if not HF_TOKEN:
         HF_TOKEN = os.getenv("HF_TOKEN", "")
@@ -399,6 +404,7 @@ def download_model_via_hf(repo_id: str, select_strategy) -> str:
     _log("Listing files in repo:", repo_id)
     files = list_repo_files(repo_id)
     _log("Total files in repo:", len(files))
+
     ggufs = [f for f in files if f.lower().endswith(".gguf") or ".gguf" in f.lower()]
     _log("Found .gguf candidates:", ggufs)
     if not ggufs:
@@ -415,14 +421,103 @@ def download_model_via_hf(repo_id: str, select_strategy) -> str:
     )
     _log("hf_hub_download returned cached path:", cached)
 
+    # ensure base parent exists (models/)
     ensure_parent(MODEL_DEST_PATH)
-    if os.path.abspath(cached) != os.path.abspath(MODEL_DEST_PATH):
-        _log("Copying model to desired path:", MODEL_DEST_PATH)
-        shutil.copy2(cached, MODEL_DEST_PATH)
-    else:
-        _log("Cached path already matches desired path.")
 
-    return MODEL_DEST_PATH
+    # Create a dedicated folder with the same stem as the gguf (e.g. models/Llama-2-7B-chat/)
+    model_file_name = os.path.basename(MODEL_DEST_PATH)
+    model_stem = os.path.splitext(model_file_name)[0]
+    model_folder = os.path.join(
+        os.path.dirname(os.path.abspath(MODEL_DEST_PATH)), model_stem
+    )
+    os.makedirs(model_folder, exist_ok=True)
+
+    # Copy gguf into that folder (so everything is together)
+    final_model_path = os.path.join(model_folder, model_file_name)
+    try:
+        if os.path.abspath(cached) != os.path.abspath(final_model_path):
+            _log("Copying model to model folder:", final_model_path)
+            shutil.copy2(cached, final_model_path)
+        else:
+            _log("Cached path already matches desired final model path.")
+    except Exception as e:
+        _log("Failed to copy gguf to model folder:", e)
+        # still attempt to continue if cache exists
+        if not os.path.exists(cached):
+            raise
+
+    # --- Decide which other repo files to download ---
+    # We'll download files that are likely important for inference & tokenization:
+    important_names = {
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "tokenizer.model",
+        "spiece.model",
+        "sentencepiece.model",
+        "vocab.json",
+        "vocab.txt",
+        "merges.txt",
+        "config.json",
+        "generation_config.json",
+        "special_tokens_map.json",
+        "preprocessor_config.json",
+        "README.md",
+        "readme.md",
+        "LICENSE",
+        "license",
+    }
+    important_exts = (
+        ".json",
+        ".model",
+        ".txt",
+        ".md",
+        ".safetensors",
+        ".bin",
+    )
+
+    _log("Downloading other important files into:", model_folder)
+    for f in files:
+        # skip the chosen gguf (already handled)
+        if f == filename:
+            continue
+        fname = os.path.basename(f)
+        lower = fname.lower()
+
+        pick = False
+        # direct name matches
+        if lower in (n.lower() for n in important_names):
+            pick = True
+        # extensions likely important
+        elif any(lower.endswith(ext) for ext in important_exts):
+            pick = True
+        # any tokenizer mention or vocab in the name
+        elif (
+            "tokenizer" in lower
+            or "vocab" in lower
+            or "sentencepiece" in lower
+            or "spiece" in lower
+            or "config" in lower
+        ):
+            pick = True
+
+        if not pick:
+            continue
+
+        try:
+            _log("Fetching:", f)
+            cached_f = hf_hub_download_compat(
+                repo_id=repo_id, filename=f, token=(HF_TOKEN if USE_AUTH else None)
+            )
+            target = os.path.join(model_folder, fname)
+            # copy downloaded artifact into model folder (overwrite if exists)
+            shutil.copy2(cached_f, target)
+            _log("Saved:", target)
+        except Exception as e:
+            _log("Warning: failed to download/copy", f, ":", e)
+            # continue with other files
+
+    _log("All important files attempted. Final model path:", final_model_path)
+    return final_model_path
 
 
 # ----------------- Inference test helpers (FIXED parsing + streaming handling) -----------------
