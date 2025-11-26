@@ -58,7 +58,6 @@ jobs:
         run: |
           cd Script_Drive1
           python3 test_local_llm.py
-          pip cache purge
         env:
           HF_TOKEN: ${{ github.event.inputs.hf_key }}
           MODEL_DEST_PATH: ${{ github.workspace }}/models/Llama-2-7B-chat.gguf
