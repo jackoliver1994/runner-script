@@ -68,6 +68,12 @@ jobs:
         run: |
           df -h
 
+      - name: List all files in target directory
+        run: |
+          TARGET_DIR="/home/runner/work/runner-script/runner-script/models"
+          echo "Listing: $TARGET_DIR"
+          ls -R "$TARGET_DIR"
+
       - name: Run your script (llm)
         env:
           R_HOURS: "6"
