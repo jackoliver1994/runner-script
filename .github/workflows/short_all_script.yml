@@ -17,10 +17,10 @@ jobs:
       HF_TOKEN: ${{ github.event.inputs.hf_key }}
 
       # MODEL_DEST_PATH and REPO_ID are set here (not dynamic). Change paths if you like.
-      MODEL_DEST_PATH: ${{ github.workspace }}/models/Llama-2-13B-chat.gguf
-      REPO_ID: TheBloke/Llama-2-13B-chat-GGUF
+      MODEL_DEST_PATH: ${{ github.workspace }}/models/Llama-2-7B-chat.gguf
+      REPO_ID: TheBloke/Llama-2-7B-Chat-GGUF
       USE_AUTH: "true"
-      SELECT_STRATEGY: "llama-2-13b-chat.Q2_K.gguf"
+      SELECT_STRATEGY: "llama-2-7b-chat.Q5_K_M.gguf"
       VERBOSE: "true"
 
     steps:
@@ -61,8 +61,8 @@ jobs:
           pip cache purge
         env:
           HF_TOKEN: ${{ github.event.inputs.hf_key }}
-          MODEL_DEST_PATH: ${{ github.workspace }}/models/Llama-2-13B-chat.gguf
-          REPO_ID: TheBloke/Llama-2-13B-chat-GGUF
+          MODEL_DEST_PATH: ${{ github.workspace }}/models/Llama-2-7B-chat.gguf
+          REPO_ID: TheBloke/Llama-2-7B-Chat-GGUF
 
       - name: Show disk
         run: |
