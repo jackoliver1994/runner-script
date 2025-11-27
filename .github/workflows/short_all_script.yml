@@ -54,7 +54,7 @@ jobs:
           echo "SELECT_STRATEGY -> $SELECT_STRATEGY"
           python -c "import psutil,sys; print('Total RAM GB:', psutil.virtual_memory().total/1024**3 if 'psutil' in sys.modules else 'psutil missing')"
 
-      - name: Run your script (llm)
+      - name: Test run download model script
         run: |
           cd Script_Drive1
           python3 test_local_llm.py
