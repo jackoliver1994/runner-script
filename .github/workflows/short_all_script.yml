@@ -20,7 +20,7 @@ jobs:
       MODEL_DEST_PATH: ${{ github.workspace }}/models/Llama-2-7B-chat.gguf
       REPO_ID: TheBloke/Llama-2-7B-Chat-GGUF
       USE_AUTH: "true"
-      SELECT_STRATEGY: "llama-2-7b-chat.Q6_K.gguf"
+      SELECT_STRATEGY: "llama-2-7b-chat.Q4_K_M.gguf"
       VERBOSE: "true"
 
     steps:
@@ -57,15 +57,11 @@ jobs:
       - name: Run your script (llm)
         run: |
           cd Script_Drive1
-          python3 local_llm.py
+          python3 test_local_llm.py
         env:
           HF_TOKEN: ${{ github.event.inputs.hf_key }}
           MODEL_DEST_PATH: ${{ github.workspace }}/models/Llama-2-7B-chat.gguf
           REPO_ID: TheBloke/Llama-2-7B-Chat-GGUF
-
-      - name: Show disk
-        run: |
-          df -h
 
       - name: List all files in target directory
         run: |
@@ -76,6 +72,13 @@ jobs:
       - name: Show disk
         run: |
           df -h
+
+      - name: Run your script (llm)
+        env:
+          R_HOURS: "6"
+        run: |
+          cd Script_Drive
+          python llm.py
 
       - name: Upload debug artifacts (if present)
         if: always()
